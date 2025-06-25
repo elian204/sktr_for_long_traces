@@ -1,0 +1,401 @@
+from typing import Any, Optional, List, Union, Tuple
+import numpy as np
+import pandas as pd
+import torch
+import random
+import hashlib
+
+
+def prepare_softmax(
+    softmax_list: List
+) -> List[np.ndarray]:
+    """
+    Convert a list of softmax arrays (or tensors) into a list of NumPy arrays.
+    """
+    if softmax_list is None:
+        raise ValueError("softmax_list cannot be None - softmax matrices are required")
+    if not softmax_list:
+        raise ValueError("softmax_list cannot be empty - softmax matrices are required")
+    try:
+        return convert_tensors_to_numpy(softmax_list)
+    except Exception as e:
+        raise ValueError(f"Failed to convert softmax list to numpy arrays: {e}") from e
+
+
+def convert_tensors_to_numpy(
+    softmax_list: List[Union[torch.Tensor, np.ndarray]]
+) -> List[np.ndarray]:
+    """
+    Convert a list of PyTorch tensors or NumPy arrays into NumPy arrays,
+    squeezing out the leading singleton dimension.
+
+    Parameters
+    ----------
+    softmax_list : List[Union[torch.Tensor, np.ndarray]]
+        A sequence where each element is either:
+        - a PyTorch Tensor of shape (1, …), possibly on GPU, or
+        - a NumPy array (any shape).
+
+    Returns
+    -------
+    List[np.ndarray]
+        A list of NumPy arrays. For tensor inputs, the returned array is
+        `tensor.cpu().numpy().squeeze(0)`. For array inputs, `np.asarray`
+        is used to ensure a NumPy array.
+    """
+    return [
+        # GPU → CPU → NumPy → squeeze leading dim
+        item.cpu().numpy().squeeze(0)  # type: ignore[attr-defined]
+        if isinstance(item, torch.Tensor) else np.asarray(item)
+        for item in softmax_list
+    ]
+
+
+def filter_indices(
+    df: pd.DataFrame,
+    softmax_list: Optional[List[np.ndarray]],
+    n_indices: Optional[int] = None,
+    n_per_run: Optional[int] = None,
+    sequential_sampling: bool = False,
+    random_seed: int = 42,
+    independent_sampling: bool = True
+) -> Tuple[pd.DataFrame, Optional[List[np.ndarray]]]:
+    """
+    Sample events from each trace in the dataframe.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Event log with 'case:concept:name' and 'concept:name' columns.
+    softmax_list : Optional[List[np.ndarray]]
+        Softmax matrices aligned with unique cases in df.
+        Each matrix shape: (n_classes, n_events_in_trace).
+    n_indices : Optional[int]
+        Total number of events to sample per trace (for uniform sampling).
+        Used when sequential_sampling=False. Mutually exclusive with n_per_run.
+    n_per_run : Optional[int]  
+        Number of events to sample from each activity run (for sequential sampling).
+        Used when sequential_sampling=True. Mutually exclusive with n_indices.
+    sequential_sampling : bool, default=False
+        If True, sample from each run of identical activities using n_per_run.
+        If False, sample uniformly from entire trace using n_indices.
+    random_seed : int, default=42
+        Base random seed for reproducible sampling.
+    independent_sampling : bool, default=True
+        If True, each trace uses a different random seed derived from base seed.
+        If False, all traces use the same random state.
+        
+    Returns
+    -------
+    tuple
+        (filtered_df, filtered_softmax_list)
+        - filtered_df: DataFrame with sampled events
+        - filtered_softmax_list: None or list of filtered softmax matrices
+        
+    Raises
+    ------
+    ValueError
+        If parameter combination is invalid or alignment issues exist.
+        
+    Examples
+    --------
+    # Uniform sampling: 5 total events per trace
+    >>> filter_indices(df, softmax, n_indices=5, sequential_sampling=False)
+    
+    # Sequential sampling: 2 events from each activity run  
+    >>> filter_indices(df, softmax, n_per_run=2, sequential_sampling=True)
+    
+    Notes
+    -----
+    When independent_sampling=True, each trace gets its own random seed:
+    trace_seed = base_seed + trace_index. This ensures reproducible but
+    diverse sampling patterns across traces.
+    """
+    # Validate parameter combinations
+    if sequential_sampling and n_per_run is None:
+        raise ValueError("n_per_run must be specified when sequential_sampling=True")
+    if not sequential_sampling and n_indices is None:
+        raise ValueError("n_indices must be specified when sequential_sampling=False")
+    if n_indices is not None and n_per_run is not None:
+        raise ValueError("n_indices and n_per_run are mutually exclusive")
+    
+    # Get unique cases in appearance order
+    case_ids = df['case:concept:name'].drop_duplicates().tolist()
+    
+    # Validate softmax list if provided
+    if softmax_list is not None:
+        _validate_softmax_alignment(df, softmax_list, case_ids)
+    
+    # Setup random number generation strategy
+    if independent_sampling:
+        def get_rng_for_trace(trace_idx: int) -> random.Random:
+            return random.Random(random_seed + trace_idx)
+    else:
+        shared_rng = random.Random(random_seed)
+        def get_rng_for_trace(trace_idx: int) -> random.Random:
+            return shared_rng
+    
+    # Process each trace independently
+    filtered_dfs = []
+    filtered_softmax = [] if softmax_list is not None else None
+    
+    for i, case_id in enumerate(case_ids):
+        # Validate that case_id matches the index
+        if str(i) != str(case_id):
+            raise ValueError(f"Case ID '{case_id}' at index {i} doesn't match expected value '{i}'")
+        
+        # Get trace data
+        trace_df = df[df['case:concept:name'] == case_id].reset_index(drop=True)
+        trace_length = len(trace_df)
+        
+        # Get RNG for this specific trace
+        trace_rng = get_rng_for_trace(i)
+        
+        # Sample indices based on strategy
+        if sequential_sampling:
+            assert n_per_run is not None  # Type narrowing for mypy
+            sampled_indices = _sample_sequential_indices(
+                trace_df, n_per_run, trace_rng
+            )
+        else:
+            assert n_indices is not None  # Type narrowing for mypy
+            sampled_indices = _sample_uniform_indices(
+                trace_length, n_indices, trace_rng
+            )
+        
+        # Filter dataframe and softmax
+        filtered_trace = trace_df.iloc[sampled_indices].reset_index(drop=True)
+        filtered_dfs.append(filtered_trace)
+        
+        if softmax_list is not None:
+            filtered_matrix = softmax_list[i][:, sampled_indices]
+            filtered_softmax.append(filtered_matrix)
+        
+    # Combine results
+    result_df = pd.concat(filtered_dfs, ignore_index=True)
+    
+    return result_df, filtered_softmax
+
+
+def _sample_uniform_indices(
+    trace_length: int,
+    n_indices: int, 
+    rng: random.Random
+) -> List[int]:
+    """Sample n_indices positions uniformly from trace."""
+    n_to_sample = min(n_indices, trace_length)
+    return sorted(rng.sample(range(trace_length), n_to_sample))
+
+
+def _sample_sequential_indices(
+    trace_df: pd.DataFrame,
+    n_per_run: int,
+    rng: random.Random
+) -> List[int]:
+    """Sample n_per_run positions from each activity run."""
+    activity_sequence = trace_df['concept:name'].tolist()
+    sampled_indices = []
+    
+    # Find runs of identical activities
+    current_activity = None
+    run_start = 0
+    
+    for i, activity in enumerate(activity_sequence + [None]):
+        if activity != current_activity:
+            if current_activity is not None:
+                # Sample from the completed run [run_start, i)
+                run_indices = list(range(run_start, i))
+                run_sample_size = min(n_per_run, len(run_indices))
+                sampled_from_run = rng.sample(run_indices, run_sample_size)
+                sampled_indices.extend(sampled_from_run)
+            
+            # Start new run
+            current_activity = activity
+            run_start = i
+    
+    return sorted(sampled_indices)
+
+
+def _validate_softmax_alignment(
+    df: pd.DataFrame, 
+    softmax_list: List[np.ndarray], 
+    case_ids: List[str]
+) -> None:
+    """Validate that softmax matrices align with dataframe traces."""
+    if len(case_ids) != len(softmax_list):
+        raise ValueError(
+            f"Number of cases ({len(case_ids)}) doesn't match "
+            f"number of softmax matrices ({len(softmax_list)})"
+        )
+    
+    trace_lengths = df['case:concept:name'].value_counts()
+    for i, case_id in enumerate(case_ids):
+        expected_length = trace_lengths[case_id]
+        actual_length = softmax_list[i].shape[1]
+        
+        if expected_length != actual_length:
+            raise ValueError(
+                f"Case '{case_id}': trace has {expected_length} events "
+                f"but softmax matrix has {actual_length} columns"
+            )
+
+
+def split_train_test(
+    df: pd.DataFrame,
+    n_train_traces: int,
+    n_test_traces: int,
+    train_cases: Optional[List[Any]] = None,
+    test_cases: Optional[List[Any]] = None,
+    ensure_train_variant_diversity: bool = False,
+    ensure_test_variant_diversity: bool = False,
+    random_seed: int = 42
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split event log into train and test sets based on traces.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Event log with 'case:concept:name' column.
+    n_train_traces : int
+        Number of training traces to select (only used when train_cases is None).
+    n_test_traces : int
+        Number of test traces to select (only used when test_cases is None).
+    train_cases : Optional[List[Any]]
+        Specific case IDs for training. If provided, ALL these cases are used
+        and n_train_traces is ignored.
+    test_cases : Optional[List[Any]]
+        Specific case IDs for testing. If provided, ALL these cases are used
+        and n_test_traces is ignored.
+    ensure_train_variant_diversity : bool, default=False
+        If True, select train cases from different trace variants.
+        Only used when train_cases is None.
+    ensure_test_variant_diversity : bool, default=False
+        If True, select test cases from different trace variants.
+        Only used when test_cases is None.
+    random_seed : int, default=42
+        Random seed for reproducible selection.
+        
+    Returns
+    -------
+    tuple
+        (train_df, test_df) - DataFrames containing train and test events.
+        
+    Examples
+    --------
+    >>> train_df, test_df = split_train_test(
+    ...     df, n_train_traces=10, n_test_traces=5,
+    ...     ensure_test_variant_diversity=True, random_seed=42
+    ... )
+    """
+    # Get all unique cases
+    all_cases = df['case:concept:name'].drop_duplicates().tolist()
+    
+    # Generate derived seeds for train and test to ensure independence
+    train_seed = _get_derived_seed(random_seed, "train")
+    test_seed = _get_derived_seed(random_seed, "test")
+    
+    # Determine train cases
+    if train_cases is not None:
+        final_train_cases = train_cases
+    elif ensure_train_variant_diversity:
+        final_train_cases = _select_diverse_cases(df, n_train_traces, train_seed)
+    else:
+        final_train_cases = _select_random_cases(all_cases, n_train_traces, train_seed)
+    
+    # Determine test cases (excluding train cases to prevent data leakage)
+    remaining_cases = [c for c in all_cases if c not in final_train_cases]
+    
+    if test_cases is not None:
+        final_test_cases = test_cases
+    elif ensure_test_variant_diversity:
+        remaining_df = df.loc[df['case:concept:name'].isin(remaining_cases)]
+        final_test_cases = _select_diverse_cases(remaining_df, n_test_traces, test_seed)
+    else:
+        final_test_cases = _select_random_cases(remaining_cases, n_test_traces, test_seed)
+    
+    # Create train and test DataFrames
+    train_df = _extract_cases(df, final_train_cases)
+    test_df = _extract_cases(df, final_test_cases)
+    
+    return train_df, test_df
+
+
+def _select_random_cases(
+    all_cases: List[str], 
+    n_cases: int, 
+    seed: int
+) -> List[str]:
+    """Randomly select n_cases from all available cases."""
+    rng = random.Random(seed)
+    n_to_select = min(n_cases, len(all_cases))
+    return rng.sample(all_cases, n_to_select)
+
+
+def _select_diverse_cases(
+    df: pd.DataFrame, 
+    n_cases: int, 
+    seed: int
+) -> List[str]:
+    """
+    Select cases from different trace variants to ensure diversity.
+    Each variant represents a unique sequence of activities.
+    """
+    rng = random.Random(seed)
+    
+    # Group cases by their trace variant (sequence of activities)
+    trace_variants = {}
+    for case_id in df['case:concept:name'].unique():
+        case_trace = df[df['case:concept:name'] == case_id]['concept:name'].tolist()
+        trace_signature = tuple(case_trace)
+        
+        if trace_signature not in trace_variants:
+            trace_variants[trace_signature] = []
+        trace_variants[trace_signature].append(case_id)
+    
+    selected_cases = []
+    available_variants = list(trace_variants.keys())
+    
+    # First, select one case from each different variant
+    for i in range(min(n_cases, len(available_variants))):
+        variant = available_variants[i]
+        selected_case = rng.choice(trace_variants[variant])
+        selected_cases.append(selected_case)
+    
+    # If we still need more cases, select randomly from remaining cases
+    if len(selected_cases) < n_cases:
+        all_cases = df['case:concept:name'].unique().tolist()
+        remaining_cases = [c for c in all_cases if c not in selected_cases]
+        
+        n_additional = n_cases - len(selected_cases)
+        if len(remaining_cases) >= n_additional:
+            additional_cases = rng.sample(remaining_cases, n_additional)
+            selected_cases.extend(additional_cases)
+        else:
+            # If not enough remaining cases, select all remaining
+            selected_cases.extend(remaining_cases)
+    
+    return selected_cases[:n_cases]
+
+
+def _extract_cases(df: pd.DataFrame, case_ids: List[str]) -> pd.DataFrame:
+    """Extract events for specified case IDs, maintaining order."""
+    if not case_ids:
+        return df.iloc[0:0].copy()
+    
+    # Filter and preserve original row order
+    filtered = df[df['case:concept:name'].isin(case_ids)].reset_index()
+    
+    # Sort by case_ids order, then by original position
+    case_order = {case_id: i for i, case_id in enumerate(case_ids)}
+    filtered['_order'] = filtered['case:concept:name'].map(lambda x: case_order[x])
+    
+    return (filtered.sort_values(['_order', 'index'])
+                   .drop(columns=['_order', 'index'])
+                   .reset_index(drop=True))
+
+
+def _get_derived_seed(base_seed: int, context: str) -> int:
+    """Generate a derived seed for different contexts."""
+    seed_str = f"{base_seed}_{context}"
+    return int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)

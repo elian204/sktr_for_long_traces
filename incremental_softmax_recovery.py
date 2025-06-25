@@ -7,14 +7,19 @@ compare_stochastic_vs_argmax_random_indices function.
 """
 
 from typing import Any, Callable, List, Optional, Tuple, Union
+import logging
 import pandas as pd
 import numpy as np
+from utils import validate_input_parameters, process_cost_function
+from data_processing import prepare_softmax
+
+# Configure logger
+logger = logging.getLogger(__name__)
 
 
 def incremental_softmax_recovery(
     df: pd.DataFrame,
-    *,
-    softmax_lst: Optional[List[np.ndarray]] = None,
+    softmax_lst: List[np.ndarray],
     n_train_traces: int = 10,
     n_test_traces: int = 10,
     train_cases: Optional[List[Any]] = None,
@@ -30,12 +35,14 @@ def incremental_softmax_recovery(
     alpha: float = 0.5,
     use_ngram_smoothing: bool = True,
     use_calibration: bool = False,
-    temp_bounds: Tuple[int, int] = (1, 10),
-    n_indices: int = 100,
+    temp_bounds: Tuple[float, float] = (1.0, 10.0),
+    n_indices: Optional[int] = None,
+    n_per_run: Optional[int] = None,
     sequential_sampling: bool = False,
     round_precision: int = 2,
     random_seed: int = 42,
-) -> pd.DataFrame:
+    return_model: bool = False,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Any]]:
     """
     Incrementally recover activity sequences using beam search over softmax matrices.
 
@@ -48,7 +55,7 @@ def incremental_softmax_recovery(
     df
         Event log with 'case:concept:name' and 'concept:name' columns.
     softmax_lst
-        Softmax matrices per trace; if None, defaults to empty list.
+        Softmax matrices per trace (required).
     n_train_traces
         Number of traces for model discovery (ignored if train_cases is set).
     n_test_traces
@@ -69,41 +76,64 @@ def incremental_softmax_recovery(
         Conditional probability settings (weights, blending, smoothing).
     use_calibration, temp_bounds
         Whether to apply temperature scaling and its bounds.
-    n_indices, sequential_sampling
-        Sampling settings: positions per trace and sequential mode.
+    n_indices : Optional[int]
+        Total number of events to sample per trace (for uniform sampling).
+        Used when sequential_sampling=False. Mutually exclusive with n_per_run.
+    n_per_run : Optional[int]
+        Number of events to sample from each activity run (for sequential sampling).
+        Used when sequential_sampling=True. Mutually exclusive with n_indices.
+    sequential_sampling : bool
+        If True, sample from each run of identical activities using n_per_run.
+        If False, sample uniformly from entire trace using n_indices.
     round_precision
         Digits to round probabilities to.
     random_seed
         Seed for reproducibility.
+    return_model
+        If True, also return the discovered Petri net model.
 
     Returns
     -------
-    pd.DataFrame
-        Results with columns:
-          - case:concept:name, step, predicted_activity,
-            ground_truth, beam_probability, is_correct,
-            cumulative_accuracy
+    results_df
+        DataFrame with columns:
+          - case:concept:name, step, predicted_activity, ground_truth,
+            beam_probability, is_correct, cumulative_accuracy
+    (results_df, model)
+        If return_model is True.
     """
     logger.info("Starting incremental softmax recovery.")
 
     # Prepare default containers
-    softmax_lst = softmax_lst or []
     lambdas = lambdas or []
 
-    # 1. Validate inputs
+    # 1. Validate sampling parameters
+    if sequential_sampling and n_per_run is None:
+        raise ValueError("n_per_run must be specified when sequential_sampling=True")
+    if not sequential_sampling and n_indices is None:
+        raise ValueError("n_indices must be specified when sequential_sampling=False")
+    if n_indices is not None and n_per_run is not None:
+        raise ValueError("n_indices and n_per_run are mutually exclusive")
+
+    # 2. Validate other inputs
+    sampling_param = n_per_run if sequential_sampling else n_indices
     validate_input_parameters(
-        n_indices, round_precision, non_sync_penalty, alpha, temp_bounds
+        sampling_param, round_precision, non_sync_penalty, alpha, temp_bounds
     )
 
     # 2. Cost function
-    cost_fn = process_cost_function(cost_function)
+    cost_fn = process_cost_function(cost_function, round_precision)
 
     # 3. Softmax preparation
     softmax_np = prepare_softmax(softmax_lst)
 
     # 4. Filter data and matrices
     filtered_log, filtered_softmax = filter_indices(
-        df, softmax_np, n_indices, sequential_sampling, random_seed
+        df, 
+        softmax_np, 
+        n_indices=n_indices,
+        n_per_run=n_per_run,
+        sequential_sampling=sequential_sampling, 
+        random_seed=random_seed
     )
 
     # 5. Train/test split
@@ -123,7 +153,7 @@ def incremental_softmax_recovery(
     model = discover_petri_net(train_df, non_sync_penalty)
 
     # 7. Conditional probabilities (optional)
-    prob_dict: dict = {}
+    prob_dict = {}
     if use_cond_probs:
         prob_dict = build_probability_dict(train_df, use_cond_probs, lambdas)
 
@@ -176,4 +206,4 @@ def incremental_softmax_recovery(
     # 11. Build and return results
     results_df = pd.DataFrame(recovery_records)
     logger.info("Incremental recovery completed.")
-    return results_df
+    return (results_df, model) if return_model else results_df
