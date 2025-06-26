@@ -11,7 +11,8 @@ import logging
 import pandas as pd
 import numpy as np
 from utils import validate_input_parameters, process_cost_function
-from data_processing import prepare_softmax
+from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices
+from petri_model import discover_petri_net, build_probability_dict
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -39,6 +40,7 @@ def incremental_softmax_recovery(
     n_indices: Optional[int] = None,
     n_per_run: Optional[int] = None,
     sequential_sampling: bool = False,
+    independent_sampling: bool = True,
     round_precision: int = 2,
     random_seed: int = 42,
     return_model: bool = False,
@@ -85,6 +87,9 @@ def incremental_softmax_recovery(
     sequential_sampling : bool
         If True, sample from each run of identical activities using n_per_run.
         If False, sample uniformly from entire trace using n_indices.
+    independent_sampling : bool
+        If True, each trace uses a different random seed derived from base seed.
+        If False, all traces use the same random state for sampling.
     round_precision
         Digits to round probabilities to.
     random_seed
@@ -113,6 +118,8 @@ def incremental_softmax_recovery(
         raise ValueError("n_indices must be specified when sequential_sampling=False")
     if n_indices is not None and n_per_run is not None:
         raise ValueError("n_indices and n_per_run are mutually exclusive")
+    if n_indices is None and n_per_run is None:
+        raise ValueError("Either n_indices or n_per_run must be specified")
 
     # 2. Validate other inputs
     sampling_param = n_per_run if sequential_sampling else n_indices
@@ -132,7 +139,8 @@ def incremental_softmax_recovery(
         softmax_np, 
         n_indices=n_indices,
         n_per_run=n_per_run,
-        sequential_sampling=sequential_sampling, 
+        sequential_sampling=sequential_sampling,
+        independent_sampling=independent_sampling, 
         random_seed=random_seed
     )
 

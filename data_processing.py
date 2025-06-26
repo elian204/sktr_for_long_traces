@@ -1,4 +1,27 @@
-from typing import Any, Optional, List, Union, Tuple
+"""
+Data Processing Utilities for Process Mining
+============================================
+
+Provides utilities for event log manipulation, trace sampling, and neural network
+output processing in process mining applications.
+
+Key Features:
+- Softmax matrix processing and PyTorch tensor conversion
+- Trace sampling (uniform or sequential strategies) 
+- Train/test splitting with variant diversity support
+- Reproducible random sampling with configurable independence
+
+Main Functions:
+- prepare_softmax: Convert tensors to NumPy arrays
+- filter_indices: Sample events from traces  
+- split_train_test: Create train/test splits with diversity constraints
+
+Example:
+    >>> filtered_df, _ = filter_indices(df, softmax_list, n_indices=5)
+    >>> train_df, test_df = split_train_test(df, 100, 50, random_seed=42)
+"""
+
+from typing import Any, Optional, List, Sequence, Union, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -356,6 +379,9 @@ def _select_diverse_cases(
     selected_cases = []
     available_variants = list(trace_variants.keys())
     
+    # Shuffle the variants to randomize selection order
+    rng.shuffle(available_variants)
+    
     # First, select one case from each different variant
     for i in range(min(n_cases, len(available_variants))):
         variant = available_variants[i]
@@ -399,3 +425,103 @@ def _get_derived_seed(base_seed: int, context: str) -> int:
     """Generate a derived seed for different contexts."""
     seed_str = f"{base_seed}_{context}"
     return int(hashlib.md5(seed_str.encode()).hexdigest()[:8], 16)
+
+
+def select_softmax_matrices(
+    softmax_matrices: Sequence[np.ndarray],
+    df: pd.DataFrame
+) -> List[np.ndarray]:
+    """
+    Select softmax matrices corresponding to case IDs in DataFrame.
+    
+    Maps case IDs to softmax matrix indices. Supports both integer and string case IDs.
+    Uses standard event log columns: 'case:concept:name' and 'concept:name'.
+    
+    Parameters
+    ----------
+    softmax_matrices : Sequence[np.ndarray]
+        Sequence of softmax matrices, indexed by case ID
+    df : pd.DataFrame
+        DataFrame with columns 'case:concept:name' and 'concept:name'
+        
+    Returns
+    -------
+    List[np.ndarray]
+        Softmax matrices corresponding to unique case IDs in df
+        
+    Raises
+    ------
+    ValueError
+        If required columns missing, case IDs invalid, or indices out of bounds
+        
+    Examples
+    --------
+    >>> matrices = [np.array([[0.8, 0.2], [0.3, 0.7]]), 
+    ...            np.array([[0.9, 0.1], [0.4, 0.6]])]
+    >>> df = pd.DataFrame({'case:concept:name': ['0', '1', '0'],
+    ...                   'concept:name': ['A', 'B', 'C']})
+    >>> result = select_softmax_matrices(matrices, df)
+    >>> len(result)  # Should be 2 (unique cases 0 and 1)
+    2
+    """
+    case_column = 'case:concept:name'
+    activity_column = 'concept:name'
+    
+    # Validate required columns
+    if case_column not in df.columns:
+        raise ValueError(f"DataFrame missing required column: '{case_column}'")
+    if activity_column not in df.columns:
+        raise ValueError(f"DataFrame missing required column: '{activity_column}'")
+    
+    # Get unique case IDs in appearance order
+    unique_case_ids = df[case_column].drop_duplicates().tolist()
+    
+    if not unique_case_ids:
+        raise ValueError("No case IDs found in DataFrame")
+    
+    # Convert case IDs to matrix indices
+    try:
+        indices = _convert_case_ids_to_indices(unique_case_ids, len(softmax_matrices))
+    except ValueError as e:
+        raise ValueError(f"Case ID conversion failed: {e}") from e
+    
+    # Select and return matrices
+    selected_matrices = [softmax_matrices[idx] for idx in indices]
+    
+
+    return selected_matrices
+
+
+def _convert_case_ids_to_indices(
+    case_ids: List[Union[str, int]], 
+    max_matrices: int
+) -> List[int]:
+    """
+    Convert case IDs to valid matrix indices.
+    
+    Supports both integer and string case IDs.
+    """
+    indices = []
+    
+    for case_id in case_ids:
+        try:
+            # Convert to integer index
+            idx = int(case_id)
+                
+            # Validate bounds
+            if idx < 0:
+                raise ValueError(f"Negative case ID not allowed: {case_id}")
+            if idx >= max_matrices:
+                raise ValueError(f"Case ID {case_id} out of bounds (max: {max_matrices - 1})")
+                
+            indices.append(idx)
+            
+        except (ValueError, TypeError) as e:
+            if "invalid literal" in str(e):
+                raise ValueError(f"Case ID '{case_id}' is not convertible to integer")
+            raise ValueError(f"Invalid case ID '{case_id}': {e}")
+    
+    return indices
+
+    
+
