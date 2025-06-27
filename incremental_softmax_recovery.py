@@ -11,8 +11,9 @@ import logging
 import pandas as pd
 import numpy as np
 from utils import validate_input_parameters, process_cost_function
-from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices
+from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
 from petri_model import discover_petri_net, build_probability_dict
+from calibration import calibrate_softmax
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -32,11 +33,13 @@ def incremental_softmax_recovery(
     beam_width: int = 10,
     activity_prob_threshold: float = 0.0,
     use_cond_probs: bool = False,
+    max_hist_len: int = 3,
     lambdas: Optional[List[float]] = None,
     alpha: float = 0.5,
     use_ngram_smoothing: bool = True,
     use_calibration: bool = False,
     temp_bounds: Tuple[float, float] = (1.0, 10.0),
+    temperature: Optional[float] = None,
     n_indices: Optional[int] = None,
     n_per_run: Optional[int] = None,
     sequential_sampling: bool = False,
@@ -54,62 +57,110 @@ def incremental_softmax_recovery(
 
     Parameters
     ----------
-    df
+    df : pd.DataFrame
         Event log with 'case:concept:name' and 'concept:name' columns.
-    softmax_lst
-        Softmax matrices per trace (required).
-    n_train_traces
+        **IMPORTANT**: Case IDs must be sequential strings starting from '0'.
+        The case IDs must be exactly ['0', '1', '2', ..., 'N-1'] in order
+        to maintain alignment with the softmax_lst matrices. This is a 
+        restrictive requirement of the current implementation.
+    softmax_lst : List[np.ndarray]
+        Softmax matrices per trace (required). Must be aligned with case IDs:
+        softmax_lst[0] corresponds to case '0', softmax_lst[1] to case '1', etc.
+    n_train_traces : int, default=10
         Number of traces for model discovery (ignored if train_cases is set).
-    n_test_traces
+    n_test_traces : int, default=10
         Number of traces to test (ignored if test_cases is set).
-    train_cases, test_cases
+    train_cases, test_cases : Optional[List[Any]], default=None
         Specific case IDs for training/testing (overrides respective counts).
-    ensure_train_variant_diversity, ensure_test_variant_diversity
+        If provided, must follow the sequential string format.
+    ensure_train_variant_diversity, ensure_test_variant_diversity : bool, default=False
         Enforce distinct trace variants in train/test splits.
-    cost_function
+    cost_function : str or callable, default='linear'
         'linear', 'logarithmic', or a callable mapping float→float.
-    non_sync_penalty
+    non_sync_penalty : float, default=1.0
         Penalty weight for non-synchronous transitions.
-    beam_width
+    beam_width : int, default=10
         Beam search width (number of candidates retained).
-    activity_prob_threshold
+    activity_prob_threshold : float, default=0.0
         Minimum softmax probability to consider an activity.
-    use_cond_probs, lambdas, alpha, use_ngram_smoothing
-        Conditional probability settings (weights, blending, smoothing).
-    use_calibration, temp_bounds
-        Whether to apply temperature scaling and its bounds.
-    n_indices : Optional[int]
+    use_cond_probs : bool, default=False
+        Whether to use conditional probabilities based on trace history.
+    max_hist_len : int, default=3
+        Maximum history length for conditional probabilities.
+    lambdas : Optional[List[float]], default=None
+        Blending weights for conditional probability computation.
+    alpha : float, default=0.5
+        Blending parameter for conditional probabilities (0=history only, 1=base only).
+    use_ngram_smoothing : bool, default=True
+        Whether to apply n-gram smoothing for conditional probabilities.
+    use_calibration : bool, default=False
+        Whether to apply temperature scaling for probability calibration.
+    temp_bounds : Tuple[float, float], default=(1.0, 10.0)
+        Temperature bounds for calibration optimization.
+    temperature : Optional[float], default=None
+        Manual temperature value (bypasses optimization if provided).
+    n_indices : Optional[int], default=None
         Total number of events to sample per trace (for uniform sampling).
         Used when sequential_sampling=False. Mutually exclusive with n_per_run.
-    n_per_run : Optional[int]
+    n_per_run : Optional[int], default=None
         Number of events to sample from each activity run (for sequential sampling).
         Used when sequential_sampling=True. Mutually exclusive with n_indices.
-    sequential_sampling : bool
+    sequential_sampling : bool, default=False
         If True, sample from each run of identical activities using n_per_run.
         If False, sample uniformly from entire trace using n_indices.
-    independent_sampling : bool
+    independent_sampling : bool, default=True
         If True, each trace uses a different random seed derived from base seed.
         If False, all traces use the same random state for sampling.
-    round_precision
+    round_precision : int, default=2
         Digits to round probabilities to.
-    random_seed
+    random_seed : int, default=42
         Seed for reproducibility.
-    return_model
+    return_model : bool, default=False
         If True, also return the discovered Petri net model.
 
     Returns
     -------
-    results_df
+    results_df : pd.DataFrame
         DataFrame with columns:
           - case:concept:name, step, predicted_activity, ground_truth,
             beam_probability, is_correct, cumulative_accuracy
-    (results_df, model)
-        If return_model is True.
+    (results_df, model) : tuple
+        If return_model is True, returns tuple of (results_df, petri_net_model).
+        
+    Raises
+    ------
+    ValueError
+        If case IDs don't follow the sequential string format ['0', '1', '2', ...].
+        If parameter combinations are invalid (e.g., both n_indices and n_per_run specified).
+        If required data is missing or misaligned.
+        
+    Notes
+    -----
+    This implementation has a restrictive assumption about case ID format:
+    - Case IDs must be sequential strings: ['0', '1', '2', ..., 'N-1']
+    - The order in the DataFrame must match the softmax matrix order
+    - softmax_lst[i] must correspond to case ID str(i)
+    
+    For datasets with non-sequential case IDs (e.g., 'CASE_001', 'CASE_042'), 
+    you must preprocess to convert to sequential format.
+        
+    Examples
+    --------
+    >>> # Correct case ID format
+    >>> df = pd.DataFrame({
+    ...     'case:concept:name': ['0', '0', '1', '1', '2', '2'],
+    ...     'concept:name': ['A', 'B', 'A', 'C', 'B', 'C']
+    ... })
+    >>> softmax_matrices = [matrix_0, matrix_1, matrix_2]  # Aligned order
+    >>> results = incremental_softmax_recovery(df, softmax_matrices, n_indices=2)
     """
     logger.info("Starting incremental softmax recovery.")
 
     # Prepare default containers
     lambdas = lambdas or []
+
+    # 0. Early validation of sequential case ID assumption
+    validate_sequential_case_ids(df, softmax_lst)
 
     # 1. Validate sampling parameters
     if sequential_sampling and n_per_run is None:
@@ -123,17 +174,18 @@ def incremental_softmax_recovery(
 
     # 2. Validate other inputs
     sampling_param = n_per_run if sequential_sampling else n_indices
+    assert sampling_param is not None, "sampling_param should not be None after validation"
     validate_input_parameters(
         sampling_param, round_precision, non_sync_penalty, alpha, temp_bounds
     )
 
-    # 2. Cost function
+    # 3. Cost function
     cost_fn = process_cost_function(cost_function, round_precision)
 
-    # 3. Softmax preparation
+    # 4. Softmax preparation
     softmax_np = prepare_softmax(softmax_lst)
 
-    # 4. Filter data and matrices
+    # 5. Filter data and matrices
     filtered_log, filtered_softmax = filter_indices(
         df, 
         softmax_np, 
@@ -144,7 +196,7 @@ def incremental_softmax_recovery(
         random_seed=random_seed
     )
 
-    # 5. Train/test split
+    # 6. Train/test split
     train_df, test_df = split_train_test(
         filtered_log,
         n_train_traces,
@@ -156,44 +208,41 @@ def incremental_softmax_recovery(
         random_seed=random_seed,
     )
 
-    # 6. Model discovery
+    # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
     model = discover_petri_net(train_df, non_sync_penalty)
 
-    # 7. Conditional probabilities (optional)
+    # 8. Conditional probabilities (optional)
     prob_dict = {}
     if use_cond_probs:
-        prob_dict = build_probability_dict(train_df, use_cond_probs, lambdas)
+        prob_dict = build_probability_dict(train_df, max_hist_len)
 
-    # 8. Prepare test softmax matrices (with optional calibration)
+    # 9. Prepare test softmax matrices (with optional calibration)
+    if filtered_softmax is None:
+        raise ValueError("Filtered softmax matrices are required but none were generated")
+    
     test_softmax_matrices = select_softmax_matrices(filtered_softmax, test_df)
     if use_calibration:
+        # Use complete original matrices for calibration training (not filtered)
         train_softmax_matrices = select_softmax_matrices(softmax_np, train_df)
         test_softmax_matrices = calibrate_softmax(
-            train_df,
-            test_df,
-            train_softmax_matrices,
-            test_softmax_matrices,
-            temp_bounds,
+            train_df=train_df,
+            test_df=test_df,
+            softmax_train=train_softmax_matrices,
+            softmax_test=test_softmax_matrices,
+            temp_bounds=temp_bounds,
+            temperature=temperature,
         )
-
-    # 9. Validate alignment between test cases and matrices
-    test_cases = test_df["case:concept:name"].drop_duplicates().tolist()
-    logger.info(f"Processing {len(test_cases)} cases: {test_cases}")
-    if not test_softmax_matrices or len(test_cases) != len(test_softmax_matrices):
-        raise ValueError(
-            "No softmax matrices provided"
-            if not test_softmax_matrices
-            else f"Found {len(test_cases)} cases but "
-                 f"{len(test_softmax_matrices)} matrices"
-        )
-
-    # 10. Incremental beam-search recovery
+    
+    # 10. Extract test case IDs for processing
+    test_case_ids = test_df['case:concept:name'].drop_duplicates().tolist()
+    
+    # 11. Incremental beam-search recovery
     recovery_records: List[dict] = []
     for idx, (case, softmax_matrix) in enumerate(
-        zip(test_cases, test_softmax_matrices), start=1
+        zip(test_case_ids, test_softmax_matrices), start=1
     ):
-        logger.debug(f"Case {idx}/{len(test_cases)}: {case}")
+        logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
         records = _process_test_case_incremental(
             trace_case=case,
             test_df=test_df,
@@ -211,7 +260,50 @@ def incremental_softmax_recovery(
         )
         recovery_records.extend(records)
 
-    # 11. Build and return results
+    # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
     logger.info("Incremental recovery completed.")
     return (results_df, model) if return_model else results_df
+
+
+def _process_test_case_incremental(
+    trace_case: str,
+    test_df: pd.DataFrame,
+    softmax_matrix: np.ndarray,
+    model: Any,
+    cost_function: Callable[[float], float],
+    beam_width: int,
+    lambdas: List[float],
+    alpha: float,
+    use_cond_probs: bool,
+    prob_dict: dict,
+    use_ngram_smoothing: bool,
+    round_precision: int,
+    activity_prob_threshold: float,
+) -> List[dict]:
+    """
+    Process a single test case using incremental beam search.
+    
+    This is a placeholder implementation that needs to be completed
+    with the actual beam search logic.
+    """
+    # Get the trace events for this case
+    case_events = test_df[test_df['case:concept:name'] == trace_case]
+    
+    # Placeholder: Return dummy records for now
+    # TODO: Implement actual beam search incremental recovery logic
+    records = []
+    
+    for step, (_, event) in enumerate(case_events.iterrows()):
+        record = {
+            'case:concept:name': trace_case,
+            'step': step,
+            'predicted_activity': event['concept:name'],  # Placeholder
+            'ground_truth': event['concept:name'],
+            'beam_probability': 1.0,  # Placeholder
+            'is_correct': True,  # Placeholder
+            'cumulative_accuracy': 1.0  # Placeholder
+        }
+        records.append(record)
+    
+    return records

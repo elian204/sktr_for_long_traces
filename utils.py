@@ -136,3 +136,41 @@ def process_cost_function(
         raise TypeError(f"cost_function must be a string or callable, got {type(cost_function)}")
 
 
+def inverse_softmax(
+    softmax_probs: np.ndarray,
+    epsilon: float = 1e-9
+) -> np.ndarray:
+    """
+    Convert softmax probabilities to logits (inverse of softmax).
+
+    Parameters
+    ----------
+    softmax_probs : np.ndarray
+        Array of softmax probabilities, shape (n_classes, n_events) or (n_classes,).
+        Each probability should be in (0, 1) and columns should sum to 1.
+    epsilon : float, default=1e-9
+        Small value to avoid log(0) or log(1) which would result in -inf/inf.
+
+    Returns
+    -------
+    np.ndarray
+        Logits with same shape as input.
+
+    Notes
+    -----
+    - This computes log(p), not the logit function log(p/(1-p)).
+    - Softmax logit recovery can only retrieve logits *up to a constant shift*
+      since softmax is invariant to adding constants: softmax(x) = softmax(x + c).
+    - Used primarily for temperature scaling in probability calibration.
+
+    Examples
+    --------
+    >>> probs = np.array([[0.7, 0.2], [0.3, 0.8]])
+    >>> logits = inverse_softmax(probs)
+    >>> # logits ≈ [[-0.357, -1.609], [-1.204, -0.223]]
+    """
+    # Clip probabilities to avoid log(0) and log(1)
+    probs = np.clip(softmax_probs, epsilon, 1.0 - epsilon)
+    return np.log(probs)
+
+

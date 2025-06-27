@@ -279,11 +279,9 @@ def _create_configured_petrinet(
 
 def build_probability_dict(
     train_df: pd.DataFrame,
-    use_conditional_probs: bool,
-    lambdas: Optional[List[float]] = None,
-    max_hist_len: int = 2,
+    max_hist_len: int = 3,
     precision: int = 2
-) -> Optional[Dict[Tuple[str, ...], Dict[str, float]]]:
+) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build a conditional probability dictionary from training traces.
     
@@ -291,32 +289,21 @@ def build_probability_dict(
     ----------
     train_df : pd.DataFrame
         Training DataFrame with 'case:concept:name' and 'concept:name' columns
-    use_conditional_probs : bool
-        Whether to build conditional probabilities
-    lambdas : List[float], optional
-        N-gram weights for smoothing (if provided, max_hist_len = len(lambdas))
-    max_hist_len : int, default=2
+    max_hist_len : int, default=3
         Maximum history length for n-grams
     precision : int, default=2
         Decimal precision for probabilities
         
     Returns
     -------
-    Dict[Tuple[str, ...], Dict[str, float]] or None
-        Dictionary mapping history tuples to activity probabilities,
-        or None if conditional probabilities not requested
+    Dict[Tuple[str, ...], Dict[str, float]]
+        Dictionary mapping history tuples to activity probabilities
     """
-    if not use_conditional_probs or lambdas is None:
-        return None
-    
-    max_hist_len = len(lambdas)
-    prob_dict = _build_conditioned_prob_dict(
+    return _build_conditioned_prob_dict(
         train_df, 
         max_hist_len=max_hist_len, 
         precision=precision
     )
-    
-    return prob_dict
 
 
 def _build_conditioned_prob_dict(
@@ -344,34 +331,38 @@ def _build_conditioned_prob_dict(
     Dict[Tuple[str, ...], Dict[str, float]]
         Dictionary mapping history tuples to {activity: probability} dictionaries
     """
-    # Extract activity sequences per case
-    activity_sequences = _extract_activity_sequences(df_train)
+    # Efficient extraction using groupby - O(n) instead of O(n²)
+    activity_sequences = [
+        group['concept:name'].tolist() 
+        for _, group in df_train.groupby('case:concept:name', sort=False)
+    ]
     
-    # Generate all (history, activity) pairs
-    history_activity_pairs = []
+    # Build histogram directly without intermediate list
+    history_counts = defaultdict(lambda: defaultdict(int))
+    
     for sequence in activity_sequences:
         pairs = _get_histories_up_to_length_k(sequence, max_hist_len)
-        history_activity_pairs.extend(pairs)
+        for history, activity in pairs:
+            history_counts[history][activity] += 1
     
-    # Count occurrences
-    pair_counts = Counter(history_activity_pairs)
-    
-    # Convert to conditional probabilities
-    prob_dict = _convert_to_conditional_probabilities(pair_counts, precision)
+    # Convert to conditional probabilities in single pass
+    prob_dict = {}
+    for history, activity_counts in history_counts.items():
+        total_count = sum(activity_counts.values())
+        if total_count == 0:
+            continue
+            
+        activity_probs = {}
+        for activity, count in activity_counts.items():
+            probability = round(count / total_count, precision)
+            if probability > 0:  # Only include non-zero probabilities
+                activity_probs[activity] = probability
+        
+        # Only include histories that have valid probabilities
+        if activity_probs:
+            prob_dict[history] = activity_probs
     
     return prob_dict
-
-
-def _extract_activity_sequences(df_train: pd.DataFrame) -> List[List[str]]:
-    """Extract list of activity sequences from training DataFrame."""
-    sequences = []
-    
-    for case_id in df_train['case:concept:name'].unique():
-        case_data = df_train[df_train['case:concept:name'] == case_id]
-        sequence = case_data['concept:name'].tolist()
-        sequences.append(sequence)
-    
-    return sequences
 
 
 def _get_histories_up_to_length_k(
@@ -393,12 +384,13 @@ def _get_histories_up_to_length_k(
     List[Tuple[Tuple[str, ...], str]]
         List of (history_tuple, next_activity) pairs
     """
+    if not activities_seq_list:
+        return []
+    
     histories = []
     
     # Include the first activity with empty history
-    if activities_seq_list:
-        first_activity = activities_seq_list[0]
-        histories.append(((), first_activity))
+    histories.append(((), activities_seq_list[0]))
     
     # Generate histories for subsequent activities
     for i in range(1, len(activities_seq_list)):
@@ -410,53 +402,3 @@ def _get_histories_up_to_length_k(
             histories.append((history, current_activity))
     
     return histories
-
-
-def _convert_to_conditional_probabilities(
-    pair_counts: Counter,
-    precision: int = 2
-) -> Dict[Tuple[str, ...], Dict[str, float]]:
-    """
-    Convert absolute counts to conditional probabilities P(activity | history).
-    
-    Parameters
-    ----------
-    pair_counts : Counter
-        Counter of (history, activity) pairs
-    precision : int, default=2
-        Decimal precision for probabilities
-        
-    Returns
-    -------
-    Dict[Tuple[str, ...], Dict[str, float]]
-        Conditional probability dictionary
-    """
-    # Group by history to calculate P(activity | history)
-    history_totals = defaultdict(int)
-    history_activity_counts = defaultdict(lambda: defaultdict(int))
-    
-    # Count totals per history
-    for (history, activity), count in pair_counts.items():
-        history_totals[history] += count
-        history_activity_counts[history][activity] += count
-    
-    # Convert to probabilities
-    prob_dict = {}
-    
-    for history in history_activity_counts:
-        total_count = history_totals[history]
-        
-        if total_count == 0:
-            continue
-            
-        activity_probs = {}
-        for activity, count in history_activity_counts[history].items():
-            probability = round(count / total_count, precision)
-            if probability > 0:  # Only include non-zero probabilities
-                activity_probs[activity] = probability
-        
-        # Only include histories that have valid probabilities
-        if activity_probs:
-            prob_dict[history] = activity_probs
-    
-    return prob_dict

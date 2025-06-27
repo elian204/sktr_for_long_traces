@@ -263,6 +263,48 @@ def _validate_softmax_alignment(
             )
 
 
+def validate_sequential_case_ids(df: pd.DataFrame, softmax_lst: List[np.ndarray]) -> None:
+    """
+    Validate that case IDs are sequential strings starting from '0'.
+    
+    This function ensures the restrictive assumption required by the current
+    implementation: case IDs must be ['0', '1', '2', ...] in order.
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Event log with 'case:concept:name' column
+    softmax_lst : List[np.ndarray]
+        List of softmax matrices, one per case
+        
+    Raises
+    ------
+    ValueError
+        If case IDs don't match the sequential string pattern
+    """
+    # Get unique case IDs in order of appearance
+    unique_cases = df['case:concept:name'].drop_duplicates().tolist()
+    
+    # Check count alignment
+    if len(unique_cases) != len(softmax_lst):
+        raise ValueError(
+            f"Number of unique cases ({len(unique_cases)}) doesn't match "
+            f"number of softmax matrices ({len(softmax_lst)})"
+        )
+    
+    # Check sequential pattern
+    expected_cases = [str(i) for i in range(len(unique_cases))]
+    
+    if unique_cases != expected_cases:
+        raise ValueError(
+            f"Case IDs must be sequential strings starting from '0'.\n"
+            f"Expected: {expected_cases}\n"
+            f"Found: {unique_cases}\n"
+            f"This implementation requires case IDs to be exactly ['0', '1', '2', ...] "
+            f"to maintain alignment between traces and softmax matrices."
+        )
+
+
 def split_train_test(
     df: pd.DataFrame,
     n_train_traces: int,
@@ -522,6 +564,4 @@ def _convert_case_ids_to_indices(
             raise ValueError(f"Invalid case ID '{case_id}': {e}")
     
     return indices
-
-    
 
