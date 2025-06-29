@@ -6,9 +6,10 @@ using beam search with Petri nets, following the pattern of the existing
 compare_stochastic_vs_argmax_random_indices function.
 """
 
-from typing import Tuple, Union, Callable
+from typing import Tuple, Union, Callable, Optional
 import numpy as np
 
+MoveType = str 
 
 def validate_input_parameters(
     n_indices: int,
@@ -79,61 +80,48 @@ def validate_input_parameters(
         raise ValueError(f"temp_bounds values must be positive, got {temp_bounds}")
 
 
-def process_cost_function(
-    cost_function: Union[str, Callable[[float], float]], 
+def make_cost_function(
+    base: Union[str, Callable[[float], float]] = "linear",
+    model_move: Optional[Union[float, str, Callable[[float], float]]] = 1.0,
+    log_move:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
+    tau_move:   Optional[Union[float, str, Callable[[float], float]]] = 1e-6,
     round_precision: int = 2
-) -> Callable[[float], float]:
+) -> Callable[[float, MoveType], float]:
     """
-    Process and validate the cost function parameter.
-    
-    Parameters
-    ----------
-    cost_function : str or callable
-        Either 'linear', 'logarithmic', or a custom callable that maps float → float.
-    round_precision : int, default=2
-        Number of decimal places for probability rounding. Used to determine
-        the minimum probability (10^-round_precision) for logarithmic scaling.
-        
-    Returns
-    -------
-    callable
-        A cost function that takes a float and returns a float.
-        For logarithmic functions, costs are normalized to [0,1] range.
-        
-    Raises
-    ------
-    ValueError
-        If cost_function is a string but not 'linear' or 'logarithmic'.
-    TypeError
-        If cost_function is neither a string nor callable.
-        
-    Notes
-    -----
-    - Linear cost: cost = 1 - probability
-    - Logarithmic cost: cost = -ln(max(prob, min_prob)) / (-ln(min_prob))
-      where min_prob = 10^(-round_precision)
+    Build f(p: float, move_type: MoveType) → cost.
+
+    Defaults:
+      - sync: `base` (linear/logarithmic/callable)
+      - model: constant 1.0
+      - log:   constant 1.0
+      - tau:   constant 1e-6
     """
-    if isinstance(cost_function, str):
-        if cost_function == "linear":
-            return lambda x: 1.0 - x
-        elif cost_function == "logarithmic":
-            # Calculate minimum probability and normalization factor
-            min_prob = 10 ** (-round_precision)
-            scale_factor = -np.log(min_prob)  # This ensures max cost = 1.0
-            
-            def logarithmic_cost(x: float) -> float:
-                # Clamp probability to valid range [min_prob, 1.0]
-                prob = max(min(x, 1.0), min_prob)
-                return -np.log(prob) / scale_factor
-            
-            return logarithmic_cost
-        else:
-            raise ValueError(f"Unknown cost function string: '{cost_function}'. "
-                           f"Supported values are 'linear' and 'logarithmic'.")
-    elif callable(cost_function):
-        return cost_function
-    else:
-        raise TypeError(f"cost_function must be a string or callable, got {type(cost_function)}")
+    def normalize(cf):
+        if isinstance(cf, (float, int)):
+            return lambda _: float(cf)
+        if isinstance(cf, str):
+            if cf == "linear":
+                return lambda p: 1 - p
+            if cf == "logarithmic":
+                min_p = 10 ** (-round_precision)
+                scale = -np.log(min_p)
+                return lambda p: -np.log(max(min(p, 1.0), min_p)) / scale
+            raise ValueError(f"Unknown cost '{cf}'")
+        if callable(cf):
+            return cf
+        raise TypeError(f"Cost spec must be float, str or callable, got {type(cf)}")
+
+    base_fn = normalize(base)
+    overrides = {
+        "model": normalize(model_move),
+        "log":   normalize(log_move),
+        "tau":   normalize(tau_move),
+    }
+
+    def cost_fn(prob: float, move_type: MoveType = "sync") -> float:
+        return overrides.get(move_type, base_fn)(prob)
+
+    return cost_fn
 
 
 def inverse_softmax(

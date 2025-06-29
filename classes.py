@@ -1,3 +1,26 @@
+"""
+Core classes for Petri net modeling and process conformance checking.
+
+This module provides the fundamental data structures and algorithms for:
+- Petri net representation (places, transitions, arcs, markings)
+- Reachability graph construction and exploration
+- Synchronous product construction for alignment-based conformance checking
+- A* and Dijkstra-based optimal alignment computation with probabilistic weights
+- Support for partial conformance checking and trace recovery
+
+Main Classes:
+    Place, Transition, Arc: Basic Petri net components
+    Marking: Token distribution representation
+    PetriNet: Main Petri net class with reachability analysis
+    SyncProduct: Specialized class for conformance checking alignments
+    Graph, Node, Edge: Graph representation structures
+    search_node_new: Search state for alignment algorithms
+
+The module supports both classical and probabilistic conformance checking
+approaches, including conditional probability-based cost functions and
+n-gram smoothing for improved alignment quality.
+"""
+
 import numpy as np
 import copy
 from heapq import heappush, heappop

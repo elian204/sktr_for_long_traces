@@ -10,10 +10,11 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import logging
 import pandas as pd
 import numpy as np
-from utils import validate_input_parameters, process_cost_function
+from utils import validate_input_parameters, make_cost_function
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_softmax
+from beam_search import process_test_case_incremental
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ def incremental_softmax_recovery(
     ensure_train_variant_diversity: bool = False,
     ensure_test_variant_diversity: bool = False,
     cost_function: Union[str, Callable[[float], float]] = "linear",
+    model_move_cost: Optional[Union[float, str, Callable[[float], float]]] = 1.0,
+    log_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
+    tau_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1e-6,
     non_sync_penalty: float = 1.0,
     beam_width: int = 10,
     activity_prob_threshold: float = 0.0,
@@ -180,7 +184,13 @@ def incremental_softmax_recovery(
     )
 
     # 3. Cost function
-    cost_fn = process_cost_function(cost_function, round_precision)
+    cost_fn = make_cost_function(
+        base=cost_function,
+        model_move=model_move_cost,
+        log_move=log_move_cost,
+        tau_move=tau_move_cost,
+        round_precision=round_precision
+    )
 
     # 4. Softmax preparation
     softmax_np = prepare_softmax(softmax_lst)
@@ -243,20 +253,30 @@ def incremental_softmax_recovery(
         zip(test_case_ids, test_softmax_matrices), start=1
     ):
         logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
-        records = _process_test_case_incremental(
-            trace_case=case,
-            test_df=test_df,
+        
+        # Get predicted sequence using beam search
+        predicted_sequence = process_test_case_incremental(
             softmax_matrix=softmax_matrix,
             model=model,
-            cost_function=cost_fn,
+            cost_fn=cost_fn,
             beam_width=beam_width,
             lambdas=lambdas,
             alpha=alpha,
             use_cond_probs=use_cond_probs,
             prob_dict=prob_dict,
             use_ngram_smoothing=use_ngram_smoothing,
-            round_precision=round_precision,
             activity_prob_threshold=activity_prob_threshold,
+        )
+        
+        # Extract ground truth sequence for accuracy computation
+        ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
+        ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+        
+        # Compute accuracy and create records
+        records = _compute_accuracy_records(
+            case_id=case,
+            predicted_sequence=predicted_sequence,
+            ground_truth_sequence=ground_truth_sequence
         )
         recovery_records.extend(records)
 
@@ -266,44 +286,56 @@ def incremental_softmax_recovery(
     return (results_df, model) if return_model else results_df
 
 
-def _process_test_case_incremental(
-    trace_case: str,
-    test_df: pd.DataFrame,
-    softmax_matrix: np.ndarray,
-    model: Any,
-    cost_function: Callable[[float], float],
-    beam_width: int,
-    lambdas: List[float],
-    alpha: float,
-    use_cond_probs: bool,
-    prob_dict: dict,
-    use_ngram_smoothing: bool,
-    round_precision: int,
-    activity_prob_threshold: float,
+def _compute_accuracy_records(
+    case_id: str,
+    predicted_sequence: List[str],
+    ground_truth_sequence: List[str]
 ) -> List[dict]:
     """
-    Process a single test case using incremental beam search.
+    Compute accuracy records by comparing predicted and ground truth sequences.
     
-    This is a placeholder implementation that needs to be completed
-    with the actual beam search logic.
+    Parameters
+    ----------
+    case_id : str
+        Case identifier
+    predicted_sequence : List[str]
+        Predicted activity sequence
+    ground_truth_sequence : List[str]
+        Ground truth activity sequence
+        
+    Returns
+    -------
+    List[dict]
+        List of records with accuracy metrics for each step
     """
-    # Get the trace events for this case
-    case_events = test_df[test_df['case:concept:name'] == trace_case]
-    
-    # Placeholder: Return dummy records for now
-    # TODO: Implement actual beam search incremental recovery logic
     records = []
+    correct_predictions = 0
+    max_len = max(len(predicted_sequence), len(ground_truth_sequence))
     
-    for step, (_, event) in enumerate(case_events.iterrows()):
+    for step in range(max_len):
+        # Get predicted and ground truth activities (handle mismatched lengths)
+        predicted_activity = predicted_sequence[step] if step < len(predicted_sequence) else "UNK"
+        ground_truth = ground_truth_sequence[step] if step < len(ground_truth_sequence) else "UNK"
+        
+        # Check correctness
+        is_correct = predicted_activity == ground_truth
+        if is_correct:
+            correct_predictions += 1
+        
+        # Compute cumulative accuracy
+        cumulative_accuracy = correct_predictions / (step + 1)
+        
         record = {
-            'case:concept:name': trace_case,
+            'case:concept:name': case_id,
             'step': step,
-            'predicted_activity': event['concept:name'],  # Placeholder
-            'ground_truth': event['concept:name'],
-            'beam_probability': 1.0,  # Placeholder
-            'is_correct': True,  # Placeholder
-            'cumulative_accuracy': 1.0  # Placeholder
+            'predicted_activity': predicted_activity,
+            'ground_truth': ground_truth,
+            'is_correct': is_correct,
+            'cumulative_accuracy': cumulative_accuracy
         }
         records.append(record)
     
     return records
+
+
+
