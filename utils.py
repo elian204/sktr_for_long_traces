@@ -6,7 +6,7 @@ using beam search with Petri nets, following the pattern of the existing
 compare_stochastic_vs_argmax_random_indices function.
 """
 
-from typing import Tuple, Union, Callable, Optional
+from typing import Tuple, Union, Callable, Optional, Dict, List
 import numpy as np
 
 MoveType = str 
@@ -160,5 +160,170 @@ def inverse_softmax(
     # Clip probabilities to avoid log(0) and log(1)
     probs = np.clip(softmax_probs, epsilon, 1.0 - epsilon)
     return np.log(probs)
+
+
+def compute_conditional_probability(
+    path_prefix: Tuple[str, ...],
+    activity_name: str,
+    base_probability: float,
+    prob_dict: dict,
+    lambdas: List[float],
+    alpha: float,
+    use_ngram_smoothing: bool,
+) -> float:
+    """
+    Compute conditional probability based on path history.
+    
+    Supports both n-gram smoothing and prefix search approaches for
+    computing conditional probabilities based on path history.
+    
+    Parameters
+    ----------
+    path_prefix : tuple of str
+        Sequence of activities leading to current transition
+    activity_name : str
+        Name of the current activity
+    base_probability : float
+        Base probability from softmax
+    prob_dict : dict
+        Probability dictionary for conditional weights
+    lambdas : list of float
+        Weights for n-gram lengths (required for n-gram smoothing)
+    alpha : float
+        Blending factor between base and conditional probabilities
+    use_ngram_smoothing : bool
+        Whether to use n-gram smoothing approach
+        
+    Returns
+    -------
+    float
+        Conditional probability
+    """
+    if not prob_dict:
+        return base_probability
+    
+    if use_ngram_smoothing:
+        conditional_prob = compute_ngram_probability(
+            path_prefix, activity_name, prob_dict, lambdas
+        )
+    else:
+        conditional_prob = compute_prefix_search_probability(
+            path_prefix, activity_name, prob_dict
+        )
+    
+    # Blend conditional probability with base probability
+    return (1 - alpha) * conditional_prob + alpha * base_probability
+
+
+def compute_ngram_probability(
+    path_prefix_tuple: Tuple[str, ...],
+    activity_name: str,
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
+    lambdas: List[float]
+) -> float:
+    """
+    Compute probability using n-gram smoothing.
+    
+    Parameters
+    ----------
+    path_prefix_tuple : tuple of str
+        Sequence of activities in path prefix
+    activity_name : str
+        Name of current activity
+    prob_dict : dict
+        N-gram probability dictionary
+    lambdas : list of float
+        Weights for different n-gram lengths
+        
+    Returns
+    -------
+    float
+        Computed probability
+    """
+    if not lambdas:
+        return 0.0
+    
+    if not path_prefix_tuple:
+        return prob_dict.get((), {}).get(activity_name, 0.0)
+    
+    total_weighted_prob = 0.0
+    total_lambda_weight = 0.0
+    max_n = min(len(path_prefix_tuple), len(lambdas))
+    
+    for n in range(1, max_n + 1):
+        prefix_n_gram = path_prefix_tuple[-n:]
+        prob = prob_dict.get(prefix_n_gram, {}).get(activity_name, 0.0)
+        lambda_weight = lambdas[n - 1]
+        
+        total_weighted_prob += lambda_weight * prob
+        total_lambda_weight += lambda_weight
+    
+    if total_lambda_weight == 0:
+        return 0.0
+    
+    return total_weighted_prob / total_lambda_weight
+
+
+def compute_prefix_search_probability(
+    path_prefix_tuple: Tuple[str, ...],
+    activity_name: str,
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]]
+) -> float:
+    """
+    Compute probability using prefix search.
+    
+    Parameters
+    ----------
+    path_prefix_tuple : tuple of str
+        Sequence of activities in path prefix
+    activity_name : str
+        Name of current activity
+    prob_dict : dict
+        Prefix probability dictionary
+        
+    Returns
+    -------
+    float
+        Computed probability
+    """
+    if not path_prefix_tuple:
+        return 0.0
+    
+    # Check exact prefix match
+    if path_prefix_tuple in prob_dict:
+        return prob_dict[path_prefix_tuple].get(activity_name, 0.0)
+    
+    # Find longest matching prefix
+    longest_prefix = find_longest_prefix(path_prefix_tuple, prob_dict)
+    if longest_prefix:
+        return prob_dict[longest_prefix].get(activity_name, 0.0)
+    
+    return 0.0
+
+
+def find_longest_prefix(
+    path_prefix_tuple: Tuple[str, ...],
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]]
+) -> Optional[Tuple[str, ...]]:
+    """
+    Find longest prefix that exists in dictionary.
+    
+    Parameters
+    ----------
+    path_prefix_tuple : tuple of str
+        Complete path to search in
+    prob_dict : dict
+        Dictionary to search for prefixes
+        
+    Returns
+    -------
+    tuple of str or None
+        Longest matching prefix, or None if no match found
+    """
+    for i in range(len(path_prefix_tuple), 0, -1):
+        sub_prefix = path_prefix_tuple[-i:]
+        if sub_prefix in prob_dict:
+            return sub_prefix
+    return None
 
 
