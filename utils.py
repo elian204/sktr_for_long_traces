@@ -203,6 +203,10 @@ def compute_conditional_probability(
         return base_probability
     
     if use_ngram_smoothing:
+        # Validate lambdas when using n-gram smoothing
+        if not lambdas:
+            raise ValueError("lambdas must be provided when use_ngram_smoothing is True")
+        
         conditional_prob = compute_ngram_probability(
             path_prefix, activity_name, prob_dict, lambdas
         )
@@ -233,7 +237,9 @@ def compute_ngram_probability(
     prob_dict : dict
         N-gram probability dictionary
     lambdas : list of float
-        Weights for different n-gram lengths
+        Weights for different n-gram lengths, ordered from unigram to higher n-grams.
+        lambdas[0] = unigram weight, lambdas[1] = bigram weight, 
+        lambdas[2] = trigram weight, etc.
         
     Returns
     -------
@@ -241,7 +247,7 @@ def compute_ngram_probability(
         Computed probability
     """
     if not lambdas:
-        return 0.0
+        raise ValueError("lambdas cannot be empty for n-gram probability computation")
     
     if not path_prefix_tuple:
         return prob_dict.get((), {}).get(activity_name, 0.0)
@@ -287,7 +293,7 @@ def compute_prefix_search_probability(
         Computed probability
     """
     if not path_prefix_tuple:
-        return 0.0
+        return prob_dict.get((), {}).get(activity_name, 0.0)
     
     # Check exact prefix match
     if path_prefix_tuple in prob_dict:

@@ -290,7 +290,7 @@ def _compute_accuracy_records(
     case_id: str,
     predicted_sequence: List[str],
     ground_truth_sequence: List[str]
-) -> List[dict]:
+) -> pd.DataFrame:
     """
     Compute accuracy records by comparing predicted and ground truth sequences.
     
@@ -305,37 +305,37 @@ def _compute_accuracy_records(
         
     Returns
     -------
-    List[dict]
-        List of records with accuracy metrics for each step
+    pd.DataFrame
+        DataFrame with accuracy metrics for each step
+        
+    Raises
+    ------
+    ValueError
+        If the sequences have different lengths
     """
-    records = []
-    correct_predictions = 0
-    max_len = max(len(predicted_sequence), len(ground_truth_sequence))
+    # Check that both sequences have the same length
+    if len(predicted_sequence) != len(ground_truth_sequence):
+        raise ValueError(
+            f"Sequences must have the same length. "
+            f"Predicted: {len(predicted_sequence)}, Ground truth: {len(ground_truth_sequence)}"
+        )
     
-    for step in range(max_len):
-        # Get predicted and ground truth activities (handle mismatched lengths)
-        predicted_activity = predicted_sequence[step] if step < len(predicted_sequence) else "UNK"
-        ground_truth = ground_truth_sequence[step] if step < len(ground_truth_sequence) else "UNK"
-        
-        # Check correctness
-        is_correct = predicted_activity == ground_truth
-        if is_correct:
-            correct_predictions += 1
-        
-        # Compute cumulative accuracy
-        cumulative_accuracy = correct_predictions / (step + 1)
-        
-        record = {
-            'case:concept:name': case_id,
-            'step': step,
-            'predicted_activity': predicted_activity,
-            'ground_truth': ground_truth,
-            'is_correct': is_correct,
-            'cumulative_accuracy': cumulative_accuracy
-        }
-        records.append(record)
+    # Efficiently compute matches using numpy for better performance
+    predicted_array = np.array(predicted_sequence)
+    ground_truth_array = np.array(ground_truth_sequence)
+    matches = predicted_array == ground_truth_array
     
-    return records
+    # Create DataFrame directly
+    data = {
+        'case:concept:name': [case_id] * len(predicted_sequence),
+        'step': list(range(len(predicted_sequence))),
+        'predicted_activity': predicted_sequence,
+        'ground_truth': ground_truth_sequence,
+        'is_correct': matches,
+        'cumulative_accuracy': np.cumsum(matches) / np.arange(1, len(matches) + 1)
+    }
+    
+    return pd.DataFrame(data)
 
 
 
