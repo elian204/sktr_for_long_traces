@@ -6,11 +6,11 @@ using beam search with Petri nets, following the pattern of the existing
 compare_stochastic_vs_argmax_random_indices function.
 """
 
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union, Dict
 import logging
 import pandas as pd
 import numpy as np
-from utils import validate_input_parameters, make_cost_function
+from utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_softmax
@@ -33,13 +33,14 @@ def incremental_softmax_recovery(
     model_move_cost: Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     log_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     tau_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1e-6,
-    non_sync_penalty: float = 1.0,
     beam_width: int = 10,
     activity_prob_threshold: float = 0.0,
     use_cond_probs: bool = False,
     max_hist_len: int = 3,
     lambdas: Optional[List[float]] = None,
     alpha: float = 0.5,
+    beam_score_alpha: float = 0.5,
+    completion_patience: int = 5,
     use_ngram_smoothing: bool = True,
     use_calibration: bool = False,
     temp_bounds: Tuple[float, float] = (1.0, 10.0),
@@ -50,8 +51,10 @@ def incremental_softmax_recovery(
     independent_sampling: bool = True,
     round_precision: int = 2,
     random_seed: int = 42,
-    return_model: bool = False,
-) -> Union[pd.DataFrame, Tuple[pd.DataFrame, Any]]:
+    save_model_path: str = "./discovered_petri_net",
+    save_model: bool = True,
+    non_sync_penalty: float = 1.0,
+) -> Tuple[pd.DataFrame, Dict[str, List[float]]]:
     """
     Incrementally recover activity sequences using beam search over softmax matrices.
 
@@ -81,8 +84,6 @@ def incremental_softmax_recovery(
         Enforce distinct trace variants in train/test splits.
     cost_function : str or callable, default='linear'
         'linear', 'logarithmic', or a callable mapping float→float.
-    non_sync_penalty : float, default=1.0
-        Penalty weight for non-synchronous transitions.
     beam_width : int, default=10
         Beam search width (number of candidates retained).
     activity_prob_threshold : float, default=0.0
@@ -95,6 +96,10 @@ def incremental_softmax_recovery(
         Blending weights for conditional probability computation.
     alpha : float, default=0.5
         Blending parameter for conditional probabilities (0=history only, 1=base only).
+    beam_score_alpha : float, default=0.5
+        Beam scoring alpha for blending normalized and total costs.
+    completion_patience : int, default=5
+        Number of extra iterations to continue beam search after first completion.
     use_ngram_smoothing : bool, default=True
         Whether to apply n-gram smoothing for conditional probabilities.
     use_calibration : bool, default=False
@@ -119,17 +124,20 @@ def incremental_softmax_recovery(
         Digits to round probabilities to.
     random_seed : int, default=42
         Seed for reproducibility.
-    return_model : bool, default=False
-        If True, also return the discovered Petri net model.
-
+    save_model_path : str, default="./discovered_petri_net"
+        Path (without .pdf extension) to save the Petri net visualization.
+    save_model : bool, default=True
+        If True, save the Petri net visualization to the specified path.
+    
     Returns
     -------
     results_df : pd.DataFrame
         DataFrame with columns:
           - case:concept:name, step, predicted_activity, ground_truth,
             beam_probability, is_correct, cumulative_accuracy
-    (results_df, model) : tuple
-        If return_model is True, returns tuple of (results_df, petri_net_model).
+    accuracy_dict : Dict[str, List[float]]
+        Dictionary with keys 'sktr_accuracy' and 'argmax_accuracy',
+        each containing a list of per-trace accuracies (fraction of correct predictions in the trace).
         
     Raises
     ------
@@ -156,7 +164,7 @@ def incremental_softmax_recovery(
     ...     'concept:name': ['A', 'B', 'A', 'C', 'B', 'C']
     ... })
     >>> softmax_matrices = [matrix_0, matrix_1, matrix_2]  # Aligned order
-    >>> results = incremental_softmax_recovery(df, softmax_matrices, n_indices=2)
+    >>> results_df, accuracy_dict = incremental_softmax_recovery(df, softmax_matrices, n_indices=2)
     """
     logger.info("Starting incremental softmax recovery.")
 
@@ -220,7 +228,9 @@ def incremental_softmax_recovery(
 
     # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
-    model = discover_petri_net(train_df, non_sync_penalty)
+    model = discover_petri_net(train_df)
+    if save_model:
+        visualize_petri_net(model, output_path=save_model_path)
 
     # 8. Conditional probabilities (optional)
     prob_dict = {}
@@ -249,13 +259,15 @@ def incremental_softmax_recovery(
     
     # 11. Incremental beam-search recovery
     recovery_records: List[dict] = []
+    sktr_accs: List[float] = []
+    argmax_accs: List[float] = []
     for idx, (case, softmax_matrix) in enumerate(
         zip(test_case_ids, test_softmax_matrices), start=1
     ):
         logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
         
         # Get predicted sequence using beam search
-        predicted_sequence = process_test_case_incremental(
+        sktr_preds = process_test_case_incremental(
             softmax_matrix=softmax_matrix,
             model=model,
             cost_fn=cost_fn,
@@ -266,76 +278,103 @@ def incremental_softmax_recovery(
             prob_dict=prob_dict,
             use_ngram_smoothing=use_ngram_smoothing,
             activity_prob_threshold=activity_prob_threshold,
+            beam_score_alpha=beam_score_alpha,
+            completion_patience=completion_patience,
         )
         
         # Extract ground truth sequence for accuracy computation
         ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
         ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
         
+        # Compute argmax predictions
+        argmax_indices = np.argmax(softmax_matrix, axis=0)
+        argmax_preds = [str(idx) for idx in argmax_indices]
+        
         # Compute accuracy and create records
-        records = _compute_accuracy_records(
+        records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
             case_id=case,
-            predicted_sequence=predicted_sequence,
+            sktr_preds=sktr_preds,
+            argmax_preds=argmax_preds,
             ground_truth_sequence=ground_truth_sequence
         )
-        recovery_records.extend(records)
+        recovery_records.extend(records_df.to_dict('records'))
+        sktr_accs.append(sktr_acc)
+        argmax_accs.append(argmax_acc)
 
     # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
+    accuracy_dict = {
+        'sktr_accuracy': sktr_accs,
+        'argmax_accuracy': argmax_accs
+    }
     logger.info("Incremental recovery completed.")
-    return (results_df, model) if return_model else results_df
+    return results_df, accuracy_dict
 
 
 def _compute_accuracy_records(
     case_id: str,
-    predicted_sequence: List[str],
+    sktr_preds: List[str],
+    argmax_preds: List[str],
     ground_truth_sequence: List[str]
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, float, float]:
     """
-    Compute accuracy records by comparing predicted and ground truth sequences.
+    Compute accuracy records and trace-level accuracies by comparing SKTR, argmax, and ground truth sequences.
     
     Parameters
     ----------
     case_id : str
         Case identifier
-    predicted_sequence : List[str]
-        Predicted activity sequence
+    sktr_preds : List[str]
+        SKTR predicted activity sequence (beam search)
+    argmax_preds : List[str]
+        Argmax predicted sequence
     ground_truth_sequence : List[str]
         Ground truth activity sequence
         
     Returns
     -------
     pd.DataFrame
-        DataFrame with accuracy metrics for each step
+        DataFrame with per-step accuracy metrics for SKTR predictions
+    float
+        Trace-level SKTR accuracy (fraction correct)
+    float
+        Trace-level argmax accuracy (fraction correct)
         
     Raises
     ------
     ValueError
         If the sequences have different lengths
     """
-    # Check that both sequences have the same length
-    if len(predicted_sequence) != len(ground_truth_sequence):
+    # Check that all sequences have the same length
+    seq_len = len(ground_truth_sequence)
+    if len(sktr_preds) != seq_len or len(argmax_preds) != seq_len:
         raise ValueError(
-            f"Sequences must have the same length. "
-            f"Predicted: {len(predicted_sequence)}, Ground truth: {len(ground_truth_sequence)}"
+            f"All sequences must have the same length. "
+            f"SKTR: {len(sktr_preds)}, Argmax: {len(argmax_preds)}, Ground truth: {seq_len}"
         )
     
     # Efficiently compute matches using numpy for better performance
-    predicted_array = np.array(predicted_sequence)
+    sktr_array = np.array(sktr_preds)
+    argmax_array = np.array(argmax_preds)
     ground_truth_array = np.array(ground_truth_sequence)
-    matches = predicted_array == ground_truth_array
+    sktr_matches = sktr_array == ground_truth_array
+    argmax_matches = argmax_array == ground_truth_array
     
-    # Create DataFrame directly
+    # Compute trace accuracies
+    sktr_acc = np.mean(sktr_matches)
+    argmax_acc = np.mean(argmax_matches)
+    
+    # Create DataFrame for per-step metrics (using SKTR)
     data = {
-        'case:concept:name': [case_id] * len(predicted_sequence),
-        'step': list(range(len(predicted_sequence))),
-        'predicted_activity': predicted_sequence,
+        'case:concept:name': [case_id] * seq_len,
+        'step': list(range(seq_len)),
+        'predicted_activity': sktr_preds,
         'ground_truth': ground_truth_sequence,
-        'is_correct': matches,
-        'cumulative_accuracy': np.cumsum(matches) / np.arange(1, len(matches) + 1)
+        'is_correct': sktr_matches,
+        'cumulative_accuracy': np.cumsum(sktr_matches) / np.arange(1, seq_len + 1)
     }
     
-    return pd.DataFrame(data)
+    return pd.DataFrame(data), sktr_acc, argmax_acc
 
 
 

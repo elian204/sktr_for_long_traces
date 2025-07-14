@@ -6,11 +6,20 @@ using beam search with Petri nets, following the pattern of the existing
 compare_stochastic_vs_argmax_random_indices function.
 """
 
+import pickle
 from typing import Tuple, Union, Callable, Optional, Dict, List
 import numpy as np
+import pandas as pd
+import torch
+from pathlib import Path
+import io
+from graphviz import Digraph
+import os
+from contextlib import redirect_stderr
+from classes import PetriNet
 
 MoveType = str 
-
+        
 def validate_input_parameters(
     n_indices: int,
     round_precision: int,
@@ -332,4 +341,301 @@ def find_longest_prefix(
             return sub_prefix
     return None
 
+
+def prepare_df(
+    dataset_name: str,
+    path: Optional[Union[str, Path]] = None,
+    return_mapping: bool = False,
+) -> Union[
+    Tuple[pd.DataFrame, List[np.ndarray]],
+    Tuple[pd.DataFrame, List[np.ndarray], Dict[str, str]]
+]:
+    """
+    Prepare a DataFrame from a specified video dataset.
+
+    Loads target labels and softmax predictions, builds a combined DataFrame,
+    auto-fixes matrix orientation, and optionally returns activity mapping.
+
+    Parameters
+    ----------
+    dataset_name : str
+        One of: '50salads', 'gtea', 'breakfast'.
+    path : str or Path, optional
+        Base directory containing:
+          - {dataset_name}_softmax_lst.pickle
+          - {dataset_name}_target_lst.pickle
+        If None, tries three common relative locations.
+    return_mapping : bool, optional
+        If True, returns the mapping dict as the third element.
+
+    Returns
+    -------
+    (df, softmax_list) or (df, softmax_list, mapping_dict)
+    """
+    class CPU_Unpickler(pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == 'torch.storage' and name == '_load_from_bytes':
+                return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+            else: return super().find_class(module, name)
+
+    # 1) validate dataset
+    valid = {'50salads', 'gtea', 'breakfast'}
+    if dataset_name not in valid:
+        raise ValueError(f"dataset_name must be one of {valid}")
+
+    # 2) resolve path
+    dirs_to_try = []
+    if path:
+        dirs_to_try.append(Path(path))
+    else:
+        here = Path(__file__).resolve().parent
+        dirs_to_try += [
+            here / 'Datasets' / 'video',
+            here.parent / 'Datasets' / 'video',
+            here.parents[1] / 'Datasets' / 'video'
+        ]
+
+    for d in dirs_to_try:
+        if d.is_dir():
+            data_dir = d
+            break
+    else:
+        raise FileNotFoundError(f"Could not find Datasets/video in {dirs_to_try}")
+
+    sf_path = data_dir / f"{dataset_name}_softmax_lst.pickle"
+    tg_path = data_dir / f"{dataset_name}_target_lst.pickle"
+    if not sf_path.exists() or not tg_path.exists():
+        raise FileNotFoundError(f"Missing files in {data_dir}")
+
+    # 3) load pickles
+    with open(sf_path, "rb") as f:
+        raw_softmax = CPU_Unpickler(f).load()
+    with open(tg_path, "rb") as f:
+        target_list = CPU_Unpickler(f).load()
+
+    # 4) fix orientation
+    softmax_list: List[np.ndarray] = []
+    for idx, entry in enumerate(raw_softmax):
+        arr = entry.cpu().numpy() if isinstance(entry, torch.Tensor) else np.asarray(entry)
+        arr = np.squeeze(arr)
+        L = len(target_list[idx])
+        if arr.ndim == 1:
+            # reshape 1D → (n_classes, L)
+            c = arr.size // L
+            if arr.size % L:
+                raise ValueError(f"Cannot reshape array of size {arr.size} to match length {L}")
+            arr = arr.reshape(c, L)
+        else:
+            c, e = arr.shape
+            if e != L and c == L:
+                arr = arr.T
+                c, e = arr.shape
+            if e != L:
+                raise ValueError(f"Case {idx}: expected {L} columns but got {e}")
+
+        softmax_list.append(arr)
+
+    # 5) build df
+    recs = []
+    for idx, trace in enumerate(target_list):
+        cid = str(idx)
+        recs += [{"case:concept:name": cid, "concept:name": str(int(x))} for x in trace.tolist()]
+    df = pd.DataFrame.from_records(recs)
+
+    # 6) mapping
+    df, mapping_dict = map_to_string_numbers(df)
+
+    return (df, softmax_list, mapping_dict) if return_mapping else (df, softmax_list)
+   
+    
+def map_to_string_numbers(
+    df: pd.DataFrame,
+    map_strings_to_integer_strings: bool = False
+) -> Tuple[pd.DataFrame, Dict[str, str]]:
+    """
+    Ensure `df['concept:name']` contains stringified integers.
+
+    - If `map_strings_to_integer_strings=False`, values are cast to int then str.
+    - If `map_strings_to_integer_strings=True`, every unique label is assigned
+      a new integer string starting from 0.
+
+    Returns
+    -------
+    df
+        Modified DataFrame (copy-on-write semantics).
+    mapping_dict
+        The mapping used (newly generated or empty if direct casting).
+    """
+    df = df.copy()  # avoid in-place changes
+
+    if map_strings_to_integer_strings:
+        mapping_dict = {}
+        next_id = 0
+
+        def _map_new(label: str) -> str:
+            nonlocal next_id
+            if label not in mapping_dict:
+                mapping_dict[label] = str(next_id)
+                next_id += 1
+            return mapping_dict[label]
+
+        df["concept:name"] = df["concept:name"].astype(str).map(_map_new)
+    else:
+        # Cast to int then str
+        df["concept:name"] = (
+            df["concept:name"]
+            .astype(int)
+            .astype(str)
+        )
+        mapping_dict = {}
+
+    return df, mapping_dict
+
+
+def group_cases_by_trace(df: pd.DataFrame) -> pd.DataFrame:
+    # Group by 'case:concept:name' and aggregate the 'concept:name' into a tuple
+    grouped = df.groupby('case:concept:name')['concept:name'].apply(tuple).reset_index()
+    
+    # Group by the trace (sequence of activities) and aggregate the case IDs
+    trace_groups = grouped.groupby('concept:name')['case:concept:name'].apply(list).reset_index()
+    
+    # Add a column for the length of each trace
+    trace_groups['trace_length'] = trace_groups['concept:name'].apply(len)
+    
+    # Sort case_list numerically
+    trace_groups['case:concept:name'] = trace_groups['case:concept:name'].apply(lambda x: sorted(x, key=int))
+    
+    # Create result DataFrame with explicit column names
+    result = pd.DataFrame({
+        'case_list': trace_groups['case:concept:name'],
+        'trace_length': trace_groups['trace_length']
+    })
+    
+    return result
+
+
+def visualize_petri_net(
+    net: PetriNet, 
+    marking: Optional[Tuple[int, ...]] = None, 
+    output_path: str = "./model"
+) -> None:
+    """
+    Generates a visual representation of a Petri Net model using Graphviz.
+    Transitions are displayed as rectangles, and places as circles.
+    Tokens are represented as filled black circles within places if a marking is provided.
+
+    Args:
+        net: The self-defined Petri Net model defining the structure of the net (places, transitions, arcs).
+        marking (tuple, optional): A tuple representing the current marking of the net.
+            Each entry corresponds to a place in the order defined by the place_mapping.
+            If None, the net will be visualized without tokens.
+        output_path (str, optional): Path (without extension) to save the visualization. Defaults to "./model".
+    """
+    try:
+        from graphviz import Digraph
+    except ImportError:
+        raise ImportError("graphviz package is required. Install with: pip install graphviz")
+    
+    if not hasattr(net, 'place_mapping') or not hasattr(net, 'reverse_place_mapping'):
+        raise AttributeError("The provided Petri net does not have the required place_mapping and reverse_place_mapping attributes")
+
+    viz = Digraph(engine='dot')
+    viz.attr(rankdir='TB')  # Set rank direction to top-to-bottom
+
+    # Convert tuple marking to dictionary if provided
+    marking_dict = {}
+    if marking is not None:
+        if hasattr(marking, 'places'):
+            # Handle Marking object
+            marking_tuple = marking.places
+        elif isinstance(marking, tuple):
+            # Handle tuple directly
+            marking_tuple = marking
+        else:
+            raise ValueError("marking must be a tuple or a Marking object")
+        
+        if len(marking_tuple) != len(net.place_mapping):
+            raise ValueError(f"The length of the marking tuple ({len(marking_tuple)}) does not match the number of places in the net ({len(net.place_mapping)})")
+        
+        for idx, tokens in enumerate(marking_tuple):
+            if tokens > 0:
+                place = net.reverse_place_mapping[idx]
+                marking_dict[place.name] = tokens  # Store by place name
+
+    # Add Places (Circles)
+    for i, place in enumerate(net.places):
+        place_id = f"place_{i}_{place.name}"
+        label = place.name
+        if marking is not None and place.name in marking_dict:  # Check by place name
+            tokens = marking_dict[place.name]
+            if tokens > 0:
+                # Add a large token to the label with larger font size
+                label += f"\n<FONT POINT-SIZE='30'>●</FONT>"
+        
+        # Ensure that the label is treated as an HTML-like label
+        viz.node(place_id, label=f"<{label}>", shape='circle', style='filled', fillcolor='white', fixedsize='true', width='0.75', height='0.75')
+
+    # Add Transitions (Rectangles)
+    for i, transition in enumerate(net.transitions):
+        trans_id = f"trans_{i}_{transition.name}"
+        label = transition.label if hasattr(transition, 'label') and transition.label else transition.name
+        viz.node(trans_id, label=label, shape='box')
+
+    # Add Arcs
+    for arc in net.arcs:
+        # Find the IDs we assigned to places and transitions
+        source_id = None
+        target_id = None
+        
+        # Find source ID
+        for i, place in enumerate(net.places):
+            if place == arc.source:
+                source_id = f"place_{i}_{place.name}"
+                break
+        for i, trans in enumerate(net.transitions):
+            if trans == arc.source:
+                source_id = f"trans_{i}_{trans.name}"
+                break
+                
+        # Find target ID
+        for i, place in enumerate(net.places):
+            if place == arc.target:
+                target_id = f"place_{i}_{place.name}"
+                break
+        for i, trans in enumerate(net.transitions):
+            if trans == arc.target:
+                target_id = f"trans_{i}_{trans.name}"
+                break
+        
+        if source_id and target_id:
+            viz.edge(source_id, target_id)
+
+    # Dynamically identify source places (no incoming arcs)
+    sources = [place for place in net.places if not place.in_arcs]
+
+    # Dynamically identify sink places (no outgoing arcs)
+    sinks = [place for place in net.places if not place.out_arcs]
+
+    # Explicitly set the rank of source nodes (if any)
+    if sources:
+        with viz.subgraph() as s:
+            s.attr(rank='source')
+            for i, place in enumerate(net.places):
+                if place in sources:
+                    s.node(f"place_{i}_{place.name}")
+
+    # Explicitly set the rank of sink nodes (if any)
+    if sinks:
+        with viz.subgraph() as s:
+            s.attr(rank='sink')
+            for i, place in enumerate(net.places):
+                if place in sinks:
+                    s.node(f"place_{i}_{place.name}")
+
+    # Redirect stderr to null to suppress warnings
+    with open(os.devnull, 'w') as f, redirect_stderr(f):
+        # Save Visualization 
+        viz.render(output_path, format='pdf', cleanup=True)
+
+    print(f"Visualization saved to: {output_path}.pdf")
 

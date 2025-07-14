@@ -20,6 +20,9 @@ import pandas as pd
 import numpy as np
 from classes import PetriNet, Marking
 from utils import compute_conditional_probability
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class BeamCandidate:
@@ -79,7 +82,7 @@ class BeamState:
     """
     def __init__(self,
                  beam_width: int,
-                 epsilon: float = 1e-2,
+                 epsilon: float = 1e-3,
                  alpha: float = 0.5):
         """
         :param beam_width: max number of beams to keep
@@ -131,6 +134,8 @@ def process_test_case_incremental(
     prob_dict: dict,
     use_ngram_smoothing: bool,
     activity_prob_threshold: float,
+    beam_score_alpha: float = 0.5,
+    completion_patience: int = 5,
 ) -> List[str]:
     """
     Process a single test case using incremental beam search.
@@ -160,6 +165,10 @@ def process_test_case_incremental(
         Whether to apply n-gram smoothing
     activity_prob_threshold : float
         Minimum probability threshold for considering activities
+    beam_score_alpha : float, default=0.5
+        Interpolation weight for beam scoring (normalized vs total cost)
+    completion_patience : int, default=5
+        Number of extra iterations to continue after first completion to find potentially better paths.
         
     Returns
     -------
@@ -174,7 +183,7 @@ def process_test_case_incremental(
         raise ValueError("Model must have a valid initial marking (init_mark)")
     
     # Initialize beam search
-    beam_state = BeamState(beam_width)
+    beam_state = BeamState(beam_width, alpha=beam_score_alpha)
     n_timestamps = softmax_matrix.shape[1]
     
     # Initialize with empty path (zero initial cost)
@@ -189,6 +198,9 @@ def process_test_case_incremental(
     # Main beam search loop - continue until all candidates complete the sequence
     max_iterations = n_timestamps * 10  # Safety limit to prevent infinite loops
     iteration = 0
+    all_completed: List[BeamCandidate] = []
+    patience_counter = 0
+    first_completion = False
     
     while iteration < max_iterations:
         iteration += 1
@@ -212,13 +224,31 @@ def process_test_case_incremental(
         beam_state.prune_beam()
         
         # Check for completed candidates AFTER expansion and pruning
-        completed_candidates = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
-        if completed_candidates:
-            # Return the best completed candidate
-            best_completed = min(completed_candidates, key=lambda c: beam_state._beam_score(c))
-            return list(best_completed.path)
-             
+        completed = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
+        if completed:
+            if not first_completion:
+                first_completion = True
+            all_completed.extend(completed)
+        
+        # Remove completed from active beam
+        beam_state.candidates = [c for c in beam_state.candidates if c.timestamp < n_timestamps]
+        
+        # Patience check
+        if first_completion:
+            patience_counter += 1
+            if patience_counter >= completion_patience and all_completed:
+                break
+        
+        if not beam_state.candidates:
+            break
+    
+    # Select best completed if any
+    if all_completed:
+        best_completed = min(all_completed, key=lambda c: beam_state._beam_score(c))
+        return list(best_completed.path)
+    
     # Fallback if we exit the loop without completing any candidates
+    logger.warning(f"Beam search failed to complete after {max_iterations} iterations, falling back to greedy prediction")
     return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps)
 
 

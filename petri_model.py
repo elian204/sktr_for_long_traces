@@ -13,7 +13,7 @@ from classes import Arc, Marking, PetriNet, Place, Transition
 
 def discover_petri_net(
     train_df: pd.DataFrame,
-    non_sync_penalty: float
+    non_sync_penalty: float = 1.0
 ) -> PetriNet:
     """
     Discover an inductive Petri net from training traces.
