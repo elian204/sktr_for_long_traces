@@ -16,9 +16,11 @@ import io
 from graphviz import Digraph
 import os
 from contextlib import redirect_stderr
-from classes import PetriNet
+import logging
 
-MoveType = str 
+MoveType = str
+
+logger = logging.getLogger(__name__)
         
 def validate_input_parameters(
     n_indices: int,
@@ -259,7 +261,8 @@ def compute_ngram_probability(
         raise ValueError("lambdas cannot be empty for n-gram probability computation")
     
     if not path_prefix_tuple:
-        return prob_dict.get((), {}).get(activity_name, 0.0)
+        base_prob = prob_dict.get((), {}).get(activity_name, 0.0)
+        return base_prob
     
     total_weighted_prob = 0.0
     total_lambda_weight = 0.0
@@ -269,14 +272,15 @@ def compute_ngram_probability(
         prefix_n_gram = path_prefix_tuple[-n:]
         prob = prob_dict.get(prefix_n_gram, {}).get(activity_name, 0.0)
         lambda_weight = lambdas[n - 1]
-        
-        total_weighted_prob += lambda_weight * prob
+        contribution = lambda_weight * prob
+        total_weighted_prob += contribution
         total_lambda_weight += lambda_weight
     
     if total_lambda_weight == 0:
         return 0.0
     
-    return total_weighted_prob / total_lambda_weight
+    final_prob = total_weighted_prob / total_lambda_weight
+    return final_prob
 
 
 def compute_prefix_search_probability(
@@ -514,11 +518,7 @@ def group_cases_by_trace(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def visualize_petri_net(
-    net: PetriNet, 
-    marking: Optional[Tuple[int, ...]] = None, 
-    output_path: str = "./model"
-) -> None:
+def visualize_petri_net(net, marking=None, output_path="./model"):
     """
     Generates a visual representation of a Petri Net model using Graphviz.
     Transitions are displayed as rectangles, and places as circles.
@@ -531,11 +531,6 @@ def visualize_petri_net(
             If None, the net will be visualized without tokens.
         output_path (str, optional): Path (without extension) to save the visualization. Defaults to "./model".
     """
-    try:
-        from graphviz import Digraph
-    except ImportError:
-        raise ImportError("graphviz package is required. Install with: pip install graphviz")
-    
     if not hasattr(net, 'place_mapping') or not hasattr(net, 'reverse_place_mapping'):
         raise AttributeError("The provided Petri net does not have the required place_mapping and reverse_place_mapping attributes")
 
@@ -545,26 +540,15 @@ def visualize_petri_net(
     # Convert tuple marking to dictionary if provided
     marking_dict = {}
     if marking is not None:
-        if hasattr(marking, 'places'):
-            # Handle Marking object
-            marking_tuple = marking.places
-        elif isinstance(marking, tuple):
-            # Handle tuple directly
-            marking_tuple = marking
-        else:
-            raise ValueError("marking must be a tuple or a Marking object")
-        
-        if len(marking_tuple) != len(net.place_mapping):
-            raise ValueError(f"The length of the marking tuple ({len(marking_tuple)}) does not match the number of places in the net ({len(net.place_mapping)})")
-        
-        for idx, tokens in enumerate(marking_tuple):
+        if len(marking) != len(net.place_mapping):
+            raise ValueError(f"The length of the marking tuple ({len(marking)}) does not match the number of places in the net ({len(net.place_mapping)})")
+        for idx, tokens in enumerate(marking):
             if tokens > 0:
                 place = net.reverse_place_mapping[idx]
                 marking_dict[place.name] = tokens  # Store by place name
 
     # Add Places (Circles)
-    for i, place in enumerate(net.places):
-        place_id = f"place_{i}_{place.name}"
+    for place in net.places:
         label = place.name
         if marking is not None and place.name in marking_dict:  # Check by place name
             tokens = marking_dict[place.name]
@@ -573,69 +557,46 @@ def visualize_petri_net(
                 label += f"\n<FONT POINT-SIZE='30'>●</FONT>"
         
         # Ensure that the label is treated as an HTML-like label
-        viz.node(place_id, label=f"<{label}>", shape='circle', style='filled', fillcolor='white', fixedsize='true', width='0.75', height='0.75')
+        viz.node(str(place), label=f"<{label}>", shape='circle', style='filled', fillcolor='white', fixedsize='true', width='0.75', height='0.75')
 
     # Add Transitions (Rectangles)
-    for i, transition in enumerate(net.transitions):
-        trans_id = f"trans_{i}_{transition.name}"
-        label = transition.label if hasattr(transition, 'label') and transition.label else transition.name
-        viz.node(trans_id, label=label, shape='box')
+    for transition in net.transitions:
+        label = transition.label if transition.label else str(transition)
+        viz.node(str(transition), label=label, shape='box')
 
     # Add Arcs
     for arc in net.arcs:
-        # Find the IDs we assigned to places and transitions
-        source_id = None
-        target_id = None
-        
-        # Find source ID
-        for i, place in enumerate(net.places):
-            if place == arc.source:
-                source_id = f"place_{i}_{place.name}"
-                break
-        for i, trans in enumerate(net.transitions):
-            if trans == arc.source:
-                source_id = f"trans_{i}_{trans.name}"
-                break
-                
-        # Find target ID
-        for i, place in enumerate(net.places):
-            if place == arc.target:
-                target_id = f"place_{i}_{place.name}"
-                break
-        for i, trans in enumerate(net.transitions):
-            if trans == arc.target:
-                target_id = f"trans_{i}_{trans.name}"
-                break
-        
-        if source_id and target_id:
-            viz.edge(source_id, target_id)
+        viz.edge(str(arc.source), str(arc.target))
 
-    # Dynamically identify source places (no incoming arcs)
-    sources = [place for place in net.places if not place.in_arcs]
+    # Explicitly set the rank of the source and sink nodes
+    with viz.subgraph() as s:
+        s.attr(rank='source')
+        s.node(str(net.places[0]))  # Assuming the first place is the source
 
-    # Dynamically identify sink places (no outgoing arcs)
-    sinks = [place for place in net.places if not place.out_arcs]
-
-    # Explicitly set the rank of source nodes (if any)
-    if sources:
-        with viz.subgraph() as s:
-            s.attr(rank='source')
-            for i, place in enumerate(net.places):
-                if place in sources:
-                    s.node(f"place_{i}_{place.name}")
-
-    # Explicitly set the rank of sink nodes (if any)
-    if sinks:
-        with viz.subgraph() as s:
-            s.attr(rank='sink')
-            for i, place in enumerate(net.places):
-                if place in sinks:
-                    s.node(f"place_{i}_{place.name}")
+    with viz.subgraph() as s:
+        s.attr(rank='sink')
+        s.node(str(net.places[-1]))  # Assuming the last place is the sink
 
     # Redirect stderr to null to suppress warnings
-    with open(os.devnull, 'w') as f, redirect_stderr(f):
-        # Save Visualization 
-        viz.render(output_path, format='pdf', cleanup=True)
-
-    print(f"Visualization saved to: {output_path}.pdf")
-
+    with open(os.devnull, 'w') as f:
+        saved_paths = []
+        
+        # Try to save in PNG format
+        try:
+            png_path = viz.render(output_path, format='png', cleanup=True)
+            saved_paths.append(png_path)
+            print(f"PNG visualization saved to: {png_path}")
+        except Exception as e:
+            print(f"Failed to generate PNG visualization: {e}")
+        
+        # Try to save in PDF format
+        try:
+            pdf_path = viz.render(output_path, format='pdf', cleanup=True)
+            saved_paths.append(pdf_path)
+            print(f"PDF visualization saved to: {pdf_path}")
+        except Exception as e:
+            print(f"Failed to generate PDF visualization: {e}")
+        
+        # If neither format worked, raise an exception
+        if not saved_paths:
+            raise RuntimeError("Failed to generate visualization in both PNG and PDF formats")

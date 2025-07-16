@@ -182,6 +182,9 @@ def process_test_case_incremental(
     if model.init_mark is None:
         raise ValueError("Model must have a valid initial marking (init_mark)")
     
+    if model.final_mark is None:
+        raise ValueError("Model must have a valid final marking (final_mark)")
+    
     # Initialize beam search
     beam_state = BeamState(beam_width, alpha=beam_score_alpha)
     n_timestamps = softmax_matrix.shape[1]
@@ -224,14 +227,14 @@ def process_test_case_incremental(
         beam_state.prune_beam()
         
         # Check for completed candidates AFTER expansion and pruning
-        completed = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
+        completed = [c for c in beam_state.candidates if c.timestamp >= n_timestamps and c.marking.places == model.final_mark.places]
         if completed:
             if not first_completion:
                 first_completion = True
             all_completed.extend(completed)
         
         # Remove completed from active beam
-        beam_state.candidates = [c for c in beam_state.candidates if c.timestamp < n_timestamps]
+        beam_state.candidates = [c for c in beam_state.candidates if not (c.timestamp >= n_timestamps and c.marking.places == model.final_mark.places)]
         
         # Patience check
         if first_completion:
@@ -322,45 +325,46 @@ def _expand_beam_candidates(
         sync_trans = {t.label: t for t in available if t.label is not None}
         tau_trans  = {t.name:  t for t in available if t.label is None}
 
-        # Raw softmax probs at this timestamp
-        probs = softmax_matrix[:, cand.timestamp]
+        if cand.timestamp < softmax_matrix.shape[1]:
+            # Raw softmax probs at this timestamp
+            probs = softmax_matrix[:, cand.timestamp]
 
-        # 1) handle sync/log moves via softmax indices
-        for idx, raw_p in enumerate(probs):
-            if raw_p < activity_prob_threshold:
-                continue
+            # 1) handle sync/log moves via softmax indices
+            for idx, raw_p in enumerate(probs):
+                if raw_p < activity_prob_threshold:
+                    continue
 
-            act = str(idx)
-            p = (
-                compute_conditional_probability(
-                    cand.path, act, raw_p,
-                    prob_dict, lambdas, alpha, use_ngram_smoothing
+                act = str(idx)
+                p = (
+                    compute_conditional_probability(
+                        cand.path, act, raw_p,
+                        prob_dict, lambdas, alpha, use_ngram_smoothing
+                    )
+                    if use_cond_probs and prob_dict else raw_p
                 )
-                if use_cond_probs and prob_dict else raw_p
-            )
 
-            if act in sync_trans:
-                # synchronous move
-                move_type = "sync"
-                next_path = cand.path + (act,)
-                next_timestamp = cand.timestamp + 1
-                next_marking = model._fire_transition(cand.marking, sync_trans[act])
-            else:
-                # log move: insert log event without model firing
-                move_type = "log"
-                next_path = cand.path + (act,)
-                next_timestamp = cand.timestamp + 1
-                next_marking = cand.marking
+                if act in sync_trans:
+                    # synchronous move
+                    move_type = "sync"
+                    next_path = cand.path + (act,)
+                    next_timestamp = cand.timestamp + 1
+                    next_marking = model._fire_transition(cand.marking, sync_trans[act])
+                else:
+                    # log move: insert log event without model firing
+                    move_type = "log"
+                    next_path = cand.path + (act,)
+                    next_timestamp = cand.timestamp + 1
+                    next_marking = cand.marking
 
-            step_cost = cost_fn(p, move_type)
-            new_candidates.append(
-                BeamCandidate(
-                    path=next_path,
-                    cumulative_cost=cand.cumulative_cost + step_cost,
-                    marking=next_marking,
-                    timestamp=next_timestamp
+                step_cost = cost_fn(p, move_type)
+                new_candidates.append(
+                    BeamCandidate(
+                        path=next_path,
+                        cumulative_cost=cand.cumulative_cost + step_cost,
+                        marking=next_marking,
+                        timestamp=next_timestamp
+                    )
                 )
-            )
 
         # 2) handle tau transitions separately (silent model moves)
         for trans in tau_trans.values():
