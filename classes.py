@@ -23,9 +23,11 @@ n-gram smoothing for improved alignment quality.
 
 import numpy as np
 import copy
-from heapq import heappush, heappop
 from collections import deque
-from typing import Dict, List, Set, Tuple, Union, Optional, Any
+from typing import Dict, List, Set, Tuple, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class Place:
@@ -472,9 +474,17 @@ class PetriNet:
             self.transitions_indices[transitions.name] = curr_idx            
      
     
-    def _find_available_transitions(self, mark_tuple):
-        '''Input: tuple
-           Output: list'''
+    def _find_available_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
+        """
+        Given a marking (as a tuple of token counts), return a list of transitions
+        that are enabled (i.e., can fire) from this marking.
+
+        Args:
+            mark_tuple (Tuple[int, ...]): The current marking represented as a tuple of token counts.
+
+        Returns:
+            List[Transition]: A list of enabled Transition objects for the given marking.
+        """
         
         available_transitions = []
         for transition in self.transitions:
@@ -484,7 +494,17 @@ class PetriNet:
         return available_transitions
 
     
-    def __check_transition_prerequesits(self, transition, mark_tuple):
+    def __check_transition_prerequesits(self, transition: Transition, mark_tuple: Tuple[int, ...]) -> bool:
+        """
+        Check if the given transition is enabled under the current marking.
+
+        Args:
+            transition (Transition): The transition to check.
+            mark_tuple (Tuple[int, ...]): The current marking as a tuple of token counts.
+
+        Returns:
+            bool: True if the transition is enabled (all input places have enough tokens), False otherwise.
+        """
         for arc in transition.in_arcs:
             arc_weight = arc.weight
             source_idx = self.places_indices[arc.source.name]
@@ -583,774 +603,127 @@ resulting in: {new_mark}, during transition: {transition.name}')
                 return sub_prefix
         return None
 
-
-class SyncProduct(PetriNet):
-   
-    def __init__(self, net, trace_model, cost_function=None, init_mark=None, final_mark=None):
-           
-        super().__init__()  
-        net.assign_model_transitions_move_type()
-        trace_model.assign_trace_transitions_move_type()
-        
-        self.net = net
-        self.trace_model = trace_model
-        self.places = self.net.places + self.trace_model.places
-        self.transitions = self.net.transitions + self.trace_model.transitions
-        self.arcs = self.net.arcs + self.trace_model.arcs
-
-        self.cost_function = lambda x: 0 if cost_function is None else cost_function(x)
-
-        new_sync_transitions = self.net._generate_all_sync_transitions(self.trace_model, cost_function)
-        self.add_transitions_with_arcs(new_sync_transitions)
-        self.update_sync_product_trans_names()
-        
-        self.places_indices = {place.name: idx for idx, place in enumerate(self.places)}
-        self.transitions_indices = {transition.name: idx for idx, transition in enumerate(self.transitions)}        
-    
-        self.init_mark = Marking(self.net.init_mark.places + self.trace_model.init_mark.places) if init_mark is None else init_mark
-        self.final_mark = Marking(self.net.final_mark.places + self.trace_model.final_mark.places) if final_mark is None else final_mark
-
-
-    def update_sync_product_trans_names(self, sync_product=None):
-        if sync_product is None:
-            transitions = self.transitions
-        else:
-            transitions = sync_product.transitions
-
-        for trans in transitions:
-            if trans.move_type == 'model':
-                if not hasattr(self.net, '_sync_names_updated') or not self.net._sync_names_updated:
-                    trans.name = f'(>>, {trans.name})'
-            elif trans.move_type == 'trace':
-                trans.name = f'({trans.name}, >>)'
-            else:
-                trans.name = f'({trans.name}, {trans.name})'
-
-        if not hasattr(self.net, '_sync_names_updated'):
-            self.net._sync_names_updated = True
-
-        transitions_indices = {transitions[i].name: i for i in range(len(transitions))}
-
-        if sync_product is not None:
-            sync_product.transitions_indices = transitions_indices
-            return sync_product
-        else:
-            self.transitions_indices = transitions_indices
-
-
-    def construct_synchronous_product(self, trace_model, cost_function, net_init_mark=None, net_final_mark=None):
-        return SyncProduct(net=self, trace_model=trace_model, cost_function=cost_function,
-                           net_init_mark=net_init_mark, net_final_mark=net_final_mark)
-
-
-    def _dijkstra_no_rg_construct(
-        self,
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
-        alpha: float = 0.5,
-        partial_conformance: bool = False,
-        return_net_final_marking: bool = False,
-        n_unique_final_markings: int = 1,
-        overlap_size: int = 0,
-        trace_activities_multiset: Optional[Set[str]] = None,
-        use_heuristic_distance: bool = False,
-        trace_recovery: bool = False,
-        use_cond_probs: bool = False,
-        lambdas: Optional[Tuple[float, ...]] = None,
-        use_ngram_smoothing: bool = False
-    ) -> Tuple[Union[List[Transition], List[Tuple]], int]:
+    # ---------------------------------------------------------------------------
+    #  Helper – canonical converter
+    # ---------------------------------------------------------------------------
+    def _ensure_marking_object(self, mark):
         """
-        Perform Dijkstra's algorithm without reachability graph construction.
-        
-        This method implements a variant of Dijkstra's algorithm for finding optimal
-        alignments between process models and traces, with support for probabilistic
-        weights and various optimization strategies.
-        
+        Convert `mark` (tuple or Marking) to a Marking instance.
+
         Parameters
         ----------
-        prob_dict : dict, optional
-            Probability dictionary for conditional weights
-        alpha : float, default=0.5
-            Blending factor for probability calculations
-        partial_conformance : bool, default=False
-            Whether to perform partial conformance checking
-        return_net_final_marking : bool, default=False
-            Whether to return the net final marking
-        n_unique_final_markings : int, default=1
-            Number of unique final markings to find
-        overlap_size : int, default=0
-            Size of overlap for partial conformance
-        trace_activities_multiset : set, optional
-            Multiset of activities in the trace
-        use_heuristic_distance : bool, default=False
-            Whether to use A* heuristic
-        trace_recovery : bool, default=False
-            Whether to recover full alignment trace
-        use_cond_probs : bool, default=False
-            Whether to use conditional probabilities
-        lambdas : tuple, optional
-            N-gram weights for smoothing
-        use_ngram_smoothing : bool, default=False
-            Whether to use n-gram smoothing
-            
+        mark : Tuple[int, ...] | Marking
+        """
+        if isinstance(mark, tuple):
+            return Marking(mark)
+        if hasattr(mark, "places"):
+            return mark         # already a Marking
+        raise TypeError(f"Expected tuple or Marking, got {type(mark)}")
+
+
+    # ---------------------------------------------------------------------------
+    #  τ-path exploration for a single marking
+    # ---------------------------------------------------------------------------
+    def _compute_reachable_transitions_via_tau(
+        self,
+        marking_places: Tuple[int, ...],
+        max_tau_depth: int = 100
+    ) -> Dict["Transition", Tuple["Transition", ...]]:
+        """
+        Return all non-silent transitions reachable from `marking_places`
+        together with the shortest τ-path enabling each of them.
+
         Returns
         -------
-        tuple
-            (results, nodes_opened) where results depend on parameters
+        Mapping[Transition, Tuple[tau1, tau2, ...]]
+        Empty tuple ⇒ transition is directly enabled.
         """
-        search_state = self._initialize_search_state()
-        init_node = self._initialize_dijkstra_node(
-            trace_activities_multiset,
-            use_heuristic_distance
-        )
-        
-        self._add_node_to_heap(search_state['heap'], init_node)
-        
-        while search_state['heap'] and not self._is_search_complete(
-            search_state, n_unique_final_markings
-        ):
-            current_node = self._get_next_node(search_state)
-            
-            if self._should_skip_node(current_node, search_state):
+        if max_tau_depth <= 0:
+            raise ValueError("max_tau_depth must be positive")
+
+        reachable: Dict = {}                               # Transition → τ-path
+        queue = deque([(marking_places, tuple())])         # (mark, current τ-path)
+        visited: Dict[Tuple[int, ...], int] = {}           # Marking → shortest τ-len
+
+        while queue:
+            current_mark, tau_path = queue.popleft()
+
+            if visited.get(current_mark, float("inf")) <= len(tau_path):
                 continue
-            
-            if self._process_potential_final_node(
-                current_node, search_state, partial_conformance, 
-                n_unique_final_markings
-            ):
+            visited[current_mark] = len(tau_path)
+
+            try:
+                available = self._find_available_transitions(current_mark)
+            except Exception as exc:
+                logger.warning("Could not get transitions for %s: %s", current_mark, exc)
                 continue
-            
-            self._expand_node(
-                current_node, search_state, prob_dict, lambdas,
-                use_cond_probs, alpha, use_heuristic_distance,
-                use_ngram_smoothing
-            )
-        
-        results = self._process_dijkstra_final_nodes(
-            search_state['final_nodes'],
-            partial_conformance,
-            overlap_size,
-            trace_recovery,
-            return_net_final_marking
-        )
-        
-        return results, search_state['nodes_opened']
-    
-    def _initialize_search_state(self) -> Dict[str, Any]:
-        """Initialize the search state with empty data structures."""
-        return {
-            'heap': [],
-            'marking_distance_dict': {},
-            'visited_markings': set(),
-            'final_nodes': [],
-            'final_markings_unique': set(),
-            'nodes_opened': 0
-        }
-    
-    def _add_node_to_heap(self, heap: List[search_node_new], node: search_node_new) -> None:
-        """Add a node to the priority queue."""
-        heappush(heap, node)
-    
-    def _get_next_node(self, search_state: Dict[str, Any]) -> search_node_new:
-        """Get the next node from the priority queue."""
-        return heappop(search_state['heap'])
-    
-    def _should_skip_node(
-        self, 
-        node: search_node_new, 
-        search_state: Dict[str, Any]
-    ) -> bool:
-        """Check if a node should be skipped."""
-        return tuple(node.marking.places) in search_state['visited_markings']
-    
-    def _is_search_complete(
-        self, 
-        search_state: Dict[str, Any], 
-        n_unique_final_markings: int
-    ) -> bool:
-        """Check if the search is complete."""
-        return len(search_state['final_nodes']) >= n_unique_final_markings
-    
-    def _process_potential_final_node(
+
+            # record non-silent transitions
+            for t in available:
+                if t.label is not None:                    # non-silent
+                    if t not in reachable or len(tau_path) < len(reachable[t]):
+                        reachable[t] = tau_path
+
+            # expand along τ moves
+            for t in available:
+                if t.label is None:                        # τ
+                    if len(tau_path) + 1 > max_tau_depth:
+                        continue
+                    try:
+                        successor = self._fire_transition(
+                            self._ensure_marking_object(current_mark), t
+                        ).places
+                    except Exception as exc:
+                        logger.warning("Could not fire τ %s: %s", t.name, exc)
+                        continue
+
+                    if visited.get(successor, float("inf")) > len(tau_path) + 1:
+                        queue.append((successor, tau_path + (t,)))
+
+        return reachable
+
+
+    # ---------------------------------------------------------------------------
+    #  Main: build and STORE full marking → transition map
+    # ---------------------------------------------------------------------------
+    def build_marking_transition_map(
         self,
-        node: search_node_new,
-        search_state: Dict[str, Any],
-        partial_conformance: bool,
-        n_unique_final_markings: int
-    ) -> bool:
+        max_tau_depth: int = 100
+    ) -> Dict[Tuple[int, ...], Dict]:
         """
-        Process a node that might be a final node.
-        
-        Returns
-        -------
-        bool
-            True if node was final and processed, False otherwise
+        Compute the map and store it on `self` as `self.marking_transition_map`.
         """
-        if self._is_dijkstra_final_node(
-            node, 
-            partial_conformance, 
-            n_unique_final_markings, 
-            search_state['final_markings_unique']
-        ):
-            search_state['final_nodes'].append(node)
-            return True
-        return False
-    
-    def _expand_node(
-        self,
-        current_node: search_node_new,
-        search_state: Dict[str, Any],
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]],
-        lambdas: Optional[Tuple[float, ...]],
-        use_cond_probs: bool,
-        alpha: float,
-        use_heuristic_distance: bool,
-        use_ngram_smoothing: bool
-    ) -> None:
-        """Expand a node by generating all successors."""
-        search_state['nodes_opened'] += 1
-        
-        available_transitions = self._find_available_transitions(
-            current_node.marking.places
-        )
-        
-        for transition in available_transitions:
-            new_node = self._create_dijkstra_successor_node(
-                current_node, transition, prob_dict, lambdas,
-                use_cond_probs, alpha, use_heuristic_distance,
-                use_ngram_smoothing
-            )
-            
-            self._update_search_state_with_node(new_node, search_state)
-        
-        search_state['visited_markings'].add(tuple(current_node.marking.places))
-    
-    def _update_search_state_with_node(
-        self,
-        new_node: search_node_new,
-        search_state: Dict[str, Any]
-    ) -> None:
-        """Update search state with a new node if it should be added."""
-        if self._should_add_dijkstra_node(
-            new_node, 
-            search_state['marking_distance_dict']
-        ):
-            marking_key = tuple(new_node.marking.places)
-            search_state['marking_distance_dict'][marking_key] = new_node.dist
-            self._add_node_to_heap(search_state['heap'], new_node)
-    
-    def _initialize_dijkstra_node(
-        self,
-        trace_activities_multiset: Optional[Set[str]],
-        use_heuristic_distance: bool
-    ) -> search_node_new:
-        """
-        Initialize the starting node for Dijkstra's algorithm.
-        
-        Parameters
-        ----------
-        trace_activities_multiset : set of str, optional
-            Multiset of activities in the trace
-        use_heuristic_distance : bool
-            Whether to use A* heuristic
-            
-        Returns
-        -------
-        search_node_new
-            Initial search node
-        """
-        trace_activities = trace_activities_multiset or set()
-        init_heuristic = 0
-        
-        if use_heuristic_distance:
-            init_heuristic = self.estimate_alignment_heuristic(
-                self.init_mark, 
-                trace_activities
-            )
-        
-        return search_node_new(
-            marking=self.init_mark,
-            dist=0,
-            trace_activities_multiset=trace_activities.copy(),
-            heuristic_distance=init_heuristic,
-            total_model_moves=0
-        )
-    
-    def _is_dijkstra_final_node(
-        self,
-        node: search_node_new,
-        partial_conformance: bool,
-        n_unique_final_markings: int,
-        final_markings_unique: Set[Tuple[int, ...]]
-    ) -> bool:
-        """
-        Check if a node represents a final state.
-        
-        Parameters
-        ----------
-        node : search_node_new
-            Current search node
-        partial_conformance : bool
-            Whether performing partial conformance check
-        n_unique_final_markings : int
-            Number of unique final markings found
-        final_markings_unique : set
-            Set of unique final markings
-            
-        Returns
-        -------
-        bool
-            True if node is a final state
-        """
-        if partial_conformance:
-            trace_marking = node.marking.places[-len(self.trace_model.places):]
-            if trace_marking == self.trace_model.final_mark.places:
-                model_marking = tuple(node.marking.places[:len(self.net.places)])
-                if model_marking not in final_markings_unique:
-                    final_markings_unique.add(model_marking)
-                    return True
-        else:
-            return node.marking.places == self.final_mark.places
-        
-        return False
-    
-    def _create_dijkstra_successor_node(
-        self,
-        current_node: search_node_new,
-        transition: Transition,
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]],
-        lambdas: Optional[Tuple[float, ...]],
-        use_cond_prob: bool,
-        alpha: float,
-        use_heuristic_distance: bool,
-        use_ngram_smoothing: bool
-    ) -> search_node_new:
-        """
-        Create a successor node by firing a transition.
-        
-        Parameters
-        ----------
-        current_node : search_node_new
-            Current search node
-        transition : Transition
-            Transition to fire
-        prob_dict : dict, optional
-            Probability dictionary for conditional weights
-        lambdas : tuple of float, optional
-            N-gram weights
-        use_cond_prob : bool
-            Whether to use conditional probabilities
-        alpha : float
-            Blending factor for probabilities
-        use_heuristic_distance : bool
-            Whether to use A* heuristic
-        use_ngram_smoothing : bool
-            Whether to use n-gram smoothing
-            
-        Returns
-        -------
-        search_node_new
-            New successor node
-        """
-        new_marking = self._fire_transition(current_node.marking, transition)
-        
-        transition_weight = self.compute_conditioned_weight(
-            path_prefix=current_node.path_prefix,
-            transition=transition,
-            prob_dict=prob_dict,
-            lambdas=lambdas,
-            use_cond_prob=use_cond_prob,
-            alpha=alpha,
-            use_ngram_smoothing=use_ngram_smoothing
-        )
-        
-        new_path_prefix = self._update_path_prefix(
-            current_node.path_prefix,
-            transition
-        )
-        
-        heuristic_distance, leftover_activities = self._compute_dijkstra_heuristic(
-            current_node,
-            transition,
-            new_marking,
-            use_heuristic_distance
-        )
-        
-        total_model_moves = self._update_model_moves(
-            current_node.total_model_moves,
-            transition
-        )
-        
-        return search_node_new(
-            marking=new_marking,
-            dist=current_node.dist + transition_weight,
-            ancestor=current_node,
-            transition_to_ancestor=transition,
-            heuristic_distance=heuristic_distance,
-            path_prefix=new_path_prefix,
-            trace_activities_multiset=leftover_activities,
-            total_model_moves=total_model_moves
-        )
-    
-    def _update_path_prefix(
-        self,
-        current_prefix: List[str],
-        transition: Transition
-    ) -> List[str]:
-        """Update path prefix based on transition type."""
-        if transition.move_type in {'trace', 'sync'}:
-            return current_prefix + [transition.label]
-        return current_prefix
-    
-    def _update_model_moves(
-        self,
-        current_total: int,
-        transition: Transition
-    ) -> int:
-        """Update total model moves counter."""
-        if transition.move_type in {'model', 'sync'}:
-            return current_total + 1
-        return current_total
-    
-    def _compute_dijkstra_heuristic(
-        self,
-        current_node: search_node_new,
-        transition: Transition,
-        new_marking: Marking,
-        use_heuristic_distance: bool
-    ) -> Tuple[float, Set[str]]:
-        """
-        Compute heuristic distance for A* search.
-        
-        Parameters
-        ----------
-        current_node : search_node_new
-            Current search node
-        transition : Transition
-            Transition being fired
-        new_marking : Marking
-            New marking after firing
-        use_heuristic_distance : bool
-            Whether to compute heuristic
-            
-        Returns
-        -------
-        tuple
-            (heuristic_distance, leftover_trace_activities)
-        """
-        if not use_heuristic_distance:
-            return 0, set()
-        
-        leftover_activities = current_node.trace_activities_multiset.copy()
-        
-        if transition.move_type in {'trace', 'sync'}:
-            leftover_activities = self.subtract_activities(
-                leftover_activities,
-                transition.label
-            )
-        
-        heuristic_distance = self.estimate_alignment_heuristic(
-            new_marking,
-            leftover_activities
-        )
-        
-        return heuristic_distance, leftover_activities
-    
-    def _should_add_dijkstra_node(
-        self,
-        new_node: search_node_new,
-        marking_distance_dict: Dict[Tuple[int, ...], float]
-    ) -> bool:
-        """Check if a node should be added to the search space."""
-        marking_key = tuple(new_node.marking.places)
-        return (marking_key not in marking_distance_dict or
-                marking_distance_dict[marking_key] > new_node.dist)
-    
-    def _process_dijkstra_final_nodes(
-        self,
-        final_nodes: List[search_node_new],
-        partial_conformance: bool,
-        overlap_size: int,
-        trace_recovery: bool,
-        return_net_final_marking: bool
-    ) -> Union[List[Transition], List[Tuple]]:
-        """
-        Process final nodes to extract alignment results.
-        
-        Parameters
-        ----------
-        final_nodes : list of search_node_new
-            List of final nodes
-        partial_conformance : bool
-            Whether performing partial conformance
-        overlap_size : int
-            Size of overlap in trace model
-        trace_recovery : bool
-            Whether to recover alignment trace
-        return_net_final_marking : bool
-            Whether to return final marking
-            
-        Returns
-        -------
-        list
-            Either list of transitions or list of tuples
-        """
-        if trace_recovery and final_nodes:
-            return self._recover_alignment_trace(final_nodes[0])
-        
-        final_trace_marking = self._create_final_trace_marking(overlap_size)
-        results = []
-        
-        for node in final_nodes:
-            path = self._build_alignment_path(node)
-            
-            if return_net_final_marking:
-                model_marking = Marking(node.marking.places[:len(self.net.places)])
-                results.append((path, node.dist, model_marking, node.heuristic_distance))
-            else:
-                results.append((path, node.dist, node.heuristic_distance))
-        
-        return results
-    
-    def _create_final_trace_marking(self, overlap_size: int) -> List[int]:
-        """Create final trace marking for partial conformance."""
-        marking = [0] * len(self.trace_model.places)
-        marking[len(self.trace_model.places) - overlap_size - 1] = 1
-        return marking
-    
-    def _recover_alignment_trace(self, node: search_node_new) -> List[Transition]:
-        """Recover the sequence of transitions from final node."""
-        alignment = []
-        current = node
-        
-        while current.ancestor:
-            alignment.append(current.transition_to_ancestor)
-            current = current.ancestor
-        
-        return alignment[::-1]
-    
-    def _build_alignment_path(self, node: search_node_new) -> List[Transition]:
-        """Build the complete alignment path from a final node."""
-        path = []
-        current = node
-        
-        while current.ancestor:
-            path.append(current.transition_to_ancestor)
-            current = current.ancestor
-        
-        return path[::-1]
-    
-    def compute_conditioned_weight(
-        self,
-        path_prefix: Union[List[str], Tuple[str, ...]],
-        transition: Transition,
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
-        lambdas: Optional[Tuple[float, ...]] = None,
-        use_cond_prob: bool = False,
-        alpha: float = 0.5,
-        use_ngram_smoothing: bool = False,
-    ) -> float:
-        """
-        Compute conditional weight of a transition.
-        
-        Supports both n-gram smoothing and prefix search approaches for
-        computing conditional probabilities based on path history.
-        
-        Parameters
-        ----------
-        path_prefix : list or tuple of str
-            Sequence of activities leading to current transition
-        transition : Transition
-            Transition to compute weight for
-        prob_dict : dict, optional
-            Probability dictionary for conditional weights
-        lambdas : tuple of float, optional
-            Weights for n-gram lengths (required for n-gram smoothing)
-        use_cond_prob : bool
-            Whether to use conditional probabilities
-        alpha : float
-            Blending factor between original and conditional weights
-        use_ngram_smoothing : bool
-            Whether to use n-gram smoothing approach
-            
-        Returns
-        -------
-        float
-            Conditioned weight for the transition
-            
-        Raises
-        ------
-        ValueError
-            If required parameters are missing or invalid
-        """
-        if not use_cond_prob or prob_dict is None:
-            return transition.weight
-        
-        if isinstance(prob_dict, dict) and not prob_dict:
-            raise ValueError("Cannot compute conditional probabilities with empty prob_dict")
-        
-        # Return static weight for non-synchronous moves
-        if transition.move_type in {'trace', 'model'} or transition.label is None:
-            return transition.weight
-        
-        prefix_tuple = tuple(path_prefix)
-        
-        if use_ngram_smoothing:
-            return self._compute_ngram_based_weight(
-                prefix_tuple, transition, prob_dict, lambdas, alpha
-            )
-        else:
-            return self._compute_prefix_based_weight(
-                prefix_tuple, transition, prob_dict, alpha
-            )
-    
-    def _compute_ngram_based_weight(
-        self,
-        prefix_tuple: Tuple[str, ...],
-        transition: Transition,
-        prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
-        lambdas: Tuple[float, ...],
-        alpha: float
-    ) -> float:
-        """Compute weight using n-gram smoothing approach."""
-        if lambdas is None:
-            raise ValueError("Lambdas must be provided for n-gram smoothing")
-        
-        prob = self._compute_ngram_probability(
-            prefix_tuple, transition.label, prob_dict, lambdas
-        )
-        blended_prob = (1 - alpha) * prob + alpha * transition.prob
-        return self.cost_function(blended_prob)
-    
-    def _compute_prefix_based_weight(
-        self,
-        prefix_tuple: Tuple[str, ...],
-        transition: Transition,
-        prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
-        alpha: float
-    ) -> float:
-        """Compute weight using prefix search approach."""
-        prob = self._compute_prefix_search_probability(
-            prefix_tuple, transition.label, prob_dict
-        )
-        cost_prob = 1 - prob
-        return (1 - alpha) * cost_prob + alpha * transition.weight
-    
-    def _compute_ngram_probability(
-        self,
-        path_prefix_tuple: Tuple[str, ...],
-        transition_label: str,
-        prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
-        lambdas: Tuple[float, ...]
-    ) -> float:
-        """
-        Compute probability using n-gram smoothing.
-        
-        Parameters
-        ----------
-        path_prefix_tuple : tuple of str
-            Sequence of activities in path prefix
-        transition_label : str
-            Label of current transition
-        prob_dict : dict
-            N-gram probability dictionary
-        lambdas : tuple of float
-            Weights for different n-gram lengths
-            
-        Returns
-        -------
-        float
-            Computed probability
-        """
-        if not lambdas:
-            raise ValueError("Lambdas list must be provided for n-gram approach")
-        
-        if not path_prefix_tuple:
-            return prob_dict.get((), {}).get(transition_label, 0)
-        
-        total_weighted_prob = 0.0
-        total_lambda_weight = 0.0
-        max_n = min(len(path_prefix_tuple), len(lambdas))
-        
-        for n in range(1, max_n + 1):
-            prefix_n_gram = path_prefix_tuple[-n:]
-            prob = prob_dict.get(prefix_n_gram, {}).get(transition_label, 0)
-            lambda_weight = lambdas[n - 1]
-            
-            total_weighted_prob += lambda_weight * prob
-            total_lambda_weight += lambda_weight
-        
-        if total_lambda_weight == 0:
-            return 0
-        
-        return total_weighted_prob / total_lambda_weight
-    
-    def _compute_prefix_search_probability(
-        self,
-        path_prefix_tuple: Tuple[str, ...],
-        transition_label: str,
-        prob_dict: Dict[Tuple[str, ...], Dict[str, float]]
-    ) -> float:
-        """
-        Compute probability using prefix search.
-        
-        Parameters
-        ----------
-        path_prefix_tuple : tuple of str
-            Sequence of activities in path prefix
-        transition_label : str
-            Label of current transition
-        prob_dict : dict
-            Prefix probability dictionary
-            
-        Returns
-        -------
-        float
-            Computed probability
-        """
-        if not path_prefix_tuple:
-            return 0
-        
-        # Check exact prefix match
-        if path_prefix_tuple in prob_dict:
-            return prob_dict[path_prefix_tuple].get(transition_label, 0)
-        
-        # Find longest matching prefix
-        longest_prefix = self.find_longest_prefix(path_prefix_tuple, prob_dict)
-        if longest_prefix:
-            return prob_dict[longest_prefix].get(transition_label, 0)
-        
-        return 0
-    
-    def find_longest_prefix(
-        self,
-        path_prefix_tuple: Tuple[str, ...],
-        prob_dict: Dict[Tuple[str, ...], Any],
-        max_length: Optional[int] = None
-    ) -> Optional[Tuple[str, ...]]:
-        """
-        Find longest prefix that exists in dictionary.
-        
-        Parameters
-        ----------
-        path_prefix_tuple : tuple of str
-            Complete path to search in
-        prob_dict : dict
-            Dictionary to search for prefixes
-        max_length : int, optional
-            Maximum prefix length to consider
-            
-        Returns
-        -------
-        tuple or None
-            Longest existing prefix, or None if not found
-        """
-        max_len = len(path_prefix_tuple)
-        if max_length is not None:
-            max_len = min(max_len, max_length)
-        
-        for length in range(max_len, 0, -1):
-            prefix = path_prefix_tuple[-length:]
-            if prefix in prob_dict:
-                return prefix
-        
-        return None
+        if self.init_mark is None:
+            raise ValueError("Initial marking must be set")
+        if max_tau_depth <= 0:
+            raise ValueError("max_tau_depth must be positive")
+
+        visited: Set[Tuple[int, ...]] = set()
+        queue   = deque([self.init_mark.places])
+        result: Dict[Tuple[int, ...], Dict] = {}
+
+        while queue:
+            marking = queue.popleft()
+            if marking in visited:
+                continue
+
+            visited.add(marking)
+            result[marking] = {
+                "available_transitions": self._compute_reachable_transitions_via_tau(
+                    marking, max_tau_depth
+                )
+            }
+
+            for t in self._find_available_transitions(marking):
+                try:
+                    succ = self._fire_transition(
+                        self._ensure_marking_object(marking), t
+                    )
+                    if succ.places not in visited:
+                        queue.append(succ.places)
+                except Exception as exc:
+                    logger.warning("Could not fire %s from %s: %s", t.name, marking, exc)
+
+        # -------- NEW: store on the object ------------------------------------
+        self.marking_transition_map = result
+        return result
