@@ -603,127 +603,212 @@ resulting in: {new_mark}, during transition: {transition.name}')
                 return sub_prefix
         return None
 
-    # ---------------------------------------------------------------------------
-    #  Helper – canonical converter
-    # ---------------------------------------------------------------------------
-    def _ensure_marking_object(self, mark):
-        """
-        Convert `mark` (tuple or Marking) to a Marking instance.
-
-        Parameters
-        ----------
-        mark : Tuple[int, ...] | Marking
-        """
-        if isinstance(mark, tuple):
-            return Marking(mark)
-        if hasattr(mark, "places"):
-            return mark         # already a Marking
-        raise TypeError(f"Expected tuple or Marking, got {type(mark)}")
-
-
-    # ---------------------------------------------------------------------------
-    #  τ-path exploration for a single marking
-    # ---------------------------------------------------------------------------
     def _compute_reachable_transitions_via_tau(
         self,
         marking_places: Tuple[int, ...],
         max_tau_depth: int = 100
-    ) -> Dict["Transition", Tuple["Transition", ...]]:
+    ) -> Dict[Transition, Tuple[Transition, ...]]:
         """
-        Return all non-silent transitions reachable from `marking_places`
-        together with the shortest τ-path enabling each of them.
-
+        Compute all non-silent transitions reachable from marking_places via τ-moves.
+        
+        Returns a mapping from each reachable non-silent transition to the shortest
+        τ-path that enables it.
+        
+        Parameters
+        ----------
+        marking_places : Tuple[int, ...]
+            Initial marking as tuple of token counts
+        max_tau_depth : int, default=100
+            Maximum τ-path length to explore
+            
         Returns
         -------
-        Mapping[Transition, Tuple[tau1, tau2, ...]]
-        Empty tuple ⇒ transition is directly enabled.
+        Dict[Transition, Tuple[Transition, ...]]
+            Mapping from reachable non-silent transitions to their enabling τ-paths.
+            Empty tuple means the transition is directly enabled from initial marking.
+            
+        Raises
+        ------
+        ValueError
+            If max_tau_depth is not positive
         """
         if max_tau_depth <= 0:
             raise ValueError("max_tau_depth must be positive")
-
-        reachable: Dict = {}                               # Transition → τ-path
-        queue = deque([(marking_places, tuple())])         # (mark, current τ-path)
-        visited: Dict[Tuple[int, ...], int] = {}           # Marking → shortest τ-len
-
+        
+        # Result: maps transitions to their shortest enabling τ-path
+        reachable_transitions: Dict[Transition, Tuple[Transition, ...]] = {}
+        
+        # BFS queue: (current_marking, τ-path_to_reach_it)
+        queue = deque([(marking_places, tuple())])
+        
+        # Track visited markings with their shortest τ-path length
+        visited_markings: Dict[Tuple[int, ...], int] = {marking_places: 0}
+        
         while queue:
-            current_mark, tau_path = queue.popleft()
-
-            if visited.get(current_mark, float("inf")) <= len(tau_path):
+            current_marking, tau_path = queue.popleft()
+            
+            # Skip if we've already processed this marking with a shorter path
+            if visited_markings.get(current_marking, float('inf')) < len(tau_path):
                 continue
-            visited[current_mark] = len(tau_path)
-
+                
             try:
-                available = self._find_available_transitions(current_mark)
+                # Get all transitions enabled at current marking
+                enabled_transitions = self._find_available_transitions(current_marking)
             except Exception as exc:
-                logger.warning("Could not get transitions for %s: %s", current_mark, exc)
+                logger.warning(f"Could not get transitions for marking {current_marking}: {exc}")
                 continue
+            
+            # Process enabled transitions
+            for transition in enabled_transitions:
+                if transition.label is None:
+                    # Silent (τ) transition - expand search if within depth limit
+                    if len(tau_path) < max_tau_depth:
+                        try:
+                            # Fire τ transition to get successor marking
+                            successor_marking_obj = self._fire_transition(
+                                Marking(current_marking),  # Direct construction instead of _ensure_marking_object
+                                transition
+                            )
+                            successor_marking = successor_marking_obj.places
+                            
+                            # Only add to queue if we found a shorter or equal path
+                            new_tau_path = tau_path + (transition,)
+                            current_shortest = visited_markings.get(successor_marking, float('inf'))
+                            
+                            if len(new_tau_path) <= current_shortest:
+                                visited_markings[successor_marking] = len(new_tau_path)
+                                queue.append((successor_marking, new_tau_path))
+                                
+                        except Exception as exc:
+                            logger.warning(f"Could not fire τ transition {transition.name}: {exc}")
+                            continue
+                else:
+                    # Non-silent transition - record if this is shortest path
+                    if (transition not in reachable_transitions or 
+                        len(tau_path) < len(reachable_transitions[transition])):
+                        reachable_transitions[transition] = tau_path
+        
+        return reachable_transitions
 
-            # record non-silent transitions
-            for t in available:
-                if t.label is not None:                    # non-silent
-                    if t not in reachable or len(tau_path) < len(reachable[t]):
-                        reachable[t] = tau_path
 
-            # expand along τ moves
-            for t in available:
-                if t.label is None:                        # τ
-                    if len(tau_path) + 1 > max_tau_depth:
-                        continue
-                    try:
-                        successor = self._fire_transition(
-                            self._ensure_marking_object(current_mark), t
-                        ).places
-                    except Exception as exc:
-                        logger.warning("Could not fire τ %s: %s", t.name, exc)
-                        continue
-
-                    if visited.get(successor, float("inf")) > len(tau_path) + 1:
-                        queue.append((successor, tau_path + (t,)))
-
-        return reachable
-
-
-    # ---------------------------------------------------------------------------
-    #  Main: build and STORE full marking → transition map
-    # ---------------------------------------------------------------------------
     def build_marking_transition_map(
         self,
         max_tau_depth: int = 100
     ) -> Dict[Tuple[int, ...], Dict]:
         """
-        Compute the map and store it on `self` as `self.marking_transition_map`.
+        Build complete marking-to-transition map and store on self.
+        
+        This explores the state space and computes τ-reachability for each discovered marking.
+        
+        Parameters
+        ----------
+        max_tau_depth : int, default=100
+            Maximum τ-path length for reachability computation
+            
+        Returns
+        -------
+        Dict[Tuple[int, ...], Dict]
+            Complete mapping stored in self.marking_transition_map
+            
+        Raises
+        ------
+        ValueError
+            If initial marking not set or max_tau_depth invalid
         """
         if self.init_mark is None:
-            raise ValueError("Initial marking must be set")
+            raise ValueError("Initial marking must be set before building transition map")
         if max_tau_depth <= 0:
             raise ValueError("max_tau_depth must be positive")
-
-        visited: Set[Tuple[int, ...]] = set()
-        queue   = deque([self.init_mark.places])
+        
+        # Track all discovered markings and their transition maps
         result: Dict[Tuple[int, ...], Dict] = {}
-
-        while queue:
-            marking = queue.popleft()
-            if marking in visited:
+        
+        # BFS for state space exploration
+        visited_markings: Set[Tuple[int, ...]] = set()
+        exploration_queue = deque([self.init_mark.places])
+        
+        while exploration_queue:
+            current_marking = exploration_queue.popleft()
+            
+            if current_marking in visited_markings:
                 continue
-
-            visited.add(marking)
-            result[marking] = {
-                "available_transitions": self._compute_reachable_transitions_via_tau(
-                    marking, max_tau_depth
+                
+            visited_markings.add(current_marking)
+            
+            # Compute τ-reachable transitions for this marking
+            try:
+                tau_reachable = self._compute_reachable_transitions_via_tau(
+                    current_marking, max_tau_depth
                 )
-            }
-
-            for t in self._find_available_transitions(marking):
-                try:
-                    succ = self._fire_transition(
-                        self._ensure_marking_object(marking), t
-                    )
-                    if succ.places not in visited:
-                        queue.append(succ.places)
-                except Exception as exc:
-                    logger.warning("Could not fire %s from %s: %s", t.name, marking, exc)
-
-        # -------- NEW: store on the object ------------------------------------
+                
+                result[current_marking] = {
+                    "available_transitions": tau_reachable
+                }
+                
+                # Explore successors by firing all directly enabled transitions
+                directly_enabled = self._find_available_transitions(current_marking)
+                for transition in directly_enabled:
+                    try:
+                        successor = self._fire_transition(
+                            Marking(current_marking),  # Direct construction
+                            transition
+                        )
+                        if successor.places not in visited_markings:
+                            exploration_queue.append(successor.places)
+                            
+                    except Exception as exc:
+                        logger.warning(f"Could not fire {transition.name} from {current_marking}: {exc}")
+                        continue
+                        
+            except Exception as exc:
+                logger.warning(f"Could not compute τ-reachability for {current_marking}: {exc}")
+                # Still add empty entry to avoid recomputation
+                result[current_marking] = {"available_transitions": {}}
+        
+        # Store result on the object
         self.marking_transition_map = result
+        
+        logger.info(f"Built marking transition map with {len(result)} markings")
         return result
+
+    def get_tau_reachable_transitions(self, marking=None, max_tau_depth=100):
+        """
+        Get all tau-reachable transitions for a given marking.
+
+        Args:
+            marking: Marking object, tuple, or None (uses initial marking if None)
+            max_tau_depth: Maximum depth for tau exploration (default: 100)
+
+        Returns:
+            Dict[Transition, Tuple[Transition, ...]]: Mapping from reachable non-silent 
+            transitions to their enabling tau-paths. Empty tuple means directly enabled.
+        """
+        if marking is None:
+            if self.init_mark is None:
+                raise ValueError("No marking provided and initial marking not set")
+            marking_tuple = self.init_mark.places
+        elif isinstance(marking, Marking):
+            marking_tuple = marking.places
+        elif isinstance(marking, tuple):
+            marking_tuple = marking
+        else:
+            raise TypeError("Marking must be a Marking object, tuple, or None")
+
+        # Check if the marking_transition_map exists and contains the marking
+        if hasattr(self, "marking_transition_map") and self.marking_transition_map is not None:
+            entry = self.marking_transition_map.get(marking_tuple)
+            if entry is not None and "available_transitions" in entry:
+                return entry["available_transitions"]
+
+        # Otherwise, compute and return
+        return self._compute_reachable_transitions_via_tau(marking_tuple, max_tau_depth)
+    
+    def get_tau_reachable_transitions_initial(self, max_tau_depth=100):
+        """Get tau-reachable transitions for the initial marking."""
+        return self.get_tau_reachable_transitions(self.init_mark, max_tau_depth)
+    
+    def get_tau_reachable_transitions_final(self, max_tau_depth=100):
+        """Get tau-reachable transitions for the final marking."""
+        if self.final_mark is None:
+            raise ValueError("Final marking not set")
+        return self.get_tau_reachable_transitions(self.final_mark, max_tau_depth)

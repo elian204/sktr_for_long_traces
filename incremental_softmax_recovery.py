@@ -286,6 +286,12 @@ def incremental_softmax_recovery(
     n_places = len(model.places)
     n_transitions = len(model.transitions)
     logger.info(f"Discovered Petri net model: {n_places} places, {n_transitions} transitions.")
+    
+    # Compute marking-to-transition map (reachable markings and their tau-reachable transitions)
+    logger.info("Computing marking-to-transition map (tau-reachability) for discovered Petri net...")
+    marking_transition_map = model.build_marking_transition_map()
+    logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
+
 
     # 8. Conditional probabilities (optional)
     prob_dict = {}
