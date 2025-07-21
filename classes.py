@@ -23,8 +23,8 @@ n-gram smoothing for improved alignment quality.
 
 import numpy as np
 import copy
-from collections import deque
-from typing import Dict, List, Set, Tuple, Any
+from collections import deque, Counter
+from typing import Dict, List, Set, Tuple, Any, Union
 import logging
 
 logger = logging.getLogger(__name__)
@@ -474,10 +474,24 @@ class PetriNet:
             self.transitions_indices[transitions.name] = curr_idx            
      
     
+    def _find_directly_enabled_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
+        """
+        Finds all transitions that are directly enabled from a given marking,
+        without considering tau-reachability.
+        """
+        available_transitions = []
+        for transition in self.transitions:
+            if self.__check_transition_prerequesits(transition, mark_tuple):
+                available_transitions.append(transition)
+        return available_transitions
+
     def _find_available_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
         """
         Given a marking (as a tuple of token counts), return a list of transitions
         that are enabled (i.e., can fire) from this marking.
+
+        If a `marking_transition_map` is available, this will return non-silent tau-reachable
+        transitions. Otherwise, it returns only directly enabled transitions.
 
         Args:
             mark_tuple (Tuple[int, ...]): The current marking represented as a tuple of token counts.
@@ -485,13 +499,19 @@ class PetriNet:
         Returns:
             List[Transition]: A list of enabled Transition objects for the given marking.
         """
-        
-        available_transitions = []
-        for transition in self.transitions:
-            if self.__check_transition_prerequesits(transition, mark_tuple):
-                available_transitions.append(transition)
-                
-        return available_transitions
+        if hasattr(self, "marking_transition_map") and self.marking_transition_map is not None:
+            entry = self.marking_transition_map.get(mark_tuple)
+            if entry and "available_transitions" in entry:
+                # Return the list of non-silent transitions reachable via tau-moves.
+                return list(entry["available_transitions"].keys())
+            else:
+                logger.warning(
+                    f"Marking {mark_tuple} not found in marking_transition_map or missing 'available_transitions'. "
+                    "Falling back to direct enabled transitions."
+                )
+
+        # Fallback to original behavior if map is not present or marking is not in map.
+        return self._find_directly_enabled_transitions(mark_tuple)
 
     
     def __check_transition_prerequesits(self, transition: Transition, mark_tuple: Tuple[int, ...]) -> bool:
@@ -537,36 +557,134 @@ class PetriNet:
         return sync_prod._dijkstra_no_rg_construct(hist_prob_dict, lamda=lamda)
     
 
-    def _fire_transition(self, mark, transition):
-        '''Input: Mark object or tuple, Transition object
-        Output: Marking object''' 
+    def _fire_transition(
+        self,
+        mark: Union[Marking, Tuple[int, ...]],
+        transition: "Transition"
+    ) -> "Marking":
+        """
+        Fire a transition on a given marking.
 
-        # Check if mark is a tuple or an instance of Marking, and get the places accordingly
+        Parameters
+        ----------
+        mark
+            Either a Marking object or a raw tuple of token counts.
+        transition
+            The transition to fire.
+
+        Returns
+        -------
+        Marking
+            The new marking after firing.
+
+        Raises
+        ------
+        TypeError
+            If `mark` is neither a tuple nor a Marking.
+        ValueError
+            If firing would produce negative tokens.
+        """
+        # 1) Normalize and type‐check
         if isinstance(mark, tuple):
             places = mark
-        elif isinstance(mark, Marking):  # Assuming Marking is a class you've defined
+        elif isinstance(mark, Marking):
             places = mark.places
         else:
-            raise TypeError("Expected mark to be either a tuple or Marking instance")
+            raise TypeError(f"mark must be a tuple or Marking, got {type(mark)}")
 
-        subtract_mark = [0] * len(places)
+        # 2) Build net token‐change per place
+        delta = Counter()
         for arc in transition.in_arcs:
-            place_idx = self.places_indices[arc.source.name]
-            subtract_mark[place_idx] -= arc.weight
-        
-        add_mark = [0] * len(places)
+            idx = self.places_indices[arc.source.name]
+            delta[idx] -= arc.weight
         for arc in transition.out_arcs:
-            place_idx = self.places_indices[arc.target.name]
-            add_mark[place_idx] += arc.weight
-  
-        new_mark = tuple([sum(x) for x in zip(places, subtract_mark, add_mark)])
-        for elem in new_mark:
-            if elem < 0:
-                print(f'The original mark was: {mark}, subtracting: {subtract_mark}, adding: {add_mark}, \
-resulting in: {new_mark}, during transition: {transition.name}')
+            idx = self.places_indices[arc.target.name]
+            delta[idx] += arc.weight
 
-        new_mark_obj = Marking(new_mark)
-        return new_mark_obj
+        # 3) Apply delta and check for negatives
+        new_places = []
+        for i, old in enumerate(places):
+            new = old + delta[i]
+            if new < 0:
+                raise ValueError(
+                    f"Firing '{transition.name}' yields negative tokens at place {i}: "
+                    f"{old} + ({delta[i]}) = {new}"
+                )
+            new_places.append(new)
+
+        # 4) Wrap in Marking
+        return Marking(tuple(new_places))
+
+    def _fire_transition_sequence(self, marking, transitions):
+        """
+        Fires a sequence of transitions starting from a given marking.
+
+        Args:
+            marking (Marking or tuple): The starting marking.
+            transitions (list or tuple of Transition): The sequence of transitions to fire.
+
+        Returns:
+            Marking: The marking after firing the entire sequence.
+        """
+        current_marking = marking
+        for transition in transitions:
+            current_marking = self._fire_transition(current_marking, transition)
+        return current_marking
+
+    def _fire_macro_transition(self, marking, target_transition):
+        """
+        Fires a τ-path and then the target transition.
+        
+        Parameters
+        ----------
+        marking : Any
+            A Marking-like object (with a `.places` tuple) or a raw tuple of ints.
+        target_transition : Transition
+            The visible transition to fire after the τ-path.
+        
+        Returns
+        -------
+        Marking
+            The final marking after firing the τ-path and the target transition.
+        
+        Raises
+        ------
+        TypeError
+            If `marking` is neither Marking-like nor a tuple of ints.
+        ValueError
+            If the transition-map isn’t computed, or target is unreachable.
+        """
+        # 1) Normalize input: accept any object with .places, or a tuple
+        if hasattr(marking, "places"):
+            marking_tuple = marking.places
+        elif isinstance(marking, tuple):
+            marking_tuple = marking
+        else:
+            raise TypeError(
+                f"_fire_macro_transition expected a Marking-like or tuple, "
+                f"got {type(marking)}"
+            )
+
+        # 2) Ensure the τ-reachability map exists
+        if not getattr(self, "marking_transition_map", None):
+            raise ValueError("marking_transition_map is not available or not computed.")
+
+        # 3) Lookup the τ-path for this marking → transition
+        entry = self.marking_transition_map.get(marking_tuple)
+        if not entry or "available_transitions" not in entry:
+            raise ValueError(f"Marking {marking_tuple} not in transition map.")
+
+        tau_path = entry["available_transitions"].get(target_transition)
+        if tau_path is None:
+            raise ValueError(
+                f"Transition {target_transition.name} not reachable from marking {marking_tuple}."
+            )
+
+        # 4) Fire the τ-sequence, then the target transition
+        marking_after_tau = self._fire_transition_sequence(marking_tuple, tau_path)
+        final_marking     = self._fire_transition(marking_after_tau, target_transition)
+        return final_marking
+
 
     def convert_marking_to_pm4py(self, marking: Any) -> Dict[Any, int]:
         return {self.reverse_place_mapping[idx]: tokens 
@@ -653,7 +771,7 @@ resulting in: {new_mark}, during transition: {transition.name}')
                 
             try:
                 # Get all transitions enabled at current marking
-                enabled_transitions = self._find_available_transitions(current_marking)
+                enabled_transitions = self._find_directly_enabled_transitions(current_marking)
             except Exception as exc:
                 logger.warning(f"Could not get transitions for marking {current_marking}: {exc}")
                 continue
@@ -746,7 +864,7 @@ resulting in: {new_mark}, during transition: {transition.name}')
                 }
                 
                 # Explore successors by firing all directly enabled transitions
-                directly_enabled = self._find_available_transitions(current_marking)
+                directly_enabled = self._find_directly_enabled_transitions(current_marking)
                 for transition in directly_enabled:
                     try:
                         successor = self._fire_transition(

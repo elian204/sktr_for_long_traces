@@ -16,9 +16,8 @@ Helper Classes and Functions:
 """
 
 from typing import Any, Callable, Dict, List, Optional, Tuple
-import pandas as pd
 import numpy as np
-from classes import PetriNet, Marking
+from classes import PetriNet
 from utils import compute_conditional_probability
 import logging
 
@@ -51,8 +50,10 @@ class BeamCandidate:
         self.timestamp = timestamp
 
     def __repr__(self) -> str:
+        marking_repr = self.marking.places if hasattr(self.marking, 'places') else self.marking
         return (f"BeamCandidate(path={self.path}, "
                 f"cost={self.cumulative_cost:.4f}, "
+                f"marking={marking_repr}, "
                 f"timestamp={self.timestamp})")
 
     def copy(self) -> 'BeamCandidate':
@@ -135,7 +136,7 @@ def process_test_case_incremental(
     use_ngram_smoothing: bool,
     activity_prob_threshold: float,
     beam_score_alpha: float = 0.5,
-    completion_patience: int = 5,
+    completion_patience: int = 5
 ) -> List[str]:
     """
     Process a single test case using incremental beam search.
@@ -205,9 +206,16 @@ def process_test_case_incremental(
     patience_counter = 0
     first_completion = False
     
+    prev_beam_state_keys = None
+
     while iteration < max_iterations:
         iteration += 1
         
+        logger.debug(f"--- Iteration {iteration} ---")
+        logger.debug(f"Beam before expansion ({len(beam_state.candidates)} candidates):")
+        for i, cand in enumerate(beam_state.candidates):
+            logger.debug(f"  {i}: {cand}")
+
         # Expand beam candidates (generate ALL successors from current beam)
         new_candidates = _expand_beam_candidates(
             beam_state=beam_state,
@@ -222,36 +230,68 @@ def process_test_case_incremental(
             activity_prob_threshold=activity_prob_threshold,
         )
         
-        # Replace ALL old candidates with new ones (proper beam search)
-        beam_state.candidates = new_candidates
+        # --- Deduplication Step ---
+        # Group candidates by their state (marking + timestamp) and keep only the best one.
+        best_candidates_per_state: Dict[Tuple, BeamCandidate] = {}
+        for cand in new_candidates:
+            state_key = (cand.marking.places, cand.timestamp)
+            if state_key not in best_candidates_per_state or \
+               cand.cumulative_cost < best_candidates_per_state[state_key].cumulative_cost:
+                best_candidates_per_state[state_key] = cand
+        
+        beam_state.candidates = list(best_candidates_per_state.values())
         beam_state.prune_beam()
         
-        # Check for completed candidates AFTER expansion and pruning
-        completed = [c for c in beam_state.candidates if c.timestamp >= n_timestamps and c.marking.places == model.final_mark.places]
-        if completed:
+        logger.debug(f"Beam after pruning ({len(beam_state.candidates)} candidates):")
+        for i, cand in enumerate(beam_state.candidates):
+            logger.debug(f"  {i}: {cand}")
+
+        # --- Stall Detection & Completion Checks ---
+        
+        # A candidate is complete if it has processed the entire trace.
+        completed_this_step = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
+        if completed_this_step:
             if not first_completion:
+                logger.debug(f"First completed candidate(s) found at iteration {iteration}.")
                 first_completion = True
-            all_completed.extend(completed)
+            all_completed.extend(completed_this_step)
+
+        # The active beam for the next iteration contains only unfinished candidates.
+        active_beam = [c for c in beam_state.candidates if c.timestamp < n_timestamps]
         
-        # Remove completed from active beam
-        beam_state.candidates = [c for c in beam_state.candidates if not (c.timestamp >= n_timestamps and c.marking.places == model.final_mark.places)]
+        # Check for stalls only on the active part of the beam.
+        current_beam_state_keys = {(c.marking.places, c.timestamp) for c in active_beam}
+        if prev_beam_state_keys is not None and current_beam_state_keys == prev_beam_state_keys:
+            logger.warning(f"Beam search stalled on active candidates at iteration {iteration}. Terminating.")
+            break
+        prev_beam_state_keys = current_beam_state_keys
         
-        # Patience check
+        beam_state.candidates = active_beam
+        
+        # Patience check: if we've found a completed candidate, wait a few steps for better ones.
         if first_completion:
             patience_counter += 1
-            if patience_counter >= completion_patience and all_completed:
+            if patience_counter >= completion_patience:
+                logger.debug(f"Completion patience of {completion_patience} iterations reached. Stopping.")
                 break
         
+        # If the active beam is empty, there's nothing more to expand.
         if not beam_state.candidates:
+            logger.info("Active beam is empty. Stopping search.")
             break
     
-    # Select best completed if any
+    # --- Final Selection ---
     if all_completed:
+        logger.info(f"Beam search finished. Found {len(all_completed)} candidates that completed the trace.")
+        # Score all completed candidates and return the path of the best one.
         best_completed = min(all_completed, key=lambda c: beam_state._beam_score(c))
         return list(best_completed.path)
     
-    # Fallback if we exit the loop without completing any candidates
-    logger.warning(f"Beam search failed to complete after {max_iterations} iterations, falling back to greedy prediction")
+    # Fallback if we exit the loop without any candidate ever completing the trace.
+    logger.warning(
+        f"Beam search failed to find any path that completes the trace after {iteration} iterations. "
+        "Falling back to greedy prediction."
+    )
     return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps)
 
 
@@ -313,18 +353,17 @@ def _expand_beam_candidates(
     Expand each beam candidate by all valid next transitions:
       - sync moves: match log & model (advance timestamp & path)
       - log moves: log insertion (advance timestamp & path)
-      - tau moves: silent model moves (advance marking only)
       - model moves: model insertion (advance marking only)
     Compute adjusted probabilities, dispatch cost_fn by move_type.
     """
     new_candidates: List[BeamCandidate] = []
 
     for cand in beam_state.candidates:
-        # Partition available transitions
+        # Get all available transitions from the current marking.
         available = model._find_available_transitions(cand.marking.places)
         sync_trans = {t.label: t for t in available if t.label is not None}
-        tau_trans  = {t.name:  t for t in available if t.label is None}
 
+        predicted_acts = set()
         if cand.timestamp < softmax_matrix.shape[1]:
             # Raw softmax probs at this timestamp
             probs = softmax_matrix[:, cand.timestamp]
@@ -335,6 +374,7 @@ def _expand_beam_candidates(
                     continue
 
                 act = str(idx)
+                predicted_acts.add(act)
                 p = (
                     compute_conditional_probability(
                         cand.path, act, raw_p,
@@ -343,53 +383,42 @@ def _expand_beam_candidates(
                     if use_cond_probs and prob_dict else raw_p
                 )
 
-                if act in sync_trans:
-                    # synchronous move
-                    move_type = "sync"
-                    next_path = cand.path + (act,)
-                    next_timestamp = cand.timestamp + 1
-                    next_marking = model._fire_transition(cand.marking, sync_trans[act])
-                else:
-                    # log move: insert log event without model firing
-                    move_type = "log"
-                    next_path = cand.path + (act,)
-                    next_timestamp = cand.timestamp + 1
-                    next_marking = cand.marking
-
-                step_cost = cost_fn(p, move_type)
+                # ALWAYS consider a log move for any activity with sufficient probability
+                log_move_cost = cost_fn(p, "log")
                 new_candidates.append(
                     BeamCandidate(
-                        path=next_path,
-                        cumulative_cost=cand.cumulative_cost + step_cost,
-                        marking=next_marking,
-                        timestamp=next_timestamp
+                        path=cand.path + (act,),
+                        cumulative_cost=cand.cumulative_cost + log_move_cost,
+                        marking=cand.marking,
+                        timestamp=cand.timestamp + 1
                     )
                 )
 
-        # 2) handle tau transitions separately (silent model moves)
-        for trans in tau_trans.values():
-            next_marking = model._fire_transition(cand.marking, trans)
-            tau_cost = cost_fn(0.0, "tau")
-            new_candidates.append(
-                BeamCandidate(
-                    path=cand.path,
-                    cumulative_cost=cand.cumulative_cost + tau_cost,
-                    marking=next_marking,
-                    timestamp=cand.timestamp
-                )
-            )
+                # IF the activity is also a valid synchronous move, consider that path too
+                if act in sync_trans:
+                    sync_move_cost = cost_fn(p, "sync")
+                    next_marking_sync = model._fire_macro_transition(cand.marking, sync_trans[act])
+                    new_candidates.append(
+                        BeamCandidate(
+                            path=cand.path + (act,),
+                            cumulative_cost=cand.cumulative_cost + sync_move_cost,
+                            marking=next_marking_sync,
+                            timestamp=cand.timestamp + 1
+                        )
+                    )
 
-        # 3) handle pure model moves (model insertion)
-        for trans in sync_trans.values():
-            next_marking = model._fire_transition(cand.marking, trans)
-            model_cost = cost_fn(0.0, "model")
-            new_candidates.append(
-                BeamCandidate(
-                    path=cand.path,
-                    cumulative_cost=cand.cumulative_cost + model_cost,
-                    marking=next_marking,
-                    timestamp=cand.timestamp
+            # 2) handle pure model moves (model insertion)
+            for trans in sync_trans.values():
+                # Use fire_macro_transition to correctly handle any required tau-path
+                next_marking = model._fire_macro_transition(cand.marking, trans)
+                model_cost = cost_fn(0.0, "model")
+                new_candidates.append(
+                    BeamCandidate(
+                        path=cand.path,
+                        cumulative_cost=cand.cumulative_cost + model_cost,
+                        marking=next_marking,
+                        timestamp=cand.timestamp
+                    )
                 )
-            )
 
     return new_candidates
