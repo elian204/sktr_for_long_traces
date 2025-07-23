@@ -3,6 +3,7 @@ Petri net discovery and conversion utilities.
 """
 
 from collections import Counter, defaultdict
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -309,59 +310,56 @@ def build_probability_dict(
 def _build_conditioned_prob_dict(
     df_train: pd.DataFrame,
     max_hist_len: int = 2,
-    precision: int = 2
+    precision: int = 2,
+    k: float = 1.0       # pseudo-count ≥1 ⇒ all log(count+k) ≥ 0
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
-    Build conditional probability dictionary from training traces.
-    
-    Creates n-gram based conditional probabilities P(activity | history)
-    where history is a sequence of previous activities.
-    
+    Build conditional probabilities P(activity | history) for all histories of
+    length ≤ max_hist_len, using log(+k) smoothing.
+
     Parameters
     ----------
     df_train : pd.DataFrame
-        Training DataFrame with columns 'case:concept:name' and 'concept:name'
+        Log with 'case:concept:name' and 'concept:name'.
     max_hist_len : int, default=2
-        Maximum length of history to consider
+        Maximum history length for n-grams.
     precision : int, default=2
-        Number of decimal places for probability rounding
-        
+        Decimal places for probabilities.
+    k : float, default=1.0
+        Pseudo-count added before log; must be ≥1 to keep logs nonnegative.
+
     Returns
     -------
-    Dict[Tuple[str, ...], Dict[str, float]]
-        Dictionary mapping history tuples to {activity: probability} dictionaries
+    Dict[history, Dict[next_activity, probability]]
     """
-    # Efficient extraction using groupby - O(n) instead of O(n²)
+    # 1) Extract sequences per case
     activity_sequences = [
-        group['concept:name'].tolist() 
+        group['concept:name'].tolist()
         for _, group in df_train.groupby('case:concept:name', sort=False)
     ]
-    
-    # Build histogram directly without intermediate list
-    history_counts = defaultdict(lambda: defaultdict(int))
-    
-    for sequence in activity_sequences:
-        pairs = _get_histories_up_to_length_k(sequence, max_hist_len)
+
+    # 2) Count (history → next_activity) exactly as original
+    history_counts: Dict[Tuple[str, ...], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for seq in activity_sequences:
+        pairs = _get_histories_up_to_length_k(seq, max_hist_len)
         for history, activity in pairs:
             history_counts[history][activity] += 1
-    
-    # Convert to conditional probabilities in single pass
-    prob_dict = {}
-    for history, activity_counts in history_counts.items():
-        total_count = sum(activity_counts.values())
-        if total_count == 0:
+
+    # 3) Build log(+k) smoothed probabilities
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    for history, counts in history_counts.items():
+        # 3a) add pseudo-count then log
+        log_weights = {a: math.log(c + k) for a, c in counts.items()}
+        total = sum(log_weights.values())
+        if total <= 0:
             continue
-            
-        activity_probs = {}
-        for activity, count in activity_counts.items():
-            probability = round(count / total_count, precision)
-            if probability > 0:  # Only include non-zero probabilities
-                activity_probs[activity] = probability
-        
-        # Only include histories that have valid probabilities
-        if activity_probs:
-            prob_dict[history] = activity_probs
-    
+        # 3b) normalize and round
+        probs = {
+            a: round(w / total, precision)
+            for a, w in log_weights.items()
+        }
+        prob_dict[history] = probs
+
     return prob_dict
 
 

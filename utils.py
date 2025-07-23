@@ -230,6 +230,29 @@ def compute_conditional_probability(
     return (1 - alpha) * conditional_prob + alpha * base_probability
 
 
+def simple_bigram_blend(
+    path_prefix: Tuple[str, ...],
+    activity_name: str,
+    base_probability: float,
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
+    alpha: float,
+) -> float:
+    """
+    Simple function to blend base probability with bigram conditional probability for testing.
+    
+    Uses bigram P(activity|previous) if previous exists, unigram P(activity) otherwise.
+    
+    Parameters same as compute_conditional_probability, but ignores lambdas and use_ngram_smoothing.
+    """
+    if not path_prefix:
+        conditional_prob = prob_dict.get((), {}).get(activity_name, 0.0)
+    else:
+        previous = path_prefix[-1]
+        conditional_prob = prob_dict.get((previous,), {}).get(activity_name, 0.0)
+    
+    return (1 - alpha) * conditional_prob + alpha * base_probability
+
+
 def compute_ngram_probability(
     path_prefix_tuple: Tuple[str, ...],
     activity_name: str,
@@ -257,16 +280,21 @@ def compute_ngram_probability(
     float
         Computed probability
     """
+    logger = logging.getLogger("ngram_prob")
     if not lambdas:
         raise ValueError("lambdas cannot be empty for n-gram probability computation")
     
     if not path_prefix_tuple:
         base_prob = prob_dict.get((), {}).get(activity_name, 0.0)
+        logger.debug(
+            f"[n-gram] Empty prefix: returning unigram prob for '{activity_name}': {base_prob}"
+        )
         return base_prob
     
     total_weighted_prob = 0.0
     total_lambda_weight = 0.0
     max_n = min(len(path_prefix_tuple), len(lambdas))
+    ngram_details = []
     
     for n in range(1, max_n + 1):
         prefix_n_gram = path_prefix_tuple[-n:]
@@ -275,11 +303,22 @@ def compute_ngram_probability(
         contribution = lambda_weight * prob
         total_weighted_prob += contribution
         total_lambda_weight += lambda_weight
+        ngram_details.append(
+            f"n={n} prefix={prefix_n_gram} lambda={lambda_weight:.3f} prob={prob:.5f} contrib={contribution:.5f}"
+        )
     
     if total_lambda_weight == 0:
+        logger.debug(
+            f"[n-gram] All lambda weights zero for prefix {path_prefix_tuple} and activity '{activity_name}'. Returning 0.0."
+        )
         return 0.0
     
     final_prob = total_weighted_prob / total_lambda_weight
+    logger.debug(
+        f"[n-gram] path_prefix={path_prefix_tuple}, activity='{activity_name}'\n"
+        f"  Details: " + "; ".join(ngram_details) + f"\n"
+        f"  total_weighted_prob={total_weighted_prob:.5f}, total_lambda_weight={total_lambda_weight:.5f}, final_prob={final_prob:.5f}"
+    )
     return final_prob
 
 

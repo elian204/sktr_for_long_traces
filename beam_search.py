@@ -18,7 +18,7 @@ Helper Classes and Functions:
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 from classes import PetriNet
-from utils import compute_conditional_probability
+from utils import compute_conditional_probability, simple_bigram_blend
 import logging
 
 logger = logging.getLogger(__name__)
@@ -43,18 +43,21 @@ class BeamCandidate:
                  path: Tuple[str, ...],
                  cumulative_cost: float,
                  marking: Any,
-                 timestamp: int):
+                 timestamp: int,
+                 move_costs: List[float] = None):
         self.path = path
         self.cumulative_cost = cumulative_cost
         self.marking = marking
         self.timestamp = timestamp
+        self.move_costs = [] if move_costs is None else move_costs
 
     def __repr__(self) -> str:
         marking_repr = self.marking.places if hasattr(self.marking, 'places') else self.marking
         return (f"BeamCandidate(path={self.path}, "
                 f"cost={self.cumulative_cost:.4f}, "
                 f"marking={marking_repr}, "
-                f"timestamp={self.timestamp})")
+                f"timestamp={self.timestamp}, "
+                f"move_costs={self.move_costs})")
 
     def copy(self) -> 'BeamCandidate':
         """Create a copy of this candidate."""
@@ -62,7 +65,8 @@ class BeamCandidate:
             path=self.path,
             cumulative_cost=self.cumulative_cost,
             marking=self.marking,
-            timestamp=self.timestamp
+            timestamp=self.timestamp,
+            move_costs=self.move_costs[:]
         )
 
 
@@ -109,7 +113,7 @@ class BeamState:
         depth = max(len(cand.path), 1)
         avg_cost = cand.cumulative_cost / (depth + self.epsilon)
         total_cost = cand.cumulative_cost
-        return self.alpha * avg_cost + (1 - self.alpha) * total_cost
+        return self.alpha * total_cost + (1 - self.alpha) * avg_cost
 
     def prune_beam(self) -> None:
         """Keep only the top beam_width candidates by blended score."""
@@ -137,7 +141,7 @@ def process_test_case_incremental(
     activity_prob_threshold: float,
     beam_score_alpha: float = 0.5,
     completion_patience: int = 5
-) -> List[str]:
+) -> Tuple[List[str], List[float]]:
     """
     Process a single test case using incremental beam search.
     
@@ -195,7 +199,8 @@ def process_test_case_incremental(
         path=(),
         cumulative_cost=0.0,
         marking=model.init_mark,
-        timestamp=0
+        timestamp=0,
+        move_costs=[]
     )
     beam_state.add_candidate(initial_candidate)
     
@@ -211,11 +216,6 @@ def process_test_case_incremental(
     while iteration < max_iterations:
         iteration += 1
         
-        logger.debug(f"--- Iteration {iteration} ---")
-        logger.debug(f"Beam before expansion ({len(beam_state.candidates)} candidates):")
-        for i, cand in enumerate(beam_state.candidates):
-            logger.debug(f"  {i}: {cand}")
-
         # Expand beam candidates (generate ALL successors from current beam)
         new_candidates = _expand_beam_candidates(
             beam_state=beam_state,
@@ -242,9 +242,6 @@ def process_test_case_incremental(
         beam_state.candidates = list(best_candidates_per_state.values())
         beam_state.prune_beam()
         
-        logger.debug(f"Beam after pruning ({len(beam_state.candidates)} candidates):")
-        for i, cand in enumerate(beam_state.candidates):
-            logger.debug(f"  {i}: {cand}")
 
         # --- Stall Detection & Completion Checks ---
         
@@ -252,7 +249,6 @@ def process_test_case_incremental(
         completed_this_step = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
         if completed_this_step:
             if not first_completion:
-                logger.debug(f"First completed candidate(s) found at iteration {iteration}.")
                 first_completion = True
             all_completed.extend(completed_this_step)
 
@@ -272,7 +268,6 @@ def process_test_case_incremental(
         if first_completion:
             patience_counter += 1
             if patience_counter >= completion_patience:
-                logger.debug(f"Completion patience of {completion_patience} iterations reached. Stopping.")
                 break
         
         # If the active beam is empty, there's nothing more to expand.
@@ -285,21 +280,22 @@ def process_test_case_incremental(
         logger.info(f"Beam search finished. Found {len(all_completed)} candidates that completed the trace.")
         # Score all completed candidates and return the path of the best one.
         best_completed = min(all_completed, key=lambda c: beam_state._beam_score(c))
-        return list(best_completed.path)
+        return list(best_completed.path), list(best_completed.move_costs)
     
     # Fallback if we exit the loop without any candidate ever completing the trace.
     logger.warning(
         f"Beam search failed to find any path that completes the trace after {iteration} iterations. "
         "Falling back to greedy prediction."
     )
-    return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps)
+    return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps, cost_fn)
 
 
 def _generate_fallback_sequence(
     beam_state: BeamState,
     softmax_matrix: np.ndarray,
-    n_timestamps: int
-) -> List[str]:
+    n_timestamps: int,
+    cost_fn: Callable[[float, str], float]
+) -> Tuple[List[str], List[float]]:
     """
     Generate fallback sequence when beam search doesn't complete successfully.
     
@@ -323,18 +319,26 @@ def _generate_fallback_sequence(
     best_candidate = beam_state.get_best_candidate()
     if best_candidate:
         predicted_sequence = list(best_candidate.path)
+        predicted_costs = list(best_candidate.move_costs)
         # If the best candidate didn't complete the full sequence, extend with highest probabilities
         for step in range(best_candidate.timestamp, n_timestamps):
+            max_p = np.max(softmax_matrix[:, step])
+            assumed_cost = cost_fn(max_p, "log")  # Assume log move cost for fallback
+            predicted_costs.append(assumed_cost)
             best_idx = np.argmax(softmax_matrix[:, step])
             predicted_sequence.append(str(best_idx))
     else:
         # Complete fallback - predict highest probability activity for each step
         predicted_sequence = []
+        predicted_costs = []
         for step in range(n_timestamps):
+            max_p = np.max(softmax_matrix[:, step])
+            assumed_cost = cost_fn(max_p, "log")
+            predicted_costs.append(assumed_cost)
             best_idx = np.argmax(softmax_matrix[:, step])
             predicted_sequence.append(str(best_idx))
     
-    return predicted_sequence
+    return predicted_sequence, predicted_costs
 
 
 def _expand_beam_candidates(
@@ -376,9 +380,9 @@ def _expand_beam_candidates(
                 act = str(idx)
                 predicted_acts.add(act)
                 p = (
-                    compute_conditional_probability(
+                    simple_bigram_blend(
                         cand.path, act, raw_p,
-                        prob_dict, lambdas, alpha, use_ngram_smoothing
+                        prob_dict, alpha
                     )
                     if use_cond_probs and prob_dict else raw_p
                 )
@@ -390,7 +394,8 @@ def _expand_beam_candidates(
                         path=cand.path + (act,),
                         cumulative_cost=cand.cumulative_cost + log_move_cost,
                         marking=cand.marking,
-                        timestamp=cand.timestamp + 1
+                        timestamp=cand.timestamp + 1,
+                        move_costs=cand.move_costs[:] + [log_move_cost]
                     )
                 )
 
@@ -403,7 +408,8 @@ def _expand_beam_candidates(
                             path=cand.path + (act,),
                             cumulative_cost=cand.cumulative_cost + sync_move_cost,
                             marking=next_marking_sync,
-                            timestamp=cand.timestamp + 1
+                            timestamp=cand.timestamp + 1,
+                            move_costs=cand.move_costs[:] + [sync_move_cost]
                         )
                     )
 
@@ -417,7 +423,8 @@ def _expand_beam_candidates(
                         path=cand.path,
                         cumulative_cost=cand.cumulative_cost + model_cost,
                         marking=next_marking,
-                        timestamp=cand.timestamp
+                        timestamp=cand.timestamp,
+                        move_costs=cand.move_costs[:]
                     )
                 )
 

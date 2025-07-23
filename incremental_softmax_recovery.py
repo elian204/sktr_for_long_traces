@@ -13,7 +13,7 @@ import numpy as np
 from utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
 from petri_model import discover_petri_net, build_probability_dict
-from calibration import calibrate_softmax
+from calibration import calibrate_probabilities, calibrate_softmax
 from beam_search import process_test_case_incremental
 
 # Configure logger
@@ -311,15 +311,25 @@ def incremental_softmax_recovery(
     if use_calibration:
         # Use complete original matrices for calibration training (not filtered)
         train_softmax_matrices = select_softmax_matrices(softmax_np, train_df)
+        used_temperature = temperature
+        if used_temperature is None:
+            used_temperature = calibrate_probabilities(
+                softmax_list=train_softmax_matrices,
+                df=train_df,
+                temp_bounds=temp_bounds,
+                only_return_temperature=True
+            )
         test_softmax_matrices = calibrate_softmax(
             train_df=train_df,
             test_df=test_df,
             softmax_train=train_softmax_matrices,
             softmax_test=test_softmax_matrices,
             temp_bounds=temp_bounds,
-            temperature=temperature,
+            temperature=used_temperature,
         )
-    calibration_info = " with calibration" if use_calibration else ""
+        calibration_info = f" with calibration (temperature={used_temperature:.2f})"
+    else:
+        calibration_info = ""
     logger.info(f"Prepared {len(test_softmax_matrices)} test softmax matrices{calibration_info}.")
     
     # 10. Extract test case IDs for processing
@@ -336,7 +346,7 @@ def incremental_softmax_recovery(
         logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
         
         # Get predicted sequence using beam search
-        sktr_preds = process_test_case_incremental(
+        sktr_preds, sktr_move_costs = process_test_case_incremental(
             softmax_matrix=softmax_matrix,
             model=model,
             cost_fn=cost_fn,
@@ -366,7 +376,8 @@ def incremental_softmax_recovery(
             argmax_preds=argmax_preds,
             ground_truth_sequence=ground_truth_sequence,
             softmax_matrix=softmax_matrix,
-            activity_prob_threshold=activity_prob_threshold
+            activity_prob_threshold=activity_prob_threshold,
+            sktr_move_costs=sktr_move_costs
         )
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
@@ -390,7 +401,8 @@ def _compute_accuracy_records(
     argmax_preds: List[str],
     ground_truth_sequence: List[str],
     softmax_matrix: np.ndarray,
-    activity_prob_threshold: float = 0.0
+    activity_prob_threshold: float = 0.0,
+    sktr_move_costs: List[float] = None
 ) -> Tuple[pd.DataFrame, float, float]:
     """
     Compute accuracy records and trace-level accuracies by comparing SKTR, argmax, and ground truth sequences.
@@ -456,13 +468,14 @@ def _compute_accuracy_records(
     data = {
         'case:concept:name': [case_id] * seq_len,
         'step': list(range(seq_len)),
-        'predicted_activity': sktr_preds,
+        'sktr_activity': sktr_preds,
         'argmax_activity': argmax_preds,
         'ground_truth': ground_truth_sequence,
         'all_probs': all_probs_filtered,
         'all_activities': all_activities_filtered,
         'is_correct': sktr_matches,
-        'cumulative_accuracy': np.cumsum(sktr_matches) / np.arange(1, seq_len + 1)
+        'cumulative_accuracy': np.cumsum(sktr_matches) / np.arange(1, seq_len + 1),
+        'sktr_move_cost': [round(cost, 2) for cost in sktr_move_costs]
     }
     
     return pd.DataFrame(data), sktr_acc, argmax_acc
