@@ -23,7 +23,7 @@ MoveType = str
 logger = logging.getLogger(__name__)
         
 def validate_input_parameters(
-    n_indices: int,
+    n_indices: Optional[int],
     round_precision: int,
     non_sync_penalty: float,
     alpha: float,
@@ -34,8 +34,8 @@ def validate_input_parameters(
     
     Parameters
     ----------
-    n_indices : int
-        Number of indices/positions per trace. Must be positive.
+    n_indices : Optional[int]
+        Number of indices/positions per trace. Must be positive if provided.
     round_precision : int
         Digits to round probabilities to. Must be non-negative.
     non_sync_penalty : float
@@ -45,6 +45,7 @@ def validate_input_parameters(
     temp_bounds : Tuple[float, float]
         Temperature bounds for calibration. Must be a valid range with min < max.
         The values must be positive.
+    
     Raises
     ------
     ValueError
@@ -52,11 +53,11 @@ def validate_input_parameters(
     TypeError
         If parameters have incorrect types.
     """
-    # Validate n_indices
-    if not isinstance(n_indices, int):
-        raise TypeError(f"n_indices must be an integer, got {type(n_indices)}")
-    if n_indices <= 0:
-        raise ValueError(f"n_indices must be positive, got {n_indices}")
+    if n_indices is not None:
+        if not isinstance(n_indices, int):
+            raise TypeError(f"n_indices must be an integer, got {type(n_indices)}")
+        if n_indices <= 0:
+            raise ValueError(f"n_indices must be positive, got {n_indices}")
     
     # Validate round_precision
     if not isinstance(round_precision, int):
@@ -236,21 +237,27 @@ def simple_bigram_blend(
     base_probability: float,
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
     alpha: float,
+    future_avg: Optional[float] = None,
+    beta: float = 0.0
 ) -> float:
     """
-    Simple function to blend base probability with bigram conditional probability for testing.
-    
-    Uses bigram P(activity|previous) if previous exists, unigram P(activity) otherwise.
-    
-    Parameters same as compute_conditional_probability, but ignores lambdas and use_ngram_smoothing.
+    Blend base probability, bigram conditional probability, and future average using weights alpha, beta, and 1-alpha-beta.
+    Enforces that all weights are nonnegative and sum to 1.
     """
     if not path_prefix:
         conditional_prob = prob_dict.get((), {}).get(activity_name, 0.0)
     else:
         previous = path_prefix[-1]
         conditional_prob = prob_dict.get((previous,), {}).get(activity_name, 0.0)
-    
-    return (1 - alpha) * conditional_prob + alpha * base_probability
+
+    if future_avg is not None and beta > 0:
+        w_base = 1.0 - alpha - beta
+        assert w_base >= 0.0, f"Invalid weights: alpha={alpha}, beta={beta}, base={w_base}"
+        return alpha * conditional_prob + beta * future_avg + w_base * base_probability
+    else:
+        w_base = 1.0 - alpha
+        assert w_base >= 0.0, f"Invalid weights: alpha={alpha}, base={w_base}"
+        return alpha * conditional_prob + w_base * base_probability
 
 
 def compute_ngram_probability(

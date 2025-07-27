@@ -140,7 +140,9 @@ def process_test_case_incremental(
     use_ngram_smoothing: bool,
     activity_prob_threshold: float,
     beam_score_alpha: float = 0.5,
-    completion_patience: int = 5
+    completion_patience: int = 5,
+    lookahead_window: int = 5,
+    beta: float = 0.0
 ) -> Tuple[List[str], List[float]]:
     """
     Process a single test case using incremental beam search.
@@ -228,6 +230,8 @@ def process_test_case_incremental(
             alpha=alpha,
             use_ngram_smoothing=use_ngram_smoothing,
             activity_prob_threshold=activity_prob_threshold,
+            lookahead_window=lookahead_window,
+            beta=beta
         )
         
         # --- Deduplication Step ---
@@ -352,6 +356,8 @@ def _expand_beam_candidates(
     alpha: float,
     use_ngram_smoothing: bool,
     activity_prob_threshold: float,
+    lookahead_window: int,
+    beta: float
 ) -> List[BeamCandidate]:
     """
     Expand each beam candidate by all valid next transitions:
@@ -379,13 +385,24 @@ def _expand_beam_candidates(
 
                 act = str(idx)
                 predicted_acts.add(act)
+                available_future = softmax_matrix.shape[1] - cand.timestamp - 1
+                future_avg = 0.0
+                if available_future > 0 and lookahead_window > 0 and beta > 0:
+                    end_idx = cand.timestamp + 1 + min(lookahead_window, available_future)
+                    future_avg = np.mean(softmax_matrix[idx, cand.timestamp + 1 : end_idx])
+
                 p = (
                     simple_bigram_blend(
                         cand.path, act, raw_p,
-                        prob_dict, alpha
+                        prob_dict, alpha,
+                        future_avg=future_avg,
+                        beta=beta
                     )
                     if use_cond_probs and prob_dict else raw_p
                 )
+
+                if not (use_cond_probs and prob_dict) and beta > 0 and future_avg > 0:
+                    p = (1 - beta) * p + beta * future_avg
 
                 # ALWAYS consider a log move for any activity with sufficient probability
                 log_move_cost = cost_fn(p, "log")
@@ -401,7 +418,15 @@ def _expand_beam_candidates(
 
                 # IF the activity is also a valid synchronous move, consider that path too
                 if act in sync_trans:
-                    sync_move_cost = cost_fn(p, "sync")
+                    if prob_dict and len(cand.path) > 0:
+                        prev_act = cand.path[-1]
+                        bigram = (prev_act,)
+                        if bigram in prob_dict and act in prob_dict[bigram]:
+                            sync_move_cost = cost_fn(p, "sync")
+                        else:
+                            sync_move_cost = cost_fn(0.0, "model")
+                    else:
+                        sync_move_cost = cost_fn(p, "sync")
                     next_marking_sync = model._fire_macro_transition(cand.marking, sync_trans[act])
                     new_candidates.append(
                         BeamCandidate(

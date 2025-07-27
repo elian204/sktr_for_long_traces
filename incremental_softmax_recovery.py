@@ -59,6 +59,8 @@ def incremental_softmax_recovery(
     alpha: float = 0.5,
     beam_score_alpha: float = 0.5,
     completion_patience: int = 5,
+    lookahead_window: int = 5,
+    beta: float = 0.0,
     use_ngram_smoothing: bool = True,
     use_calibration: bool = False,
     temp_bounds: Tuple[float, float] = (1.0, 10.0),
@@ -74,6 +76,7 @@ def incremental_softmax_recovery(
     non_sync_penalty: float = 1.0,
     verbose: bool = True,
     log_level: int = logging.INFO,
+    use_full_traces: bool = False,
 ) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]]]:
     """
     Incrementally recover activity sequences using beam search over softmax matrices.
@@ -120,6 +123,10 @@ def incremental_softmax_recovery(
         Beam scoring alpha for blending normalized and total costs.
     completion_patience : int, default=5
         Number of extra iterations to continue beam search after first completion.
+    lookahead_window : int, default=5
+        Number of steps to look ahead for beam search.
+    beta : float, default=0.0
+        Beta parameter for beam search scoring.
     use_ngram_smoothing : bool, default=True
         Whether to apply n-gram smoothing for conditional probabilities.
     use_calibration : bool, default=False
@@ -153,6 +160,10 @@ def incremental_softmax_recovery(
     log_level : int, default=logging.INFO
         Logging level (logging.DEBUG for more detailed output).
     
+    use_full_traces : bool, default=False
+        If True, skip event sampling and use complete traces and softmax matrices.
+        Requires n_indices and n_per_run to be None.
+        
     Returns
     -------
     results_df : pd.DataFrame
@@ -204,23 +215,27 @@ def incremental_softmax_recovery(
     validate_sequential_case_ids(df, softmax_lst)
     logger.info(f"Validated sequential case IDs (found {len(df['case:concept:name'].unique())} unique cases) and {len(softmax_lst)} softmax matrices.")
 
-    # 1. Validate sampling parameters
-    if sequential_sampling and n_per_run is None:
-        raise ValueError("n_per_run must be specified when sequential_sampling=True")
-    if not sequential_sampling and n_indices is None:
-        raise ValueError("n_indices must be specified when sequential_sampling=False")
-    if n_indices is not None and n_per_run is not None:
-        raise ValueError("n_indices and n_per_run are mutually exclusive")
-    if n_indices is None and n_per_run is None:
-        raise ValueError("Either n_indices or n_per_run must be specified")
-    sampling_method = "sequential runs" if sequential_sampling else "uniform sampling"
-    sampling_param_name = "n_per_run" if sequential_sampling else "n_indices"
-    sampling_param_value = n_per_run if sequential_sampling else n_indices
-    logger.info(f"Validated sampling parameters: {sampling_method} with {sampling_param_name}={sampling_param_value}.")
+    # Validate sampling configuration
+    if use_full_traces:
+        if n_indices is not None or n_per_run is not None:
+            raise ValueError("Cannot specify sampling parameters when use_full_traces=True")
+        sampling_param = None
+        logger.info("use_full_traces enabled: skipping sampling and using complete matrices.")
+    else:
+        if sequential_sampling and n_per_run is None:
+            raise ValueError("n_per_run must be specified when sequential_sampling=True")
+        if not sequential_sampling and n_indices is None:
+            raise ValueError("n_indices must be specified when sequential_sampling=False")
+        if n_indices is not None and n_per_run is not None:
+            raise ValueError("n_indices and n_per_run are mutually exclusive")
+        sampling_method = "sequential runs" if sequential_sampling else "uniform sampling"
+        sampling_param_name = "n_per_run" if sequential_sampling else "n_indices"
+        sampling_param_value = n_per_run if sequential_sampling else n_indices
+        logger.info(f"Validated sampling parameters: {sampling_method} with {sampling_param_name}={sampling_param_value}.")
+        sampling_param = n_per_run if sequential_sampling else n_indices
+        assert sampling_param is not None, "sampling_param should not be None after validation"
 
-    # 2. Validate other inputs
-    sampling_param = n_per_run if sequential_sampling else n_indices
-    assert sampling_param is not None, "sampling_param should not be None after validation"
+    # Validate other inputs
     validate_input_parameters(
         sampling_param, round_precision, non_sync_penalty, alpha, temp_bounds
     )
@@ -244,19 +259,24 @@ def incremental_softmax_recovery(
     else:
         logger.info(f"Prepared softmax arrays: {len(softmax_lst)} traces.")
 
-    # 5. Filter data and matrices
-    filtered_log, filtered_softmax = filter_indices(
-        df, 
-        softmax_np, 
-        n_indices=n_indices,
-        n_per_run=n_per_run,
-        sequential_sampling=sequential_sampling,
-        independent_sampling=independent_sampling, 
-        random_seed=random_seed
-    )
+    # 5. Filter data and matrices (optional)
     n_events_before = len(df)
+    if use_full_traces:
+        filtered_log = df.copy()
+        filtered_softmax = softmax_np
+    else:
+        filtered_log, filtered_softmax = filter_indices(
+            df, 
+            softmax_np, 
+            n_indices=n_indices,
+            n_per_run=n_per_run,
+            sequential_sampling=sequential_sampling,
+            independent_sampling=independent_sampling, 
+            random_seed=random_seed
+        )
     n_events_after = len(filtered_log)
-    logger.info(f"Filtered log and softmax matrices: {n_events_before} -> {n_events_after} events ({n_events_after/n_events_before:.1%} retained).")
+    retention = n_events_after / n_events_before if n_events_before > 0 else 0
+    logger.info(f"Processed log and softmax matrices: {n_events_before} -> {n_events_after} events ({retention:.1%} retained).")
 
     # 6. Train/test split
     train_df, test_df = split_train_test(
@@ -359,6 +379,8 @@ def incremental_softmax_recovery(
             activity_prob_threshold=activity_prob_threshold,
             beam_score_alpha=beam_score_alpha,
             completion_patience=completion_patience,
+            lookahead_window=lookahead_window,
+            beta=beta
         )
         
         # Extract ground truth sequence for accuracy computation
