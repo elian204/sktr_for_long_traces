@@ -281,7 +281,9 @@ def _create_configured_petrinet(
 def build_probability_dict(
     train_df: pd.DataFrame,
     max_hist_len: int = 3,
-    precision: int = 2
+    precision: int = 2,
+    use_log_smoothing: bool = True,
+    k: float = 1.0
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build a conditional probability dictionary from training traces.
@@ -294,6 +296,11 @@ def build_probability_dict(
         Maximum history length for n-grams
     precision : int, default=2
         Decimal precision for probabilities
+    use_log_smoothing : bool, default=True
+        Whether to use log-based smoothing (True) or regular add-k smoothing (False)
+    k : float, default=1.0
+        Pseudo-count for smoothing; for log smoothing, should be >=1 to keep logs non-negative;
+        for regular, set to 0 for raw frequencies
         
     Returns
     -------
@@ -303,7 +310,9 @@ def build_probability_dict(
     return _build_conditioned_prob_dict(
         train_df, 
         max_hist_len=max_hist_len, 
-        precision=precision
+        precision=precision,
+        use_log_smoothing=use_log_smoothing,
+        k=k
     )
 
 
@@ -311,12 +320,13 @@ def _build_conditioned_prob_dict(
     df_train: pd.DataFrame,
     max_hist_len: int = 2,
     precision: int = 2,
-    k: float = 1.0       # pseudo-count ≥1 ⇒ all log(count+k) ≥ 0
+    use_log_smoothing: bool = True,
+    k: float = 1.0       # pseudo-count >=1 for log to keep >=0; >=0 for regular
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build conditional probabilities P(activity | history) for all histories of
-    length ≤ max_hist_len, using log(+k) smoothing.
-
+    length <= max_hist_len, using either log(+k) smoothing or add-k smoothing.
+    
     Parameters
     ----------
     df_train : pd.DataFrame
@@ -325,9 +335,11 @@ def _build_conditioned_prob_dict(
         Maximum history length for n-grams.
     precision : int, default=2
         Decimal places for probabilities.
+    use_log_smoothing : bool, default=True
+        If True, use log(c + k) weights; else use (c + k) / sum(c + k)
     k : float, default=1.0
-        Pseudo-count added before log; must be ≥1 to keep logs nonnegative.
-
+        Pseudo-count added; must be >=1 for log to keep logs non-negative.
+    
     Returns
     -------
     Dict[history, Dict[next_activity, probability]]
@@ -348,16 +360,27 @@ def _build_conditioned_prob_dict(
     # 3) Build log(+k) smoothed probabilities
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
     for history, counts in history_counts.items():
-        # 3a) add pseudo-count then log
-        log_weights = {a: math.log(c + k) for a, c in counts.items()}
-        total = sum(log_weights.values())
-        if total <= 0:
+        if not counts:
             continue
-        # 3b) normalize and round
-        probs = {
-            a: round(w / total, precision)
-            for a, w in log_weights.items()
-        }
+            
+        if use_log_smoothing:
+            weights = {a: math.log(c + k) for a, c in counts.items()}
+            total = sum(weights.values())
+            if total <= 0:
+                continue
+            probs = {
+                a: round(w / total, precision)
+                for a, w in weights.items()
+            }
+        else:
+            weights = {a: c + k for a, c in counts.items()}
+            total = sum(weights.values())
+            if total <= 0:
+                continue
+            probs = {
+                a: round(w / total, precision)
+                for a, w in weights.items()
+            }
         prob_dict[history] = probs
 
     return prob_dict

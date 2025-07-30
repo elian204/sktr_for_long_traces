@@ -55,14 +55,15 @@ def incremental_softmax_recovery(
     activity_prob_threshold: float = 0.0,
     use_cond_probs: bool = False,
     max_hist_len: int = 3,
+    use_log_smoothing: bool = True,
+    k: float = 1.0,
     lambdas: Optional[List[float]] = None,
     alpha: float = 0.5,
-    beam_score_alpha: float = 0.5,
-    completion_patience: int = 5,
-    lookahead_window: int = 5,
-    beta: float = 0.0,
-    use_ngram_smoothing: bool = True,
-    use_calibration: bool = False,
+    short_term_window: int = 2,
+    long_term_window: int = 5,
+    beta: float = 0.3,  # Weight for current probability in blending
+    zero_penalty: float = 0.5,  # Penalty factor for zero conditional probability
+    use_calibration : bool = False,
     temp_bounds: Tuple[float, float] = (1.0, 10.0),
     temperature: Optional[float] = None,
     n_indices: Optional[int] = None,
@@ -125,8 +126,12 @@ def incremental_softmax_recovery(
         Number of extra iterations to continue beam search after first completion.
     lookahead_window : int, default=5
         Number of steps to look ahead for beam search.
-    beta : float, default=0.0
-        Beta parameter for beam search scoring.
+    short_term_window : int, default=2
+        Number of steps to look back for short-term context.
+    long_term_window : int, default=5
+        Number of steps to look back for long-term context.
+    beta : float, default=0.3
+        Weight for current probability in blending.
     use_ngram_smoothing : bool, default=True
         Whether to apply n-gram smoothing for conditional probabilities.
     use_calibration : bool, default=False
@@ -308,15 +313,21 @@ def incremental_softmax_recovery(
     logger.info(f"Discovered Petri net model: {n_places} places, {n_transitions} transitions.")
     
     # Compute marking-to-transition map (reachable markings and their tau-reachable transitions)
-    logger.info("Computing marking-to-transition map (tau-reachability) for discovered Petri net...")
-    marking_transition_map = model.build_marking_transition_map()
-    logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
+    # logger.info("Computing marking-to-transition map (tau-reachability) for discovered Petri net...")
+    # marking_transition_map = model.build_marking_transition_map()
+    # logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
 
 
     # 8. Conditional probabilities (optional)
     prob_dict = {}
     if use_cond_probs:
-        prob_dict = build_probability_dict(train_df, max_hist_len)
+        prob_dict = build_probability_dict(
+            train_df, 
+            max_hist_len=max_hist_len,
+            precision=round_precision,
+            use_log_smoothing=use_log_smoothing,
+            k=k
+        )
         if use_cond_probs:
             n_histories = len(prob_dict)
             avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
@@ -365,22 +376,16 @@ def incremental_softmax_recovery(
     ):
         logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
         
-        # Get predicted sequence using beam search
+        # Get predicted sequence using greedy lookahead (updated function signature)
         sktr_preds, sktr_move_costs = process_test_case_incremental(
             softmax_matrix=softmax_matrix,
-            model=model,
             cost_fn=cost_fn,
-            beam_width=beam_width,
-            lambdas=lambdas,
+            short_term_window=short_term_window,
+            long_term_window=long_term_window,
             alpha=alpha,
-            use_cond_probs=use_cond_probs,
+            beta=beta,
             prob_dict=prob_dict,
-            use_ngram_smoothing=use_ngram_smoothing,
-            activity_prob_threshold=activity_prob_threshold,
-            beam_score_alpha=beam_score_alpha,
-            completion_patience=completion_patience,
-            lookahead_window=lookahead_window,
-            beta=beta
+            zero_penalty=zero_penalty
         )
         
         # Extract ground truth sequence for accuracy computation

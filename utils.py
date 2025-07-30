@@ -15,7 +15,6 @@ from pathlib import Path
 import io
 from graphviz import Digraph
 import os
-from contextlib import redirect_stderr
 import logging
 
 MoveType = str
