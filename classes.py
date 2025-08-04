@@ -14,7 +14,7 @@ Main Classes:
     PetriNet: Main Petri net class with reachability analysis
     SyncProduct: Specialized class for conformance checking alignments
     Graph, Node, Edge: Graph representation structures
-    search_node_new: Search state for alignment algorithms
+    SearchNode: Search state for alignment algorithms
 
 The module supports both classical and probabilistic conformance checking
 approaches, including conditional probability-based cost functions and
@@ -24,6 +24,7 @@ n-gram smoothing for improved alignment quality.
 import numpy as np
 import copy
 from collections import deque, Counter
+from heapq import heappush, heappop
 from typing import Dict, List, Set, Tuple, Any, Union
 import logging
 
@@ -148,7 +149,7 @@ class Graph:
         self.edges.append(edge)
 
 
-class search_node_new:
+class SearchNode:
     def __init__(self, marking, dist=np.inf, ancestor=None, transition_to_ancestor=None, path_prefix=None,
                  trace_activities_multiset=None, heuristic_distance=None, total_model_moves=0):
         self.dist = dist
@@ -485,6 +486,7 @@ class PetriNet:
                 available_transitions.append(transition)
         return available_transitions
 
+
     def _find_available_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
         """
         Given a marking (as a tuple of token counts), return a list of transitions
@@ -554,7 +556,7 @@ class PetriNet:
         
     def conformance_checking(self, trace_model, hist_prob_dict=None, lamda=0.5):
         sync_prod = self.construct_synchronous_product(trace_model, self.cost_function)      
-        return sync_prod._dijkstra_no_rg_construct(hist_prob_dict, lamda=lamda)
+        return sync_prod.dijkstra_no_rg_construct(hist_prob_dict, lamda=lamda)
     
 
     def _fire_transition(
@@ -930,3 +932,243 @@ class PetriNet:
         if self.final_mark is None:
             raise ValueError("Final marking not set")
         return self.get_tau_reachable_transitions(self.final_mark, max_tau_depth)
+    
+    def dijkstra_no_rg_construct(self, prob_dict=None, lamda=0.5, partial_conformance=False,
+                                  return_net_final_marking=False, n_unique_final_markings=1,
+                                      overlap_size=0, trace_activities_multiset=None,
+                                      use_heuristic_distance=False, trace_recovery=False,
+                                      max_hist_len=None):
+            distance_min_heap = []
+            marking_distance_dict = {}
+            visited_markings = set()
+            final_nodes = []
+            final_markings_unique = set()
+            nodes_opened = 0
+        
+            init_node = self._initialize_dijkstra_node(trace_activities_multiset, use_heuristic_distance)
+            heappush(distance_min_heap, init_node)
+        
+            while distance_min_heap:
+                current_node = heappop(distance_min_heap)
+                
+                if current_node.marking.places in visited_markings:
+                    continue
+        
+                if self._is_dijkstra_final_node(current_node, partial_conformance, n_unique_final_markings, final_markings_unique):
+                    final_nodes.append(current_node)
+                    if len(final_nodes) == n_unique_final_markings:
+                        break
+                    continue
+        
+                nodes_opened += 1
+                available_transitions = self._find_available_transitions(current_node.marking.places)
+        
+                for transition in available_transitions:
+                    new_node = self._create_dijkstra_successor_node(current_node, transition, prob_dict, lamda, max_hist_len,
+                                                                    use_heuristic_distance)
+        
+                    if self._should_add_dijkstra_node(new_node, marking_distance_dict):
+                        marking_distance_dict[new_node.marking.places] = new_node.dist
+                        heappush(distance_min_heap, new_node)
+        
+                visited_markings.add(current_node.marking.places)
+
+            
+            return (self._process_dijkstra_final_node(final_nodes,
+                                                      partial_conformance,
+                                                      overlap_size,
+                                                      trace_recovery,
+                                                      return_net_final_marking),
+                                                      nodes_opened)
+
+
+    def _initialize_dijkstra_node(self, trace_activities_multiset, use_heuristic_distance):
+            """
+            Initialize a new node for Dijkstra's algorithm.
+            
+            Args:
+                trace_activities_multiset: Multiset of trace activities
+                use_heuristic_distance: Boolean flag to determine if heuristic should be used
+                
+            Returns:
+                A new search node initialized with the initial marking and calculated heuristic
+            """
+            # Calculate initial heuristic if enabled, otherwise use 0
+            init_heuristic = (self.estimate_alignment_heuristic(self.init_mark, trace_activities_multiset) 
+                            if use_heuristic_distance else 0)
+            
+            # Ensure trace_activities_multiset is a set if None
+            trace_activities_multiset = trace_activities_multiset or set()
+            
+            # Create and return new search node
+            return SearchNode(
+                marking=self.init_mark,
+                dist=0,
+                trace_activities_multiset=trace_activities_multiset.copy(),
+                heuristic_distance=init_heuristic,
+                total_model_moves=0
+            )
+
+    def _is_dijkstra_final_node(self, node, partial_conformance):
+        """
+        Determines whether the given node is a final node according to the Dijkstra criteria.
+        
+        In partial conformance mode, it checks whether the tail portion of the node's marking
+        (with length equal to the trace model's places) matches the trace model's final marking.
+        If so, it extracts the model's marking from the node and records it.
+        
+        In full conformance mode, it checks whether the entire marking of the node matches the final marking.
+        
+        Args:
+            node: The node to evaluate, which has a 'marking' attribute.
+            partial_conformance (bool): Flag indicating whether partial conformance is used.
+        
+        Returns:
+            bool: True if the node qualifies as a final node; otherwise, False.
+        """
+        if partial_conformance:
+            # Define the length of the trace model's marking segment.
+            trace_places_count = len(self.trace_model.places)
+            # Extract the tail portion from the node's marking.
+            node_tail_marking = node.marking.places[-trace_places_count:]
+            # Compare with the trace model's final marking.
+            if node_tail_marking == self.trace_model.final_mark.places:
+                # Extract the model portion from the node's marking.
+                model_marking = node.marking.places[:len(self.net.places)]
+                return True
+        else:
+            # For full conformance, compare the entire marking.
+            if node.marking.places == self.final_mark.places:
+                return True
+        return False
+    
+
+    def _create_dijkstra_successor_node(
+        self,
+        current_node: SearchNode,
+        transition: Transition,
+        prob_dict: Dict[Any, float],
+        lamda: float,
+        max_hist_len: int,
+        use_heuristic_distance: bool,
+        nodes_opened: int
+    ) -> SearchNode:
+        """
+        Fire a transition in the synchronous product and build the corresponding
+        Dijkstra search node.
+
+        - Updates the marking by firing the transition.
+        - Computes the conditioned transition weight.
+        - Extends the path prefix if the transition has a label.
+        - Computes heuristic distance and remaining activities.
+        - Increments model/trace move counts based on the transition type.
+        """
+        # 1. Fire the transition and compute its cost
+        new_marking = self._fire_transition(current_node.marking, transition)
+        conditioned_weight = self.compute_conditioned_weight(
+            current_node.path_prefix,
+            transition,
+            prob_dict,
+            max_length=max_hist_len,
+            lamda=lamda,
+        )
+
+        # 2. Build the new path prefix (only add label when present)
+        new_prefix = (
+            current_node.path_prefix + [transition.label]
+            if transition.label is not None
+            else current_node.path_prefix
+        )
+
+        # 3. Heuristic estimate and leftover trace activities
+        heuristic_dist, leftover_multiset = self._compute_dijkstra_heuristic(
+            current_node,
+            transition,
+            new_marking,
+            use_heuristic_distance,
+        )
+
+        # 4. Update move counters
+        is_model_move = transition.move_type in {"model", "sync"}
+        is_trace_move = transition.move_type in {"trace", "sync"}
+        new_model_moves = current_node.total_model_moves + int(is_model_move)
+        new_trace_moves = current_node.total_trace_moves + int(is_trace_move)
+
+        # 5. Construct and return the new search node
+        return SearchNode(
+            new_marking,
+            dist=current_node.dist + conditioned_weight,
+            ancestor=current_node,
+            transition_to_ancestor=transition,
+            heuristic_distance=heuristic_dist,
+            path_prefix=new_prefix,
+            trace_activities_multiset=leftover_multiset,
+            total_model_moves=new_model_moves,
+            total_trace_moves=new_trace_moves,
+            nodes_opened=nodes_opened,
+        )
+    
+    
+    def _should_add_dijkstra_node(
+        self,
+        new_node: SearchNode,
+        marking_distance: Dict[Any, float]
+    ) -> bool:
+        """
+        Decide whether a newly generated Dijkstra node should be added to the
+        open set. Returns True if:
+        - We haven't seen this marking before, or
+        - We've found a strictly shorter path to this marking.
+        """
+        places = new_node.marking.places
+        previous_dist = marking_distance.get(places)
+        return previous_dist is None or new_node.dist < previous_dist
+
+    
+    def _process_dijkstra_final_node(self, final_node):
+        """
+        Processes the final node obtained from the Dijkstra search to build the alignment path,
+        calculate the total cost, and extract the final marking and node path.
+    
+        The function performs the following steps:
+          1. Validates that the final node is not None.
+          2. Builds the alignment path and computes the total distance using `_build_dijkstra_path`.
+          3. Extracts the net's final marking (only considering places corresponding to the net).
+          4. Constructs the complete node path from the initial node to the final node.
+          5. Retrieves the count of nodes opened during the search.
+    
+        Args:
+            final_node: The final node from the Dijkstra search. Must not be None.
+    
+        Returns:
+            A tuple containing:
+              - alignment: A list of Transition objects representing the alignment path.
+              - total_distance: A float representing the total cost/distance of the path.
+              - net_final_marking: A Marking object for the net's final marking (using only the net's places).
+              - node_path: A list of node objects representing the complete path from the initial node to the final node.
+              - nodes_opened: An integer count of nodes opened during the search.
+    
+        Raises:
+            ValueError: If the provided final_node is None.
+        """
+        if final_node is None:
+            raise ValueError("Final search node during Dijkstra search is None.")
+    
+        # Build the alignment path and compute the total distance.
+        alignment, total_distance = self._build_dijkstra_path(final_node)
+    
+        # Extract the net's final marking (only include places corresponding to the net).
+        net_final_marking = Marking(final_node.marking.places[:len(self.net.places)])
+    
+        # Reconstruct the complete node path from initial to final.
+        node_path = []
+        current = final_node
+        while current:
+            node_path.append(current)
+            current = current.ancestor
+        node_path.reverse()  # Now the path is from the initial node to the final node.
+    
+        nodes_opened = final_node.nodes_opened
+    
+        return alignment, total_distance, net_final_marking, nodes_opened
+
