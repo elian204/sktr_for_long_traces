@@ -7,7 +7,7 @@ The beam search maintains multiple candidate paths and selects the most
 promising ones at each step based on probability scores and model constraints.
 
 Main Functions:
-    process_test_case_incremental: Main entry point for processing a single test case
+    process_test_case_beam_search: Main entry point for processing a single test case using beam search
     
 Helper Classes and Functions:
     BeamCandidate: Represents a candidate path in the beam
@@ -128,7 +128,7 @@ class BeamState:
         return min(self.candidates, key=lambda c: c.cumulative_cost)
 
 
-def process_test_case_incremental(
+def process_test_case_beam_search(
     softmax_matrix: np.ndarray,
     model: PetriNet,
     cost_fn: Callable[[float, str], float],

@@ -1,9 +1,9 @@
 """
-Incremental Softmax Recovery: Main high-level function.
+Softmax Trace Recovery: Main high-level function.
 
-This module provides the main entry point for incremental softmax matrix recovery
-using beam search with Petri nets, following the pattern of the existing 
-compare_stochastic_vs_argmax_random_indices function.
+This module provides the main entry point for recovering activity sequences from 
+softmax probability matrices using Petri net models. Supports both beam search 
+and conformance checking approaches for flexible trace recovery.
 """
 
 from typing import Any, Callable, List, Optional, Tuple, Union, Dict
@@ -14,7 +14,8 @@ from utils import validate_input_parameters, make_cost_function, visualize_petri
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_probabilities, calibrate_softmax
-from beam_search import process_test_case_incremental
+from beam_search import process_test_case_beam_search
+from conformance_checking import process_trace_chunked
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def incremental_softmax_recovery(
     log_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     tau_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1e-6,
     beam_width: int = 10,
-    activity_prob_threshold: float = 0.0,
+    prob_threshold: float = 1e-12,
     use_cond_probs: bool = False,
     max_hist_len: int = 3,
     lambdas: Optional[List[float]] = None,
@@ -72,15 +73,18 @@ def incremental_softmax_recovery(
     save_model_path: str = "./discovered_petri_net",
     save_model: bool = True,
     non_sync_penalty: float = 1.0,
+    recovery_method: str = "conformance",
+    chunk_size: int = 10,
+
     verbose: bool = True,
     log_level: int = logging.INFO,
 ) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]]]:
     """
-    Incrementally recover activity sequences using beam search over softmax matrices.
+    Recover activity sequences from softmax matrices using Petri net models.
 
     Discovers a Petri net model from training traces, then processes test softmax
-    matrices one step at a time. The beam search maintains top candidates and
-    outputs a running accuracy measure.
+    matrices using either beam search or chunked conformance checking. The method
+    can be selected via the recovery_method parameter.
 
     Parameters
     ----------
@@ -105,23 +109,26 @@ def incremental_softmax_recovery(
     cost_function : str or callable, default='linear'
         'linear', 'logarithmic', or a callable mapping float→float.
     beam_width : int, default=10
-        Beam search width (number of candidates retained).
-    activity_prob_threshold : float, default=0.0
-        Minimum softmax probability to consider an activity.
+        **[BEAM SEARCH ONLY]** Beam search width (number of candidates retained).
+    prob_threshold : float, default=1e-12
+        Minimum probability threshold for activity filtering. Activities with probabilities
+        below this threshold are ignored by both methods. Used for:
+        - **[BEAM SEARCH]**: Minimum softmax probability to consider an activity
+        - **[CONFORMANCE]**: Minimum probability threshold to filter activities
     use_cond_probs : bool, default=False
-        Whether to use conditional probabilities based on trace history.
+        **[BEAM SEARCH ONLY]** Whether to use conditional probabilities based on trace history.
     max_hist_len : int, default=3
-        Maximum history length for conditional probabilities.
+        **[BEAM SEARCH ONLY]** Maximum history length for conditional probabilities.
     lambdas : Optional[List[float]], default=None
-        Blending weights for conditional probability computation.
+        **[BEAM SEARCH ONLY]** Blending weights for conditional probability computation.
     alpha : float, default=0.5
-        Blending parameter for conditional probabilities (0=history only, 1=base only).
+        **[BEAM SEARCH ONLY]** Blending parameter for conditional probabilities (0=history only, 1=base only).
     beam_score_alpha : float, default=0.5
-        Beam scoring alpha for blending normalized and total costs.
+        **[BEAM SEARCH ONLY]** Beam scoring alpha for blending normalized and total costs.
     completion_patience : int, default=5
-        Number of extra iterations to continue beam search after first completion.
+        **[BEAM SEARCH ONLY]** Number of extra iterations to continue beam search after first completion.
     use_ngram_smoothing : bool, default=True
-        Whether to apply n-gram smoothing for conditional probabilities.
+        **[BEAM SEARCH ONLY]** Whether to apply n-gram smoothing for conditional probabilities.
     use_calibration : bool, default=False
         Whether to apply temperature scaling for probability calibration.
     temp_bounds : Tuple[float, float], default=(1.0, 10.0)
@@ -148,6 +155,13 @@ def incremental_softmax_recovery(
         Path (without .pdf extension) to save the Petri net visualization.
     save_model : bool, default=True
         If True, save the Petri net visualization to the specified path.
+    recovery_method : str, default="conformance"
+        Method for trace recovery. Options:
+        - "conformance": Use chunked conformance checking (deterministic, accurate)
+        - "beam_search": Use beam search algorithm (heuristic, faster for some cases)
+    chunk_size : int, default=10
+        **[CONFORMANCE ONLY]** Size of chunks for processing softmax matrices iteratively.
+        Larger chunks may be more accurate but use more memory and computation.
     verbose : bool, default=True
         If True, set up logging to display progress information.
     log_level : int, default=logging.INFO
@@ -218,15 +232,21 @@ def incremental_softmax_recovery(
     sampling_param_value = n_per_run if sequential_sampling else n_indices
     logger.info(f"Validated sampling parameters: {sampling_method} with {sampling_param_name}={sampling_param_value}.")
 
-    # 2. Validate other inputs
+    # 2. Validate recovery method
+    valid_methods = ["conformance", "beam_search"]
+    if recovery_method not in valid_methods:
+        raise ValueError(f"recovery_method must be one of {valid_methods}, got '{recovery_method}'")
+    logger.info(f"Using recovery method: {recovery_method}")
+
+    # 3. Validate other inputs
     sampling_param = n_per_run if sequential_sampling else n_indices
     assert sampling_param is not None, "sampling_param should not be None after validation"
     validate_input_parameters(
         sampling_param, round_precision, non_sync_penalty, alpha, temp_bounds
     )
-    logger.info(f"Validated input parameters: beam_width={beam_width}, alpha={alpha}, round_precision={round_precision}.")
+    logger.info(f"Validated input parameters: beam_width={beam_width}, alpha={alpha}, round_precision={round_precision}, prob_threshold={prob_threshold}.")
 
-    # 3. Cost function
+    # 4. Cost function
     cost_fn = make_cost_function(
         base=cost_function,
         model_move=model_move_cost,
@@ -345,21 +365,32 @@ def incremental_softmax_recovery(
     ):
         logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
         
-        # Get predicted sequence using beam search
-        sktr_preds, sktr_move_costs = process_test_case_incremental(
-            softmax_matrix=softmax_matrix,
-            model=model,
-            cost_fn=cost_fn,
-            beam_width=beam_width,
-            lambdas=lambdas,
-            alpha=alpha,
-            use_cond_probs=use_cond_probs,
-            prob_dict=prob_dict,
-            use_ngram_smoothing=use_ngram_smoothing,
-            activity_prob_threshold=activity_prob_threshold,
-            beam_score_alpha=beam_score_alpha,
-            completion_patience=completion_patience,
-        )
+        # Get predicted sequence using selected recovery method
+        if recovery_method == "conformance":
+            sktr_preds, sktr_move_costs = process_trace_chunked(
+                softmax_matrix=softmax_matrix,
+                model=model,
+                cost_fn=cost_fn,
+                chunk_size=chunk_size,
+                eps=prob_threshold,
+            )
+        elif recovery_method == "beam_search":
+            sktr_preds, sktr_move_costs = process_test_case_beam_search(
+                softmax_matrix=softmax_matrix,
+                model=model,
+                cost_fn=cost_fn,
+                beam_width=beam_width,
+                lambdas=lambdas,
+                alpha=alpha,
+                use_cond_probs=use_cond_probs,
+                prob_dict=prob_dict,
+                use_ngram_smoothing=use_ngram_smoothing,
+                activity_prob_threshold=prob_threshold,
+                beam_score_alpha=beam_score_alpha,
+                completion_patience=completion_patience,
+            )
+        else:
+            raise ValueError(f"Unsupported recovery method: {recovery_method}")
         
         # Extract ground truth sequence for accuracy computation
         ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
@@ -376,13 +407,13 @@ def incremental_softmax_recovery(
             argmax_preds=argmax_preds,
             ground_truth_sequence=ground_truth_sequence,
             softmax_matrix=softmax_matrix,
-            activity_prob_threshold=activity_prob_threshold,
+            activity_prob_threshold=prob_threshold,
             sktr_move_costs=sktr_move_costs
         )
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
         argmax_accs.append(argmax_acc)
-        logger.info(f"Case {idx}/{len(test_case_ids)} ({case}): SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+        logger.info(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
 
     # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
@@ -391,7 +422,7 @@ def incremental_softmax_recovery(
         'argmax_accuracy': argmax_accs
     }
     logger.info("Built results DataFrame and accuracy dictionary.")
-    logger.info("Incremental recovery completed.")
+    logger.info(f"Softmax trace recovery completed using {recovery_method} method.")
     return results_df, accuracy_dict, prob_dict
 
 

@@ -1,0 +1,43 @@
+"""
+Conformance checking functions for trace recovery.
+
+This module provides conformance-based alternatives to beam search
+for recovering activity sequences from softmax probability matrices.
+"""
+
+from typing import Callable, List, Tuple, Dict, Any
+import numpy as np
+from classes import PetriNet
+
+
+def process_trace_chunked(
+    softmax_matrix: np.ndarray,
+    model: PetriNet,
+    cost_fn: Callable[[float, str], float],
+    chunk_size: int = 10,
+    eps: float = 1e-12,
+) -> Tuple[List[str], List[float]]:
+    """
+    Drop-in replacement for process_test_case_beam_search using chunked conformance checking.
+    
+    This function provides the same interface as process_test_case_beam_search from beam_search.py
+    but uses the more deterministic chunked trace conformance approach instead of beam search.
+    
+    Args:
+        softmax_matrix: Softmax probability matrix (n_activities, n_timestamps)
+        model: PetriNet model to use for conformance checking
+        cost_fn: Cost function for moves
+        chunk_size: Size of chunks to process iteratively (new parameter)
+        eps: Minimum probability threshold - activities below this are filtered out
+
+        
+    Returns:
+        Tuple[List[str], List[float]]: (predicted_sequence, move_costs)
+        
+    """
+    return model.process_trace_conformance(
+        softmax_matrix=softmax_matrix,
+        cost_fn=cost_fn,
+        chunk_size=chunk_size,
+        eps=eps,
+    )

@@ -1224,6 +1224,12 @@ class PetriNet:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
         
+        Args:
+            softmax_matrix: Probability matrix (n_activities, n_timestamps)
+            initial_marking: Starting marking
+            cost_fn: Cost function for moves
+            eps: Minimum probability threshold - activities below this are filtered out
+        
         Returns a dict with:
         - 'alignment': List[(move_type, move_label, move_cost)]
         - 'total_cost': float
@@ -1281,7 +1287,11 @@ class PetriNet:
             # 2) Log moves (advance timestamp without firing any transition)
             if node.timestamp < n_ts:
                 for label, idx in label2idx.items():
-                    p = max(softmax_matrix[idx, node.timestamp], eps)
+                    raw_p = softmax_matrix[idx, node.timestamp]
+                    # Filter out activities below threshold (same as beam search)
+                    if raw_p < eps:
+                        continue
+                    p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                     c = cost_fn(p, 'log')
                     new_cost = cost + c
                     new_key = (node.marking.places, node.timestamp + 1)
@@ -1304,7 +1314,11 @@ class PetriNet:
                 if t.label is None or t.label not in label2idx:
                     continue
                 idx = label2idx[t.label]
-                p = max(softmax_matrix[idx, node.timestamp], eps)
+                raw_p = softmax_matrix[idx, node.timestamp]
+                # Filter out activities below threshold (same as beam search)
+                if raw_p < eps:
+                    continue
+                p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
                 new_cost = cost + c
                 new_mark = self._fire_transition(node.marking, t)
@@ -1324,6 +1338,116 @@ class PetriNet:
                     ))
 
         raise ValueError("No conforming path found for the partial trace.")
+
+
+    def conformance_chunked(
+        self,
+        softmax_matrix: np.ndarray,
+        initial_marking: 'Marking',
+        cost_fn: Callable[[float, str], float],
+        chunk_size: int = 10,
+        eps: float = 1e-12,
+    ) -> Dict[str, Any]:
+        """
+        Process softmax_matrix in sequential chunks, calling partial_trace_conformance
+        on each, and stitch together a global alignment and cost.
+        
+        Args:
+            softmax_matrix: Probability matrix (n_activities, n_timestamps)
+            initial_marking: Starting marking
+            cost_fn: Cost function for moves
+            chunk_size: Size of chunks to process
+            eps: Minimum probability threshold - activities below this are filtered out
+        """
+        n_acts, n_ts = softmax_matrix.shape
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+
+        current_marking = initial_marking
+        total_cost = 0.0
+        complete_alignment: List[Tuple[str, str]] = []
+        chunk_results: List[Dict[str, Any]] = []
+
+        for chunk_idx, start_ts in enumerate(range(0, n_ts, chunk_size)):
+            end_ts = min(start_ts + chunk_size, n_ts)
+            chunk = softmax_matrix[:, start_ts:end_ts]
+
+            result = self.partial_trace_conformance(
+                softmax_matrix=chunk,
+                initial_marking=current_marking,
+                cost_fn=cost_fn,
+                eps=eps
+            )
+
+            # Accumulate
+            total_cost += result['total_cost']
+            complete_alignment.extend(result['alignment'])
+            current_marking = result['final_marking']
+
+            chunk_results.append({
+                'chunk_index': chunk_idx,
+                'start_timestamp': start_ts,
+                'end_timestamp': end_ts,
+                'chunk_cost': result['total_cost'],
+                'chunk_alignment_length': len(result['alignment']),
+                'final_marking': result['final_marking']
+            })
+
+        return {
+            'alignment': complete_alignment,
+            'total_cost': total_cost,
+            'final_marking': current_marking,
+            'chunk_results': chunk_results,
+            'n_chunks': len(chunk_results),
+            'original_matrix_shape': softmax_matrix.shape
+        }
+
+    def process_trace_conformance(
+        self,
+        softmax_matrix: np.ndarray,
+        cost_fn: Callable[[float, str], float],
+        chunk_size: int = 10,
+        eps: float = 1e-12,
+    ) -> Tuple[List[str], List[float]]:
+        """
+        Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
+        
+        This function maintains the same interface as process_test_case_incremental but uses
+        the more efficient chunked conformance checking approach instead of beam search.
+        
+        Args:
+            softmax_matrix: Softmax probability matrix (n_activities, n_timestamps)
+            cost_fn: Cost function for moves
+            chunk_size: Size of chunks to process iteratively
+            eps: Minimum probability threshold - activities below this are filtered out
+            
+        Returns:
+            Tuple[List[str], List[float]]: (predicted_sequence, move_costs)
+        """
+        if self.init_mark is None:
+            raise ValueError("Model must have a valid initial marking (init_mark)")
+        
+        # Use chunked trace conformance
+        result = self.conformance_chunked(
+            softmax_matrix=softmax_matrix,
+            initial_marking=self.init_mark,
+            cost_fn=cost_fn,
+            chunk_size=chunk_size,
+            eps=eps
+        )
+        
+        # Extract sequence and costs from alignment
+        predicted_sequence = []
+        move_costs = []
+        
+        for move_type, move_label, move_cost in result['alignment']:
+            # Only include moves that advance the trace (sync and log moves)
+            if move_type in ['sync', 'log']:
+                predicted_sequence.append(move_label)
+                move_costs.append(move_cost)
+        
+        return predicted_sequence, move_costs
+
 
 
 
