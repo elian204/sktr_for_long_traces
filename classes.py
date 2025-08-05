@@ -25,10 +25,9 @@ import numpy as np
 import copy
 from collections import deque, Counter
 from heapq import heappush, heappop
-from typing import Dict, List, Set, Tuple, Any, Union
-import logging
-
-logger = logging.getLogger(__name__)
+from typing import Callable, Dict, List, Optional, Set, Tuple, Any, Union
+from collections import defaultdict
+import heapq
 
 
 class Place:
@@ -150,29 +149,37 @@ class Graph:
 
 
 class SearchNode:
-    def __init__(self, marking, dist=np.inf, ancestor=None, transition_to_ancestor=None, path_prefix=None,
-                 trace_activities_multiset=None, heuristic_distance=None, total_model_moves=0):
-        self.dist = dist
+    def __init__(
+        self,
+        marking: 'Marking',
+        cost: float = float('inf'),
+        ancestor: Optional['SearchNode'] = None,
+        move_type: Optional[str] = None,
+        move_label: Optional[str] = None,
+        move_cost: float = 0.0,
+        timestamp: int = 0,
+    ):
+        self.cost = cost
         self.ancestor = ancestor
-        self.transition_to_ancestor = transition_to_ancestor
+        self.move_type = move_type
+        self.move_label = move_label
+        self.move_cost = move_cost
         self.marking = marking
-        self.path_prefix = path_prefix if path_prefix is not None else []
-        self.trace_activities_multiset = trace_activities_multiset
-        # Initialize heuristic_distance with a default of 0 if not provided
-        self.heuristic_distance = heuristic_distance if heuristic_distance is not None else 0
-        self.total_model_moves = total_model_moves
-        
-    def __lt__(self, other):
-        # First compare based on the sum of dist and heuristic_distance
-        if (self.dist + self.heuristic_distance) == (other.dist + other.heuristic_distance):
-            # If they are equal, compare based on total_model_moves (larger first)
-            return self.total_model_moves > other.total_model_moves
-        return (self.dist + self.heuristic_distance) < (other.dist + other.heuristic_distance)
+        self.timestamp = timestamp
 
+    def __lt__(self, other: 'SearchNode'):
+        return self.cost < other.cost
 
-    def __repr__(self):
-        return f'Node: {self.marking}, dist: {self.dist}, heuristic: {self.heuristic_distance}'    
-    
+    def reconstruct_path(self) -> List[Tuple[str, str, float]]:
+        """Reconstruct the alignment as a list of (move_type, move_label, move_cost)."""
+        seq: List[Tuple[str, str, float]] = []
+        node = self
+        while node.ancestor is not None:
+            seq.append((node.move_type, node.move_label, node.move_cost))
+            node = node.ancestor
+        seq.reverse()
+        return seq
+
     
 class PetriNet:
     def __init__(self, name='net', places=None, transitions=None, arcs=None, properties=None, conditioned_prob_compute=False):
@@ -933,53 +940,90 @@ class PetriNet:
             raise ValueError("Final marking not set")
         return self.get_tau_reachable_transitions(self.final_mark, max_tau_depth)
     
-    def dijkstra_no_rg_construct(self, prob_dict=None, lamda=0.5, partial_conformance=False,
-                                  return_net_final_marking=False, n_unique_final_markings=1,
-                                      overlap_size=0, trace_activities_multiset=None,
-                                      use_heuristic_distance=False, trace_recovery=False,
-                                      max_hist_len=None):
-            distance_min_heap = []
-            marking_distance_dict = {}
-            visited_markings = set()
-            final_nodes = []
-            final_markings_unique = set()
-            nodes_opened = 0
-        
-            init_node = self._initialize_dijkstra_node(trace_activities_multiset, use_heuristic_distance)
-            heappush(distance_min_heap, init_node)
-        
-            while distance_min_heap:
-                current_node = heappop(distance_min_heap)
-                
-                if current_node.marking.places in visited_markings:
-                    continue
-        
-                if self._is_dijkstra_final_node(current_node, partial_conformance, n_unique_final_markings, final_markings_unique):
-                    final_nodes.append(current_node)
-                    if len(final_nodes) == n_unique_final_markings:
-                        break
-                    continue
-        
-                nodes_opened += 1
-                available_transitions = self._find_available_transitions(current_node.marking.places)
-        
-                for transition in available_transitions:
-                    new_node = self._create_dijkstra_successor_node(current_node, transition, prob_dict, lamda, max_hist_len,
-                                                                    use_heuristic_distance)
-        
-                    if self._should_add_dijkstra_node(new_node, marking_distance_dict):
-                        marking_distance_dict[new_node.marking.places] = new_node.dist
-                        heappush(distance_min_heap, new_node)
-        
-                visited_markings.add(current_node.marking.places)
 
+    def dijkstra_no_rg_construct(
+        self,
+        prob_dict: Optional[Dict[Any, float]] = None,
+        lambda_: float = 0.5,
+        partial_conformance: bool = False,
+        return_net_final_marking: bool = False,
+        n_unique_final_markings: int = 1,
+        overlap_size: int = 0,
+        trace_activities_multiset: Optional[Dict[Any, int]] = None,
+        use_heuristic_distance: bool = False,
+        trace_recovery: bool = False,
+        max_hist_len: Optional[int] = None,
+    ) -> Tuple[Any, int]:
+        """
+        Perform Dijkstra-based search over synchronous product without constructing
+        a replay graph.
+        
+        Expands minimal-distance nodes until `n_unique_final_markings` are found.
+        
+        Assumes helper methods return nodes with:
+            - .marking.places: Tuple[...] as the state key
+            - .dist: float as the path cost
+        
+        Returns
+        -------
+        Tuple[Any, int]
+            Processed final node information and count of nodes opened during search.
+        """
+        # Initialize data structures
+        open_heap: List[Any] = []
+        best_distances: Dict[Tuple[Any, ...], float] = {}
+        visited_markings: Set[Tuple[Any, ...]] = set()
+        final_nodes: List[Any] = []
+        final_markings_unique: Set[Tuple[Any, ...]] = set()
+        nodes_opened: int = 0
+        
+        # Start search from initial node
+        start = self._initialize_dijkstra_node(
+            trace_activities_multiset, use_heuristic_distance
+        )
+        heappush(open_heap, start)
+        
+        while open_heap:
+            current = heappop(open_heap)
+            key = current.marking.places
             
-            return (self._process_dijkstra_final_node(final_nodes,
-                                                      partial_conformance,
-                                                      overlap_size,
-                                                      trace_recovery,
-                                                      return_net_final_marking),
-                                                      nodes_opened)
+            # Skip already processed markings
+            if key in visited_markings:
+                continue
+                
+            # Check if current node is a valid final state
+            if self._is_dijkstra_final_node(
+                current, partial_conformance, n_unique_final_markings, final_markings_unique
+            ):
+                final_nodes.append(current)
+                if len(final_nodes) >= n_unique_final_markings:
+                    break
+                continue
+            
+            # Expand current node
+            nodes_opened += 1
+            for transition in self._find_available_transitions(key):
+                successor = self._create_dijkstra_successor_node(
+                    current, transition, prob_dict, lambda_, max_hist_len, use_heuristic_distance
+                )
+                successor_key = successor.marking.places
+                
+                # Add successor if it improves known distance
+                if self._should_add_dijkstra_node(successor, best_distances):
+                    best_distances[successor_key] = successor.dist
+                    heappush(open_heap, successor)
+            
+            visited_markings.add(key)
+        
+        # Process and return results
+        result = self._process_dijkstra_final_node(
+            final_nodes,
+            partial_conformance,
+            overlap_size,
+            trace_recovery,
+            return_net_final_marking,
+        )
+        return result, nodes_opened
 
 
     def _initialize_dijkstra_node(self, trace_activities_multiset, use_heuristic_distance):
@@ -1099,13 +1143,10 @@ class PetriNet:
             new_marking,
             dist=current_node.dist + conditioned_weight,
             ancestor=current_node,
-            transition_to_ancestor=transition,
-            heuristic_distance=heuristic_dist,
-            path_prefix=new_prefix,
-            trace_activities_multiset=leftover_multiset,
-            total_model_moves=new_model_moves,
-            total_trace_moves=new_trace_moves,
-            nodes_opened=nodes_opened,
+            move_type=transition.move_type,
+            move_label=transition.label,
+            move_cost=conditioned_weight,
+            timestamp=current_node.timestamp + 1
         )
     
     
@@ -1171,4 +1212,118 @@ class PetriNet:
         nodes_opened = final_node.nodes_opened
     
         return alignment, total_distance, net_final_marking, nodes_opened
+    
+
+    def partial_trace_conformance(
+        self,
+        softmax_matrix: np.ndarray,
+        initial_marking: 'Marking',
+        cost_fn: Callable[[float, str], float],
+        eps: float = 1e-12,
+    ) -> Dict[str, Any]:
+        """
+        Compute a partial trace conformance alignment using Dijkstra/A*-style search.
+        
+        Returns a dict with:
+        - 'alignment': List[(move_type, move_label, move_cost)]
+        - 'total_cost': float
+        - 'final_marking': Marking
+        """
+        n_acts, n_ts = softmax_matrix.shape
+        label2idx = {str(i): i for i in range(n_acts)}
+
+        # Min-heap of (cost, node)
+        open_set: List[Tuple[float, SearchNode]] = []
+        start = SearchNode(marking=initial_marking, cost=0.0, timestamp=0)
+        heapq.heappush(open_set, (0.0, start))
+
+        # Best-known cost per (marking.places, timestamp)
+        best: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
+
+        while open_set:
+            cost, node = heapq.heappop(open_set)
+            key = (node.marking.places, node.timestamp)
+            if cost > best[key]:
+                continue
+            best[key] = cost
+
+            # Goal reached: consumed all timestamps
+            if node.timestamp == n_ts:
+                return {
+                    'alignment': node.reconstruct_path(),
+                    'total_cost': node.cost,
+                    'final_marking': node.marking
+                }
+
+            enabled = self._find_available_transitions(node.marking.places)
+
+            # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
+            for t in enabled:
+                new_mark = self._fire_transition(node.marking, t)
+                move_type = 'tau' if t.label is None else 'model'
+                c = cost_fn(0.0, move_type)
+                new_cost = cost + c
+                new_key = (new_mark.places, node.timestamp)
+                if new_cost < best.get(new_key, float('inf')):
+                    heapq.heappush(open_set, (
+                        new_cost,
+                        SearchNode(
+                            marking=new_mark,
+                            cost=new_cost,
+                            ancestor=node,
+                            move_type=move_type,
+                            move_label=t.label or 'τ',
+                            move_cost=c,
+                            timestamp=node.timestamp
+                        )
+                    ))
+
+            # 2) Log moves (advance timestamp without firing any transition)
+            if node.timestamp < n_ts:
+                for label, idx in label2idx.items():
+                    p = max(softmax_matrix[idx, node.timestamp], eps)
+                    c = cost_fn(p, 'log')
+                    new_cost = cost + c
+                    new_key = (node.marking.places, node.timestamp + 1)
+                    if new_cost < best.get(new_key, float('inf')):
+                        heapq.heappush(open_set, (
+                            new_cost,
+                            SearchNode(
+                                marking=node.marking,
+                                cost=new_cost,
+                                ancestor=node,
+                                move_type='log',
+                                move_label=label,
+                                move_cost=c,
+                                timestamp=node.timestamp + 1
+                            )
+                        ))
+
+            # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
+            for t in enabled:
+                if t.label is None or t.label not in label2idx:
+                    continue
+                idx = label2idx[t.label]
+                p = max(softmax_matrix[idx, node.timestamp], eps)
+                c = cost_fn(p, 'sync')
+                new_cost = cost + c
+                new_mark = self._fire_transition(node.marking, t)
+                new_key = (new_mark.places, node.timestamp + 1)
+                if new_cost < best.get(new_key, float('inf')):
+                    heapq.heappush(open_set, (
+                        new_cost,
+                        SearchNode(
+                            marking=new_mark,
+                            cost=new_cost,
+                            ancestor=node,
+                            move_type='sync',
+                            move_label=t.label,
+                            move_cost=c,
+                            timestamp=node.timestamp + 1
+                        )
+                    ))
+
+        raise ValueError("No conforming path found for the partial trace.")
+
+
 
