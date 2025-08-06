@@ -589,13 +589,16 @@ class PetriNet:
         Returns:
             bool: True if the transition is enabled (all input places have enough tokens), False otherwise.
         """
-        for arc in transition.in_arcs:
-            arc_weight = arc.weight
-            source_idx = self.places_indices[arc.source.name]
-            if mark_tuple[source_idx] < arc_weight:
-                return False
-            
-        return True
+        if self._finalized and hasattr(transition, 'is_enabled_optimized'):
+            return transition.is_enabled_optimized(mark_tuple)
+        else:
+            # Fallback to original implementation
+            for arc in transition.in_arcs:
+                arc_weight = arc.weight
+                source_idx = self.places_indices[arc.source.name]
+                if mark_tuple[source_idx] < arc_weight:
+                    return False
+            return True
             
     
     def __assign_trace_transitions_move_type(self):
