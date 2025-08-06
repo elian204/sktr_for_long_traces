@@ -252,7 +252,20 @@ class PetriNet:
         
         # Build indices safely
         self._build_indices()
-    
+        self._finalized = False
+        self._enabled_cache = {}
+        self._cache_max_size = 10000
+
+    def finalize(self) -> None:
+        """Prepare all transitions for optimized operations."""
+        self._build_indices()  # Ensure indices are current
+        
+        for transition in self.transitions:
+            transition.prepare_fire(self.places_indices)
+        
+        self._finalized = True
+        self._enabled_cache.clear()
+
     def _build_indices(self):
         """Build lookup indices for places and transitions."""
         self.places_indices = {
