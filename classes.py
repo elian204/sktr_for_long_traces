@@ -600,10 +600,11 @@ class PetriNet:
         # 1) Normalize and type‐check
         if isinstance(mark, tuple):
             places = mark
-        elif isinstance(mark, Marking):
+        elif hasattr(mark, 'places') and isinstance(mark.places, tuple):
+            # Handle Marking objects (more robust than isinstance check)
             places = mark.places
         else:
-            raise TypeError(f"mark must be a tuple or Marking, got {type(mark)}")
+            raise TypeError(f"mark must be a tuple or Marking object with .places attribute, got {type(mark)}")
 
         # 2) Build net token‐change per place
         delta = Counter()
