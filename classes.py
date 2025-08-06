@@ -884,6 +884,10 @@ class PetriNet:
         if max_tau_depth <= 0:
             raise ValueError("max_tau_depth must be positive")
         
+        # Ensure optimization before heavy computation
+        if not self._finalized:
+            self.finalize()
+        
         result: Dict[Tuple[int, ...], Dict] = {}
         visited = set()
         queue = deque([self.init_mark.places])
