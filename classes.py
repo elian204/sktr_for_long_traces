@@ -621,13 +621,13 @@ class PetriNet:
         return sync_prod.dijkstra_no_rg_construct(hist_prob_dict, lamda=lamda)
     
 
-    def _fire_transition(
+    def _fire_transition_original(
         self,
         mark: Union[Marking, Tuple[int, ...]],
         transition: "Transition"
     ) -> "Marking":
         """
-        Fire a transition on a given marking.
+        Fire a transition on a given marking (original implementation).
 
         Parameters
         ----------
@@ -679,6 +679,41 @@ class PetriNet:
 
         # 4) Wrap in Marking
         return Marking(tuple(new_places))
+
+    def _fire_transition(self, mark, transition):
+        """
+        Fire transition with automatic optimization.
+        """
+        # Choose implementation based on finalization status
+        if self._finalized and hasattr(transition, 'in_idx_weights'):
+            # Normalize marking
+            places = mark if isinstance(mark, tuple) else mark.places
+            
+            # Early exit for truly no-op transitions (no inputs AND no outputs)
+            if len(transition.in_idx_weights) == 0 and len(transition.out_idx_weights) == 0:
+                return Marking(places)
+            
+            # Fast firing
+            new_places = list(places)
+            
+            # Consume tokens
+            for idx, weight in transition.in_idx_weights:
+                new_places[idx] -= weight
+                if new_places[idx] < 0:
+                    place_name = self.places[idx].name
+                    raise ValueError(
+                        f"Firing '{transition.name}' yields negative tokens at {place_name}: "
+                        f"{places[idx]} - {weight} = {new_places[idx]}"
+                    )
+            
+            # Produce tokens
+            for idx, weight in transition.out_idx_weights:
+                new_places[idx] += weight
+            
+            return Marking(tuple(new_places))
+        else:
+            # Use original implementation
+            return self._fire_transition_original(mark, transition)
 
     def _fire_transition_sequence(self, marking, transitions):
         """
