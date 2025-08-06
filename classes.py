@@ -57,7 +57,45 @@ class Transition:
         self.cost_function = cost_function
         self.weight = self.__initialize_weight(weight)
         self.properties = properties or {}
+
+    def prepare_fire(self, places_indices: dict) -> None:
+        """Prepare for optimized operations."""
+        # Precompute input arcs
+        self.in_idx_weights = tuple(
+            (places_indices[arc.source.name], arc.weight) 
+            for arc in self.in_arcs
+        )
         
+        # Precompute output arcs
+        self.out_idx_weights = tuple(
+            (places_indices[arc.target.name], arc.weight) 
+            for arc in self.out_arcs
+        )
+        
+        # Check for weighted inputs
+        self.has_weighted_inputs = any(w > 1 for _, w in self.in_idx_weights)
+        
+        # Store just indices for unweighted case (common, faster)
+        if not self.has_weighted_inputs:
+            self.in_indices = tuple(idx for idx, _ in self.in_idx_weights)
+    
+    def is_enabled_optimized(self, mark_tuple: Tuple[int, ...]) -> bool:
+        """Ultra-fast enabled check."""
+        if not self.in_idx_weights:
+            return True  # No inputs = always enabled
+        
+        if self.has_weighted_inputs:
+            # General case with weights
+            for idx, weight in self.in_idx_weights:
+                if mark_tuple[idx] < weight:
+                    return False
+        else:
+            # Fast path for weight=1 (common case)
+            for idx in self.in_indices:
+                if mark_tuple[idx] < 1:
+                    return False
+        return True
+
     def __repr__(self):
         return self.name
     
