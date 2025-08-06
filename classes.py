@@ -1198,7 +1198,17 @@ class PetriNet:
 
             # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
             for t in enabled:
-                new_mark = self._fire_transition(node.marking, t)
+                # Use macro transition if this transition comes from marking_transition_map
+                if (hasattr(self, "marking_transition_map") and 
+                    self.marking_transition_map is not None and
+                    node.marking.places in self.marking_transition_map and
+                    t in self.marking_transition_map[node.marking.places]["available_transitions"]):
+                    # This transition requires tau-path firing
+                    new_mark = self._fire_macro_transition(node.marking, t)
+                else:
+                    # This is a directly enabled transition
+                    new_mark = self._fire_transition(node.marking, t)
+                
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + c
@@ -1254,7 +1264,18 @@ class PetriNet:
                 p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
                 new_cost = cost + c
-                new_mark = self._fire_transition(node.marking, t)
+                
+                # Use macro transition if this transition comes from marking_transition_map
+                if (hasattr(self, "marking_transition_map") and 
+                    self.marking_transition_map is not None and
+                    node.marking.places in self.marking_transition_map and
+                    t in self.marking_transition_map[node.marking.places]["available_transitions"]):
+                    # This transition requires tau-path firing
+                    new_mark = self._fire_macro_transition(node.marking, t)
+                else:
+                    # This is a directly enabled transition
+                    new_mark = self._fire_transition(node.marking, t)
+                
                 new_key = (new_mark.places, node.timestamp + 1)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
