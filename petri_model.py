@@ -275,6 +275,9 @@ def _create_configured_petrinet(
     petri_net.place_mapping = place_mapping
     petri_net.reverse_place_mapping = {idx: place for place, idx in place_mapping.items()}
     
+    # CRITICAL: Activate all optimizations
+    petri_net.finalize()
+    
     return petri_net
 
 
