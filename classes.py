@@ -1301,20 +1301,25 @@ class PetriNet:
 
             # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
             for t in enabled:
+                tau_cost_total = 0.0
                 # Use macro transition if this transition comes from marking_transition_map
-                if (hasattr(self, "marking_transition_map") and 
-                    self.marking_transition_map is not None and
-                    node.marking.places in self.marking_transition_map and
-                    t in self.marking_transition_map[node.marking.places]["available_transitions"]):
-                    # This transition requires tau-path firing
+                if (
+                    hasattr(self, "marking_transition_map")
+                    and self.marking_transition_map is not None
+                    and node.marking.places in self.marking_transition_map
+                    and t in self.marking_transition_map[node.marking.places]["available_transitions"]
+                ):
+                    # This transition requires τ-path firing; include τ costs
+                    tau_path = self.marking_transition_map[node.marking.places]["available_transitions"][t]
+                    tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
                     new_mark = self._fire_macro_transition(node.marking, t)
                 else:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
-                
+
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
-                new_cost = cost + c
+                new_cost = cost + tau_cost_total + c
                 new_key = (new_mark.places, node.timestamp)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
@@ -1325,7 +1330,7 @@ class PetriNet:
                             ancestor=node,
                             move_type=move_type,
                             move_label=t.label or 'τ',
-                            move_cost=c,
+                            move_cost=c + tau_cost_total,
                             timestamp=node.timestamp
                         )
                     ))
@@ -1366,19 +1371,25 @@ class PetriNet:
                     continue
                 p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
-                new_cost = cost + c
+
+                tau_cost_total = 0.0
                 
                 # Use macro transition if this transition comes from marking_transition_map
-                if (hasattr(self, "marking_transition_map") and 
-                    self.marking_transition_map is not None and
-                    node.marking.places in self.marking_transition_map and
-                    t in self.marking_transition_map[node.marking.places]["available_transitions"]):
-                    # This transition requires tau-path firing
+                if (
+                    hasattr(self, "marking_transition_map")
+                    and self.marking_transition_map is not None
+                    and node.marking.places in self.marking_transition_map
+                    and t in self.marking_transition_map[node.marking.places]["available_transitions"]
+                ):
+                    # This transition requires τ-path firing; include τ costs
+                    tau_path = self.marking_transition_map[node.marking.places]["available_transitions"][t]
+                    tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
                     new_mark = self._fire_macro_transition(node.marking, t)
                 else:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
                 
+                new_cost = cost + tau_cost_total + c
                 new_key = (new_mark.places, node.timestamp + 1)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
@@ -1389,7 +1400,7 @@ class PetriNet:
                             ancestor=node,
                             move_type='sync',
                             move_label=t.label,
-                            move_cost=c,
+                            move_cost=c + tau_cost_total,
                             timestamp=node.timestamp + 1
                         )
                     ))
