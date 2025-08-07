@@ -255,6 +255,7 @@ class PetriNet:
         self._finalized = False
         self._enabled_cache = {}
         self._cache_max_size = 10000
+        self._use_cache = False  # Initialize caching as disabled by default
 
     def finalize(self) -> None:
         """Prepare all transitions for optimized operations."""
@@ -550,32 +551,37 @@ class PetriNet:
 
 
     def _find_available_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
-        """
-        Given a marking (as a tuple of token counts), return a list of transitions
-        that are enabled (i.e., can fire) from this marking.
-
-        If a `marking_transition_map` is available, this will return non-silent tau-reachable
-        transitions. Otherwise, it returns only directly enabled transitions.
-
-        Args:
-            mark_tuple (Tuple[int, ...]): The current marking represented as a tuple of token counts.
-
-        Returns:
-            List[Transition]: A list of enabled Transition objects for the given marking.
-        """
+        # Use cache if enabled
+        if self._use_cache and mark_tuple in self._enabled_cache:
+            return self._enabled_cache[mark_tuple]
+        
+        # Your existing implementation (which is correct)
         if hasattr(self, "marking_transition_map") and self.marking_transition_map is not None:
             entry = self.marking_transition_map.get(mark_tuple)
             if entry and "available_transitions" in entry:
-                # Return the list of non-silent transitions reachable via tau-moves.
-                return list(entry["available_transitions"].keys())
+                # Return the list of non-silent transitions reachable via tau-moves
+                result = list(entry["available_transitions"].keys())
             else:
                 logger.warning(
-                    f"Marking {mark_tuple} not found in marking_transition_map or missing 'available_transitions'. "
+                    f"Marking {mark_tuple} not found in marking_transition_map. "
                     "Falling back to direct enabled transitions."
                 )
-
-        # Fallback to original behavior if map is not present or marking is not in map.
-        return self._find_directly_enabled_transitions(mark_tuple)
+                result = self._find_directly_enabled_transitions(mark_tuple)
+        else:
+            # Fallback to original behavior if map is not present
+            result = self._find_directly_enabled_transitions(mark_tuple)
+        
+        # Cache result if enabled
+        if self._use_cache:
+            self._enabled_cache[mark_tuple] = result
+            # Simple cache eviction
+            if len(self._enabled_cache) > self._cache_max_size:
+                # Remove first half of entries
+                keys_to_remove = list(self._enabled_cache.keys())[:self._cache_max_size // 2]
+                for key in keys_to_remove:
+                    del self._enabled_cache[key]
+        
+        return result
 
     
     def __check_transition_prerequesits(self, transition: Transition, mark_tuple: Tuple[int, ...]) -> bool:
@@ -599,8 +605,14 @@ class PetriNet:
                 if mark_tuple[source_idx] < arc_weight:
                     return False
             return True
-            
-    
+
+    def enable_caching(self, enable: bool = True, max_size: int = 10000) -> None:
+        self._use_cache = enable
+        self._cache_max_size = max_size
+        if not enable:
+            self._enabled_cache.clear() 
+
+
     def __assign_trace_transitions_move_type(self):
         for trans in self.transitions:
             trans.move_type = 'trace'
@@ -683,17 +695,15 @@ class PetriNet:
         # 4) Wrap in Marking
         return Marking(tuple(new_places))
 
-    def _fire_transition(self, mark, transition):
-        """
-        Fire transition with automatic optimization.
-        """
+    def _fire_transition(self, mark: Union['Marking', Tuple[int, ...]], 
+                        transition: 'Transition') -> 'Marking':
         # Choose implementation based on finalization status
-        if self._finalized and hasattr(transition, 'in_idx_weights'):
+        if self._finalized and hasattr(transition, 'in_idx_weights') and transition.in_idx_weights is not None:
             # Normalize marking
             places = mark if isinstance(mark, tuple) else mark.places
             
-            # Early exit for truly no-op transitions (no inputs AND no outputs)
-            if len(transition.in_idx_weights) == 0 and len(transition.out_idx_weights) == 0:
+            # FIX: Proper check for empty transitions
+            if not transition.in_idx_weights and not transition.out_idx_weights:
                 return Marking(places)
             
             # Fast firing
