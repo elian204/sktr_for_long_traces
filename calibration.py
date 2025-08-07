@@ -2,14 +2,16 @@
 Temperature scaling and calibration for softmax probabilities.
 """
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar
+import logging
 
 from utils import inverse_softmax
 
+logger = logging.getLogger(__name__)
 
 def softmax_numpy(logits: np.ndarray, axis: int = 0) -> np.ndarray:
     """Stable softmax implementation using numpy."""
@@ -42,7 +44,7 @@ def calibrate_probabilities(
     temp_bounds: Tuple[float, float],
     only_return_temperature: bool = False,
     global_temperature: Optional[float] = None
-) -> Any:
+) -> Union[float, List[np.ndarray]]:
     """
     CPU-only temperature scaling using numpy and scipy optimization.
     
@@ -115,7 +117,7 @@ def calibrate_probabilities(
         )
         
         if not result.success:
-            print(f"Warning: Temperature optimization failed: {result.message}")
+            logger.warning("Temperature optimization failed: %s. Falling back to T=1.0.", result.message)
             global_temperature = 1.0  # Fallback to no scaling
         else:
             global_temperature = result.x

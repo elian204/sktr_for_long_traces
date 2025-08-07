@@ -11,7 +11,7 @@ import logging
 import pandas as pd
 import numpy as np
 from utils import validate_input_parameters, make_cost_function, visualize_petri_net
-from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids
+from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_probabilities, calibrate_softmax
 from beam_search import process_test_case_beam_search
@@ -331,18 +331,20 @@ def incremental_softmax_recovery(
     
     test_softmax_matrices = select_softmax_matrices(filtered_softmax, test_df)
     if use_calibration:
-        # Use complete original matrices for calibration training (not filtered)
-        train_softmax_matrices = select_softmax_matrices(softmax_np, train_df)
+        # Learn temperature on FULL, unfiltered training traces to ensure alignment
+        train_case_ids = train_df['case:concept:name'].drop_duplicates().tolist()
+        train_df_full = _extract_cases(df, train_case_ids)
+        train_softmax_matrices = select_softmax_matrices(softmax_np, train_df_full)
         used_temperature = temperature
         if used_temperature is None:
             used_temperature = calibrate_probabilities(
                 softmax_list=train_softmax_matrices,
-                df=train_df,
+                df=train_df_full,
                 temp_bounds=temp_bounds,
                 only_return_temperature=True
             )
         test_softmax_matrices = calibrate_softmax(
-            train_df=train_df,
+            train_df=train_df_full,
             test_df=test_df,
             softmax_train=train_softmax_matrices,
             softmax_test=test_softmax_matrices,
