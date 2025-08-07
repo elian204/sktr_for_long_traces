@@ -296,6 +296,8 @@ def incremental_softmax_recovery(
     # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
     model = discover_petri_net(train_df)
+    model.enable_caching(True)
+    
     if save_model:
         try:
             visualize_petri_net(model, output_path=save_model_path)
