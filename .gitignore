@@ -138,4 +138,5 @@ Thumbs.db
 
 # Logs
 *.log
-logs/ 
+logs/ discovered_petri_net.pdf
+discovered_petri_net.png
