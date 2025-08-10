@@ -21,6 +21,7 @@ Example:
     >>> train_df, test_df = split_train_test(df, 100, 50, random_seed=42)
 """
 
+from __future__ import annotations
 from typing import Any, Optional, List, Sequence, Union, Tuple
 import numpy as np
 import pandas as pd
@@ -202,41 +203,65 @@ def filter_indices(
 
 def _sample_uniform_indices(
     trace_length: int,
-    n_indices: int, 
-    rng: random.Random
+    n_indices: int,
+    rng: random.Random,
 ) -> List[int]:
-    """Sample n_indices positions uniformly from trace."""
-    n_to_sample = min(n_indices, trace_length)
-    return sorted(rng.sample(range(trace_length), n_to_sample))
+    """
+    Uniformly sample up to `n_indices` distinct positions from [0, trace_length).
+    Indices are returned sorted in ascending order (chronological).
+
+    Complexity: O(k log k) where k = min(n_indices, trace_length).
+    """
+    if trace_length <= 0 or n_indices <= 0:
+        return []
+    k = min(n_indices, trace_length)
+    # random.sample supports range directly without materializing a list
+    return sorted(rng.sample(range(trace_length), k))
 
 
 def _sample_sequential_indices(
     trace_df: pd.DataFrame,
     n_per_run: int,
-    rng: random.Random
+    rng: random.Random,
 ) -> List[int]:
-    """Sample n_per_run positions from each activity run."""
-    activity_sequence = trace_df['concept:name'].tolist()
-    sampled_indices = []
-    
-    # Find runs of identical activities
-    current_activity = None
+    """
+    Sample up to `n_per_run` positions from each maximal run of identical
+    'concept:name' values within the trace. Indices are returned sorted.
+
+    - Consecutive NaNs are treated as the *same* activity (no boundary).
+    - Other transitions (including None↔non-None) start a new run.
+
+    Complexity: O(n + r log n_per_run), where n is trace length and r is number of runs.
+    """
+    if n_per_run <= 0:
+        return []
+
+    names = trace_df["concept:name"].to_numpy()
+    n = len(names)
+    if n == 0:
+        return []
+
+    def _equal(a, b) -> bool:
+        # Treat NaN == NaN as equal; otherwise normal equality
+        if pd.isna(a) and pd.isna(b):
+            return True
+        return a == b
+
+    sampled: List[int] = []
     run_start = 0
-    
-    for i, activity in enumerate(activity_sequence + [None]):
-        if activity != current_activity:
-            if current_activity is not None:
-                # Sample from the completed run [run_start, i)
-                run_indices = list(range(run_start, i))
-                run_sample_size = min(n_per_run, len(run_indices))
-                sampled_from_run = rng.sample(run_indices, run_sample_size)
-                sampled_indices.extend(sampled_from_run)
-            
-            # Start new run
-            current_activity = activity
+
+    # scan runs without sentinels
+    for i in range(1, n + 1):
+        at_boundary = (i == n) or (not _equal(names[i], names[i - 1]))
+        if at_boundary:
+            # [run_start, i) is a maximal run
+            length = i - run_start
+            k = min(n_per_run, length)
+            if k:
+                sampled.extend(rng.sample(range(run_start, i), k))
             run_start = i
-    
-    return sorted(sampled_indices)
+
+    return sorted(sampled)
 
 
 def _validate_softmax_alignment(
