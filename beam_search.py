@@ -133,11 +133,9 @@ def process_test_case_beam_search(
     model: "PetriNet",
     cost_fn: Callable[[float, str], float],
     beam_width: int,
-    lambdas: Sequence[float],
     alpha: float,
     use_cond_probs: bool,
     prob_dict: Mapping[Any, Any],
-    use_ngram_smoothing: bool,
     activity_prob_threshold: float,
     beam_score_alpha: float = 0.5,
     completion_patience: int = 5,
@@ -158,16 +156,12 @@ def process_test_case_beam_search(
         Converts (probability, move_type/label) to a nonnegative cost.
     beam_width : int
         Maximum number of candidates kept in the beam after pruning.
-    lambdas : Sequence[float]
-        Weights for conditional probability blending.
     alpha : float
         Base/conditional blending parameter in [0, 1].
     use_cond_probs : bool
         Whether to incorporate conditional probabilities.
     prob_dict : Mapping
         Dictionary supplying conditional/transition probabilities.
-    use_ngram_smoothing : bool
-        Whether to apply n-gram smoothing when using conditional probabilities.
     activity_prob_threshold : float
         Minimum per-step probability cutoff to consider an activity.
     beam_score_alpha : float, default=0.5
@@ -280,6 +274,196 @@ def process_test_case_beam_search(
 
     logger.warning(
         "Beam search failed to complete after %d iterations; falling back to greedy.",
+        iteration,
+    )
+    return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps, cost_fn)
+
+
+def process_test_case_hybrid(
+    softmax_matrix: np.ndarray,
+    model: "PetriNet",
+    cost_fn: Callable[[float, str], float],
+    beam_width: int,
+    alpha: float,
+    use_cond_probs: bool,
+    prob_dict: Mapping[Any, Any],
+    activity_prob_threshold: float,
+    beam_score_alpha: float = 0.5,
+    completion_patience: int = 5,
+    conformance_chunk_size: int = 10,
+    conformance_eps: float = 1e-12,
+    decider: Optional[Callable[[int, np.ndarray, BeamCandidate, "PetriNet"], Optional[int]]] = None,
+) -> Tuple[List[str], List[float]]:
+    """
+    Hybrid recovery: run beam search, but when the provided `decider` indicates,
+    switch to conformance for a chunk and then resume beam search from the updated state.
+
+    Parameters mirror `process_test_case_beam_search`, with extra:
+    - conformance_chunk_size: default fallback chunk size if decider returns None/invalid
+    - conformance_eps: probability threshold for conformance filtering
+    - decider: function(timestamp, remaining_softmax, best_candidate, model) -> Optional[int]
+        Return a positive integer chunk length to trigger conformance from the current timestamp.
+        Return None/0 to continue beam search.
+    """
+    # ---- Validation ---------------------------------------------------------
+    if softmax_matrix.ndim != 2:
+        raise ValueError(
+            f"softmax_matrix must be 2D (n_activities, n_timestamps); got ndim={softmax_matrix.ndim}"
+        )
+    if getattr(model, "init_mark", None) is None:
+        raise ValueError("Model must define a valid initial marking: model.init_mark")
+    if getattr(model, "final_mark", None) is None:
+        raise ValueError("Model must define a valid final marking: model.final_mark")
+
+    n_timestamps = int(softmax_matrix.shape[1])
+    if n_timestamps == 0:
+        return [], []
+
+    # ---- Initialize beam ----------------------------------------------------
+    beam_state = BeamState(beam_width, alpha=beam_score_alpha)
+    beam_state.add_candidate(
+        BeamCandidate(
+            path=(),
+            cumulative_cost=0.0,
+            marking=model.init_mark,
+            timestamp=0,
+            move_costs=[],
+        )
+    )
+
+    max_iterations = n_timestamps * 10
+    iteration = 0
+    first_completion_found = False
+    patience = 0
+    completed: List["BeamCandidate"] = []
+    prev_active_keys: "set[Tuple[Tuple[int, ...], int]]" = set()
+
+    # Helper: apply conformance on the best candidate for a given chunk length
+    def _apply_conformance(best: BeamCandidate, chunk_len: int) -> BeamCandidate:
+        nonlocal completed
+        if chunk_len <= 0:
+            chunk_len = conformance_chunk_size
+        start_ts = best.timestamp
+        end_ts = min(start_ts + chunk_len, n_timestamps)
+        if start_ts >= end_ts:
+            return best
+
+        chunk = softmax_matrix[:, start_ts:end_ts]
+        # Run partial conformance from current marking
+        result = model.partial_trace_conformance(
+            softmax_matrix=chunk,
+            initial_marking=best.marking,
+            cost_fn=cost_fn,
+            eps=conformance_eps,
+        )
+
+        # Update candidate with alignment results
+        new_path: List[str] = list(best.path)
+        new_move_costs: List[float] = list(best.move_costs)
+        new_cost = best.cumulative_cost
+        new_timestamp = best.timestamp
+        for move_type, move_label, move_cost in result["alignment"]:
+            new_cost += float(move_cost)
+            # Only sync/log advance the trace and contribute to predicted sequence
+            if move_type in ("sync", "log"):
+                new_path.append(str(move_label))
+                new_move_costs.append(float(move_cost))
+                new_timestamp += 1
+
+        updated = BeamCandidate(
+            path=tuple(new_path),
+            cumulative_cost=new_cost,
+            marking=result["final_marking"],
+            timestamp=new_timestamp,
+            move_costs=new_move_costs,
+        )
+        # If completed via conformance, remember it
+        if updated.timestamp >= n_timestamps:
+            completed.append(updated)
+        return updated
+
+    # ---- Main loop ----------------------------------------------------------
+    while iteration < max_iterations:
+        iteration += 1
+
+        # Optionally switch to conformance for a chunk based on decider
+        best_now = beam_state.get_best_candidate()
+        if best_now is None:
+            logger.info("Active beam is empty. Stopping hybrid search.")
+            break
+        if decider is not None:
+            try:
+                remaining = softmax_matrix[:, best_now.timestamp:]
+                chunk_len = decider(best_now.timestamp, remaining, best_now, model)
+            except Exception as exc:
+                logger.warning(f"Hybrid decider errored ({exc}); continuing with beam search.")
+                chunk_len = None
+            if isinstance(chunk_len, int) and chunk_len > 0:
+                # Apply conformance to best candidate and continue
+                updated_best = _apply_conformance(best_now, chunk_len)
+                beam_state.candidates = [updated_best]
+                if updated_best.timestamp >= n_timestamps:
+                    # If we completed, allow a few more rounds then stop
+                    first_completion_found = True
+                # Continue to next iteration without expanding the beam this round
+                if first_completion_found:
+                    patience += 1
+                    if patience >= completion_patience:
+                        break
+                continue
+
+        # Otherwise run a normal beam expansion step
+        new_candidates = _expand_beam_candidates(
+            beam_state=beam_state,
+            softmax_matrix=softmax_matrix,
+            model=model,
+            cost_fn=cost_fn,
+            use_cond_probs=use_cond_probs,
+            prob_dict=prob_dict,
+            alpha=alpha,
+            activity_prob_threshold=activity_prob_threshold,
+        )
+
+        best_by_state: Dict[Tuple[Tuple[int, ...], int], "BeamCandidate"] = {}
+        for cand in new_candidates:
+            key = (cand.marking.places, cand.timestamp)
+            if key not in best_by_state or cand.cumulative_cost < best_by_state[key].cumulative_cost:
+                best_by_state[key] = cand
+
+        beam_state.candidates = list(best_by_state.values())
+        beam_state.prune_beam()
+
+        done_now = [c for c in beam_state.candidates if c.timestamp >= n_timestamps]
+        if done_now:
+            completed.extend(done_now)
+            if not first_completion_found:
+                first_completion_found = True
+
+        active = [c for c in beam_state.candidates if c.timestamp < n_timestamps]
+        active_keys = {(c.marking.places, c.timestamp) for c in active}
+        if active and active_keys == prev_active_keys:
+            logger.warning("Hybrid beam search stalled on active candidates. Terminating.")
+            break
+        prev_active_keys = active_keys
+        beam_state.candidates = active
+
+        if first_completion_found:
+            patience += 1
+            if patience >= completion_patience:
+                break
+
+        if not beam_state.candidates:
+            logger.info("Active beam is empty. Stopping hybrid search.")
+            break
+
+    # ---- Final selection / fallback ----------------------------------------
+    if completed:
+        logger.info("Hybrid search finished with %d completed candidates.", len(completed))
+        best_final = min(completed, key=lambda c: beam_state._beam_score(c))
+        return list(best_final.path), list(best_final.move_costs)
+
+    logger.warning(
+        "Hybrid search failed to complete after %d iterations; falling back to greedy.",
         iteration,
     )
     return _generate_fallback_sequence(beam_state, softmax_matrix, n_timestamps, cost_fn)

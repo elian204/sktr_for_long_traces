@@ -14,8 +14,13 @@ from utils import validate_input_parameters, make_cost_function, visualize_petri
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_probabilities, calibrate_softmax
-from beam_search import process_test_case_beam_search
+from beam_search import process_test_case_beam_search, process_test_case_hybrid
 from conformance_checking import process_trace_chunked
+try:
+    # Optional convenience import: user can define `decide` here
+    from hybrid_deciders import decide as default_hybrid_decider
+except Exception:
+    default_hybrid_decider = None
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -75,6 +80,10 @@ def incremental_softmax_recovery(
     non_sync_penalty: float = 1.0,
     recovery_method: str = "conformance",
     chunk_size: int = 10,
+    # Hybrid-specific parameters
+    hybrid_conformance_chunk_size: int = 10,
+    hybrid_conformance_eps: float = 1e-12,
+    hybrid_decider: Optional[Callable[[int, np.ndarray, Any, Any], Optional[int]]] = None,
 
     verbose: bool = True,
     log_level: int = logging.INFO,
@@ -233,10 +242,12 @@ def incremental_softmax_recovery(
     logger.info(f"Validated sampling parameters: {sampling_method} with {sampling_param_name}={sampling_param_value}.")
 
     # 2. Validate recovery method
-    valid_methods = ["conformance", "beam_search"]
+    valid_methods = ["conformance", "beam_search", "hybrid"]
     if recovery_method not in valid_methods:
         raise ValueError(f"recovery_method must be one of {valid_methods}, got '{recovery_method}'")
     logger.info(f"Using recovery method: {recovery_method}")
+    if recovery_method == "hybrid" and hybrid_decider is None and default_hybrid_decider is not None:
+        hybrid_decider = default_hybrid_decider
 
     # 3. Validate other inputs
     sampling_param = n_per_run if sequential_sampling else n_indices
@@ -384,14 +395,28 @@ def incremental_softmax_recovery(
                 model=model,
                 cost_fn=cost_fn,
                 beam_width=beam_width,
-                lambdas=lambdas,
                 alpha=alpha,
                 use_cond_probs=use_cond_probs,
                 prob_dict=prob_dict,
-                use_ngram_smoothing=use_ngram_smoothing,
                 activity_prob_threshold=prob_threshold,
                 beam_score_alpha=beam_score_alpha,
                 completion_patience=completion_patience,
+            )
+        elif recovery_method == "hybrid":
+            sktr_preds, sktr_move_costs = process_test_case_hybrid(
+                softmax_matrix=softmax_matrix,
+                model=model,
+                cost_fn=cost_fn,
+                beam_width=beam_width,
+                alpha=alpha,
+                use_cond_probs=use_cond_probs,
+                prob_dict=prob_dict,
+                activity_prob_threshold=prob_threshold,
+                beam_score_alpha=beam_score_alpha,
+                completion_patience=completion_patience,
+                conformance_chunk_size=hybrid_conformance_chunk_size,
+                conformance_eps=hybrid_conformance_eps,
+                decider=hybrid_decider,
             )
         else:
             raise ValueError(f"Unsupported recovery method: {recovery_method}")
