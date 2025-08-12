@@ -314,11 +314,10 @@ def _build_conditioned_prob_dict(
     df_train: pd.DataFrame,
     max_hist_len: int = 2,
     precision: int = 2,
-    k: float = 1.0       # pseudo-count ≥1 ⇒ all log(count+k) ≥ 0
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build conditional probabilities P(activity | history) for all histories of
-    length ≤ max_hist_len, using log(+k) smoothing.
+    length ≤ max_hist_len, using relative frequencies (no smoothing).
 
     Parameters
     ----------
@@ -328,8 +327,6 @@ def _build_conditioned_prob_dict(
         Maximum history length for n-grams.
     precision : int, default=2
         Decimal places for probabilities.
-    k : float, default=1.0
-        Pseudo-count added before log; must be ≥1 to keep logs nonnegative.
 
     Returns
     -------
@@ -348,19 +345,14 @@ def _build_conditioned_prob_dict(
         for history, activity in pairs:
             history_counts[history][activity] += 1
 
-    # 3) Build log(+k) smoothed probabilities
+    # 3) Build frequency-based probabilities
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
     for history, counts in history_counts.items():
-        # 3a) add pseudo-count then log
-        log_weights = {a: math.log(c + k) for a, c in counts.items()}
-        total = sum(log_weights.values())
+        total = sum(counts.values())
         if total <= 0:
             continue
-        # 3b) normalize and round
-        probs = {
-            a: round(w / total, precision)
-            for a, w in log_weights.items()
-        }
+        # normalize and round
+        probs = {a: round(c / total, precision) for a, c in counts.items()}
         prob_dict[history] = probs
 
     return prob_dict

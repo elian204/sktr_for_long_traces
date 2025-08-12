@@ -81,6 +81,8 @@ def incremental_softmax_recovery(
     non_sync_penalty: float = 1.0,
     recovery_method: str = "conformance",
     chunk_size: int = 10,
+    # Conformance-specific: switch penalty weight on label change (uses bigram prob_dict)
+    conformance_switch_penalty_weight: float = 0.0,
     # Hybrid-specific parameters
     hybrid_conformance_chunk_size: int = 10,
     hybrid_conformance_eps: float = 1e-12,
@@ -328,15 +330,15 @@ def incremental_softmax_recovery(
     logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
 
 
-    # 8. Conditional probabilities (optional)
-    prob_dict = {}
-    if use_cond_probs:
+    # 8. Conditional probabilities (build when needed)
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    if use_cond_probs or (recovery_method in {"conformance", "hybrid"} and conformance_switch_penalty_weight > 0.0):
         prob_dict = build_probability_dict(train_df, max_hist_len)
-        if use_cond_probs:
-            n_histories = len(prob_dict)
-            avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
-            logger.info(f"Built conditional probability dictionary: {n_histories} histories, avg {avg_activities_per_history:.1f} activities per history.")
-    logger.info("Built conditional probability dictionary.")
+        n_histories = len(prob_dict)
+        avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
+        logger.info(f"Built conditional probability dictionary: {n_histories} histories, avg {avg_activities_per_history:.1f} activities per history.")
+    else:
+        logger.info("Skipping probability dictionary build (not requested).")
 
     # 9. Prepare test softmax matrices (with optional calibration)
     if filtered_softmax is None:
@@ -401,6 +403,8 @@ def incremental_softmax_recovery(
                 eps=prob_threshold,
                 inline_progress=True,
                 progress_prefix=f"case {idx}/{len(test_case_ids)}",
+                prob_dict=prob_dict,
+                switch_penalty_weight=conformance_switch_penalty_weight,
             )
         elif recovery_method == "beam_search":
             sktr_preds, sktr_move_costs = process_test_case_beam_search(

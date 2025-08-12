@@ -202,6 +202,9 @@ class SearchNode:
         move_label: Optional[str] = None,
         move_cost: float = 0.0,
         timestamp: int = 0,
+        # Track last emitted label and full path prefix for conditional p_stay
+        last_label: Optional[str] = None,
+        path_prefix: Tuple[str, ...] = tuple(),
     ):
         self.cost = cost
         self.ancestor = ancestor
@@ -210,6 +213,8 @@ class SearchNode:
         self.move_cost = move_cost
         self.marking = marking
         self.timestamp = timestamp
+        self.last_label = last_label
+        self.path_prefix: Tuple[str, ...] = path_prefix
 
     def __lt__(self, other: 'SearchNode'):
         return self.cost < other.cost
@@ -1258,6 +1263,8 @@ class PetriNet:
         initial_marking: 'Marking',
         cost_fn: Callable[[float, str], float],
         eps: float = 1e-12,
+        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        switch_penalty_weight: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1278,7 +1285,7 @@ class PetriNet:
 
         # Min-heap of (cost, node)
         open_set: List[Tuple[float, SearchNode]] = []
-        start = SearchNode(marking=initial_marking, cost=0.0, timestamp=0)
+        start = SearchNode(marking=initial_marking, cost=0.0, timestamp=0, last_label=None, path_prefix=tuple())
         heapq.heappush(open_set, (0.0, start))
 
         # Best-known cost per (marking.places, timestamp)
@@ -1333,7 +1340,9 @@ class PetriNet:
                             move_type=move_type,
                             move_label=t.label or 'τ',
                             move_cost=c + tau_cost_total,
-                            timestamp=node.timestamp
+                            timestamp=node.timestamp,
+                            last_label=node.last_label,
+                            path_prefix=node.path_prefix,
                         )
                     ))
 
@@ -1346,7 +1355,15 @@ class PetriNet:
                         continue
                     p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                     c = cost_fn(p, 'log')
-                    new_cost = cost + c
+                    # Switch penalty from prob_dict using bigram p(x_n | x_{n-1})
+                    add_switch = 0.0
+                    if switch_penalty_weight > 0.0 and node.last_label is not None and label != node.last_label and prob_dict is not None:
+                        bigram_prefix = (node.last_label,)
+                        p_stay = float(prob_dict.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                        p_stay = max(min(p_stay, 1.0), 0.0)
+                        add_switch = switch_penalty_weight * p_stay
+
+                    new_cost = cost + c + add_switch
                     new_key = (node.marking.places, node.timestamp + 1)
                     if new_cost < best.get(new_key, float('inf')):
                         heapq.heappush(open_set, (
@@ -1357,8 +1374,10 @@ class PetriNet:
                                 ancestor=node,
                                 move_type='log',
                                 move_label=label,
-                                move_cost=c,
-                                timestamp=node.timestamp + 1
+                                move_cost=c + add_switch,
+                                timestamp=node.timestamp + 1,
+                                last_label=label,
+                                path_prefix=(node.path_prefix + (label,)),
                             )
                         ))
 
@@ -1391,7 +1410,15 @@ class PetriNet:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
                 
-                new_cost = cost + tau_cost_total + c
+                # Switch penalty from prob_dict using bigram p(x_n | x_{n-1})
+                add_switch = 0.0
+                if switch_penalty_weight > 0.0 and node.last_label is not None and t.label != node.last_label and prob_dict is not None:
+                    bigram_prefix = (node.last_label,)
+                    p_stay = float(prob_dict.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                    p_stay = max(min(p_stay, 1.0), 0.0)
+                    add_switch = switch_penalty_weight * p_stay
+
+                new_cost = cost + tau_cost_total + c + add_switch
                 new_key = (new_mark.places, node.timestamp + 1)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
@@ -1402,8 +1429,10 @@ class PetriNet:
                             ancestor=node,
                             move_type='sync',
                             move_label=t.label,
-                            move_cost=c + tau_cost_total,
-                            timestamp=node.timestamp + 1
+                            move_cost=c + tau_cost_total + add_switch,
+                            timestamp=node.timestamp + 1,
+                            last_label=t.label,
+                            path_prefix=(node.path_prefix + (t.label,)),
                         )
                     ))
 
@@ -1419,6 +1448,8 @@ class PetriNet:
         eps: float = 1e-12,
         inline_progress: bool = False,
         progress_prefix: str = "",
+        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        switch_penalty_weight: float = 0.0,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1462,7 +1493,9 @@ class PetriNet:
                 softmax_matrix=chunk,
                 initial_marking=current_marking,
                 cost_fn=cost_fn,
-                eps=eps
+                eps=eps,
+                prob_dict=prob_dict,
+                switch_penalty_weight=switch_penalty_weight,
             )
             chunk_end = time.perf_counter()
             elapsed = chunk_end - chunk_start
@@ -1518,6 +1551,8 @@ class PetriNet:
         eps: float = 1e-12,
         inline_progress: bool = False,
         progress_prefix: str = "",
+        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        switch_penalty_weight: float = 0.0,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1546,6 +1581,8 @@ class PetriNet:
             eps=eps,
             inline_progress=inline_progress,
             progress_prefix=progress_prefix,
+            prob_dict=prob_dict,
+            switch_penalty_weight=switch_penalty_weight,
         )
         
         # Extract sequence and costs from alignment

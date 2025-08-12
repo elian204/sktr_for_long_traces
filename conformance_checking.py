@@ -5,7 +5,7 @@ This module provides conformance-based alternatives to beam search
 for recovering activity sequences from softmax probability matrices.
 """
 
-from typing import Callable, List, Tuple, Dict, Any
+from typing import Callable, List, Tuple, Dict, Any, Mapping, Optional
 import numpy as np
 from classes import PetriNet
 
@@ -18,6 +18,8 @@ def process_trace_chunked(
     eps: float = 1e-12,
     inline_progress: bool = False,
     progress_prefix: str = "",
+    prob_dict: Optional[Mapping[Tuple[str, ...], Mapping[str, float]]] = None,
+    switch_penalty_weight: float = 0.0,
 ) -> Tuple[List[str], List[float]]:
     """
     Drop-in replacement for process_test_case_beam_search using chunked conformance checking.
@@ -44,4 +46,6 @@ def process_trace_chunked(
         eps=eps,
         inline_progress=inline_progress,
         progress_prefix=progress_prefix,
+        prob_dict=prob_dict,
+        switch_penalty_weight=switch_penalty_weight,
     )
