@@ -24,6 +24,7 @@ except Exception:
 
 # Configure logger
 logger = logging.getLogger(__name__)
+import sys
 
 
 def setup_logging(level=logging.INFO):
@@ -84,6 +85,7 @@ def incremental_softmax_recovery(
     hybrid_conformance_chunk_size: int = 10,
     hybrid_conformance_eps: float = 1e-12,
     hybrid_decider: Optional[Callable[[int, np.ndarray, Any, Any], Optional[int]]] = None,
+    hybrid_min_disagree_run: int = 1,
 
     verbose: bool = True,
     log_level: int = logging.INFO,
@@ -378,7 +380,16 @@ def incremental_softmax_recovery(
     for idx, (case, softmax_matrix) in enumerate(
         zip(test_case_ids, test_softmax_matrices), start=1
     ):
-        logger.debug(f"Case {idx}/{len(test_case_ids)}: {case}")
+        # In-place progress update for traces (single updating line)
+        try:
+            sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — {recovery_method}")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        # Avoid extra per-trace INFO logs when using inline progress
+        logger.debug(
+            f"Processing test case {idx}/{len(test_case_ids)} ({case}) using '{recovery_method}'"
+        )
         
         # Get predicted sequence using selected recovery method
         if recovery_method == "conformance":
@@ -388,6 +399,8 @@ def incremental_softmax_recovery(
                 cost_fn=cost_fn,
                 chunk_size=chunk_size,
                 eps=prob_threshold,
+                inline_progress=True,
+                progress_prefix=f"case {idx}/{len(test_case_ids)}",
             )
         elif recovery_method == "beam_search":
             sktr_preds, sktr_move_costs = process_test_case_beam_search(
@@ -417,6 +430,7 @@ def incremental_softmax_recovery(
                 conformance_chunk_size=hybrid_conformance_chunk_size,
                 conformance_eps=hybrid_conformance_eps,
                 decider=hybrid_decider,
+                min_disagree_run=hybrid_min_disagree_run,
             )
         else:
             raise ValueError(f"Unsupported recovery method: {recovery_method}")
@@ -442,7 +456,7 @@ def incremental_softmax_recovery(
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
         argmax_accs.append(argmax_acc)
-        logger.info(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+        logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
 
     # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
@@ -450,6 +464,12 @@ def incremental_softmax_recovery(
         'sktr_accuracy': sktr_accs,
         'argmax_accuracy': argmax_accs
     }
+    # End the in-place progress line
+    try:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
     logger.info("Built results DataFrame and accuracy dictionary.")
     logger.info(f"Softmax trace recovery completed using {recovery_method} method.")
     return results_df, accuracy_dict, prob_dict

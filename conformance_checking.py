@@ -16,6 +16,8 @@ def process_trace_chunked(
     cost_fn: Callable[[float, str], float],
     chunk_size: int = 10,
     eps: float = 1e-12,
+    inline_progress: bool = False,
+    progress_prefix: str = "",
 ) -> Tuple[List[str], List[float]]:
     """
     Drop-in replacement for process_test_case_beam_search using chunked conformance checking.
@@ -40,4 +42,6 @@ def process_trace_chunked(
         cost_fn=cost_fn,
         chunk_size=chunk_size,
         eps=eps,
+        inline_progress=inline_progress,
+        progress_prefix=progress_prefix,
     )

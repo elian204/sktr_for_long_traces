@@ -557,6 +557,164 @@ def group_cases_by_trace(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+def compute_activity_run_counts(
+    dataset_name: str,
+    path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Dict[str, int]]:
+    """
+    Compute the number of sequential runs for each activity in each trace.
+
+    A "run" is a maximal contiguous block of the same activity within a trace.
+    For example, the sequence [A, A, B, A, A, A] has:
+      - A: 2 runs ("A, A" and "A, A, A")
+      - B: 1 run
+
+    Parameters
+    ----------
+    dataset_name : str
+        One of: '50salads', 'gtea', 'breakfast'.
+    path : str or Path, optional
+        Base directory containing dataset pickles (passed to prepare_df).
+
+    Returns
+    -------
+    Dict[str, Dict[str, int]]
+        Nested dictionary mapping:
+          activity_label -> { case_id -> number_of_runs }
+        Only traces where an activity has at least one run are included in that
+        activity's inner dictionary.
+    """
+    # Load the event DataFrame for the dataset
+    df, _ = prepare_df(dataset_name, path)
+
+    # Ensure expected columns exist
+    required_cols = {"case:concept:name", "concept:name"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+
+    # Result: activity -> { case_id -> run_count }
+    activity_to_case_runs: Dict[str, Dict[str, int]] = {}
+
+    # Iterate per trace preserving order
+    for case_id, group in df.groupby("case:concept:name", sort=False):
+        labels = group["concept:name"].tolist()
+        if not labels:
+            continue
+
+        previous_label: Optional[str] = None
+        # Temporary per-trace run counts by activity
+        per_trace_runs: Dict[str, int] = {}
+
+        for label in labels:
+            # A new run starts whenever the label changes
+            if label != previous_label:
+                per_trace_runs[label] = per_trace_runs.get(label, 0) + 1
+                previous_label = label
+
+        # Merge per-trace counts into the global structure
+        for activity_label, run_count in per_trace_runs.items():
+            if activity_label not in activity_to_case_runs:
+                activity_to_case_runs[activity_label] = {}
+            activity_to_case_runs[activity_label][str(case_id)] = int(run_count)
+
+    return activity_to_case_runs
+
+
+def compute_activity_run_lengths(
+    dataset_name: str,
+    path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Dict[str, List[int]]]:
+    """
+    Compute the lengths of each sequential run for every activity in each trace.
+
+    A "run" is a maximal contiguous block of the same activity within a trace.
+    For example, the sequence [A, A, B, A, A, A] has A-run lengths [2, 3] and B-run lengths [1].
+
+    Parameters
+    ----------
+    dataset_name : str
+        One of: '50salads', 'gtea', 'breakfast'.
+    path : str or Path, optional
+        Base directory containing dataset pickles (passed to prepare_df).
+
+    Returns
+    -------
+    Dict[str, Dict[str, List[int]]]
+        Nested dictionary mapping:
+          activity_label -> { case_id -> [run_length_1, run_length_2, ...] }
+        Only traces where an activity appears are included in that activity's inner dictionary.
+    """
+    df, _ = prepare_df(dataset_name, path)
+
+    required_cols = {"case:concept:name", "concept:name"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+
+    activity_to_case_run_lengths: Dict[str, Dict[str, List[int]]] = {}
+
+    for case_id, group in df.groupby("case:concept:name", sort=False):
+        labels = group["concept:name"].tolist()
+        if not labels:
+            continue
+
+        # Build per-trace run lengths by activity
+        per_trace_lengths: Dict[str, List[int]] = {}
+
+        current_label: Optional[str] = None
+        current_run_length: int = 0
+
+        for label in labels:
+            if label == current_label:
+                current_run_length += 1
+            else:
+                if current_label is not None:
+                    per_trace_lengths.setdefault(current_label, []).append(current_run_length)
+                current_label = label
+                current_run_length = 1
+
+        # Flush last run
+        if current_label is not None:
+            per_trace_lengths.setdefault(current_label, []).append(current_run_length)
+
+        # Merge into global structure
+        for activity_label, lengths in per_trace_lengths.items():
+            activity_to_case_run_lengths.setdefault(activity_label, {})[str(case_id)] = [int(x) for x in lengths]
+
+    return activity_to_case_run_lengths
+
+
+def compute_unique_activity_run_lengths(
+    dataset_name: str,
+    path: Optional[Union[str, Path]] = None,
+) -> Dict[str, List[int]]:
+    """
+    Return, for each activity, the list of unique contiguous run lengths across all traces.
+
+    Parameters
+    ----------
+    dataset_name : str
+        One of: '50salads', 'gtea', 'breakfast'.
+    path : str or Path, optional
+        Base directory containing dataset pickles (passed to prepare_df).
+
+    Returns
+    -------
+    Dict[str, List[int]]
+        Mapping: activity_label -> sorted list of unique run lengths.
+    """
+    activity_to_case_lengths = compute_activity_run_lengths(dataset_name, path)
+
+    activity_to_unique_lengths: Dict[str, List[int]] = {}
+    for activity_label, case_to_lengths in activity_to_case_lengths.items():
+        unique_lengths = set()
+        for lengths in case_to_lengths.values():
+            unique_lengths.update(int(x) for x in lengths)
+        activity_to_unique_lengths[activity_label] = sorted(unique_lengths)
+
+    return activity_to_unique_lengths
+
 def visualize_petri_net(net, marking=None, output_path="./model"):
     """
     Generates a visual representation of a Petri Net model using Graphviz.

@@ -24,6 +24,8 @@ n-gram smoothing for improved alignment quality.
 import numpy as np
 import copy
 import logging
+import time
+import sys
 from collections import deque, Counter
 from heapq import heappush, heappop
 from typing import Callable, Dict, List, Optional, Set, Tuple, Any, Union
@@ -1415,6 +1417,8 @@ class PetriNet:
         cost_fn: Callable[[float, str], float],
         chunk_size: int = 10,
         eps: float = 1e-12,
+        inline_progress: bool = False,
+        progress_prefix: str = "",
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1436,16 +1440,34 @@ class PetriNet:
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
 
+        total_start = time.perf_counter()
+
+        total_chunks = (n_ts + chunk_size - 1) // chunk_size
+        # Suppress sequential info notifications; only inline progress or total summary
+
         for chunk_idx, start_ts in enumerate(range(0, n_ts, chunk_size)):
+            # In-place progress update
+            if inline_progress:
+                try:
+                    prefix = (progress_prefix + " ") if progress_prefix else ""
+                    sys.stdout.write(f"\r{prefix}chunk {chunk_idx + 1}/{total_chunks}")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             end_ts = min(start_ts + chunk_size, n_ts)
             chunk = softmax_matrix[:, start_ts:end_ts]
 
+            chunk_start = time.perf_counter()
             result = self.partial_trace_conformance(
                 softmax_matrix=chunk,
                 initial_marking=current_marking,
                 cost_fn=cost_fn,
                 eps=eps
             )
+            chunk_end = time.perf_counter()
+            elapsed = chunk_end - chunk_start
+            num_steps = end_ts - start_ts
+            rate = (num_steps / elapsed) if elapsed > 0 else float('inf')
 
             # Accumulate
             total_cost += result['total_cost']
@@ -1458,8 +1480,26 @@ class PetriNet:
                 'end_timestamp': end_ts,
                 'chunk_cost': result['total_cost'],
                 'chunk_alignment_length': len(result['alignment']),
-                'final_marking': result['final_marking']
+                'final_marking': result['final_marking'],
+                'processing_seconds': elapsed,
+                'processing_rate_steps_per_s': rate,
             })
+
+            # Skip per-chunk info logs; show only inline progress and the total summary
+
+        total_elapsed = time.perf_counter() - total_start
+        total_rate = (n_ts / total_elapsed) if total_elapsed > 0 else float('inf')
+        # Finish the in-place progress line
+        if inline_progress:
+            try:
+                sys.stdout.write("\r")
+                sys.stdout.flush()
+            except Exception:
+                pass
+        logger.info(
+            f"Conformance total {n_ts} steps in {total_elapsed:.3f}s "
+            f"({total_rate:.1f} steps/s) across {len(chunk_results)} chunks"
+        )
 
         return {
             'alignment': complete_alignment,
@@ -1476,6 +1516,8 @@ class PetriNet:
         cost_fn: Callable[[float, str], float],
         chunk_size: int = 10,
         eps: float = 1e-12,
+        inline_progress: bool = False,
+        progress_prefix: str = "",
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1501,7 +1543,9 @@ class PetriNet:
             initial_marking=self.init_mark,
             cost_fn=cost_fn,
             chunk_size=chunk_size,
-            eps=eps
+            eps=eps,
+            inline_progress=inline_progress,
+            progress_prefix=progress_prefix,
         )
         
         # Extract sequence and costs from alignment

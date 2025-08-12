@@ -293,6 +293,8 @@ def process_test_case_hybrid(
     conformance_chunk_size: int = 10,
     conformance_eps: float = 1e-12,
     decider: Optional[Callable[[int, np.ndarray, BeamCandidate, "PetriNet"], Optional[int]]] = None,
+    # Agreement-based conformance settings
+    min_disagree_run: int = 1,
 ) -> Tuple[List[str], List[float]]:
     """
     Hybrid recovery: run beam search, but when the provided `decider` indicates,
@@ -337,6 +339,12 @@ def process_test_case_hybrid(
     patience = 0
     completed: List["BeamCandidate"] = []
     prev_active_keys: "set[Tuple[Tuple[int, ...], int]]" = set()
+
+    # Pre-compute argmax labels for agreement tracking
+    argmax_labels = [str(int(i)) for i in np.argmax(softmax_matrix, axis=0)]
+    # Track contiguous runs of disagreement between best path and argmax
+    disagree_start: Optional[int] = None
+    candidate_at_disagree_start: Optional[BeamCandidate] = None
 
     # Helper: apply conformance on the best candidate for a given chunk length
     def _apply_conformance(best: BeamCandidate, chunk_len: int) -> BeamCandidate:
@@ -386,26 +394,29 @@ def process_test_case_hybrid(
     while iteration < max_iterations:
         iteration += 1
 
-        # Optionally switch to conformance for a chunk based on decider
-        best_now = beam_state.get_best_candidate()
-        if best_now is None:
+        # Snapshot current best before any expansion to detect where a run starts
+        best_before = beam_state.get_best_candidate()
+        if best_before is None:
             logger.info("Active beam is empty. Stopping hybrid search.")
             break
+
+        # Optionally switch to conformance for a chunk based on external decider
         if decider is not None:
             try:
-                remaining = softmax_matrix[:, best_now.timestamp:]
-                chunk_len = decider(best_now.timestamp, remaining, best_now, model)
+                remaining = softmax_matrix[:, best_before.timestamp:]
+                chunk_len = decider(best_before.timestamp, remaining, best_before, model)
             except Exception as exc:
                 logger.warning(f"Hybrid decider errored ({exc}); continuing with beam search.")
                 chunk_len = None
             if isinstance(chunk_len, int) and chunk_len > 0:
                 # Apply conformance to best candidate and continue
-                updated_best = _apply_conformance(best_now, chunk_len)
+                updated_best = _apply_conformance(best_before, chunk_len)
                 beam_state.candidates = [updated_best]
+                # Reset any disagreement tracking since timeline changed
+                disagree_start = None
+                candidate_at_disagree_start = None
                 if updated_best.timestamp >= n_timestamps:
-                    # If we completed, allow a few more rounds then stop
                     first_completion_found = True
-                # Continue to next iteration without expanding the beam this round
                 if first_completion_found:
                     patience += 1
                     if patience >= completion_patience:
@@ -446,6 +457,52 @@ def process_test_case_hybrid(
             break
         prev_active_keys = active_keys
         beam_state.candidates = active
+
+        # Agreement-based conformance: detect disagreement runs and align them via conformance
+        best_after = beam_state.get_best_candidate()
+        if best_after is not None:
+            # Check if we advanced in timestamps this round (i.e., produced a new label)
+            if best_after.timestamp > best_before.timestamp:
+                step_idx = best_after.timestamp - 1  # last produced timestamp
+                if 0 <= step_idx < n_timestamps:
+                    predicted_label = best_after.path[-1] if best_after.path else None
+                    argmax_label = argmax_labels[step_idx]
+                    if predicted_label is not None and predicted_label != argmax_label:
+                        # Start of a disagreement run
+                        if disagree_start is None:
+                            disagree_start = step_idx
+                            candidate_at_disagree_start = best_before.copy()
+                    else:
+                        # We are in agreement at this step; if a run was active, close and align it
+                        if disagree_start is not None:
+                            run_len = step_idx - disagree_start
+                            if run_len >= min_disagree_run:
+                                updated_best = _apply_conformance(candidate_at_disagree_start, run_len)
+                                beam_state.candidates = [updated_best]
+                                # If updated completes, mark completion
+                                if updated_best.timestamp >= n_timestamps:
+                                    completed.append(updated_best)
+                                    first_completion_found = True
+                                # Reset tracking
+                                disagree_start = None
+                                candidate_at_disagree_start = None
+                            else:
+                                # Run too short; discard tracking
+                                disagree_start = None
+                                candidate_at_disagree_start = None
+
+            # If we reached the end while in a disagreement run, align the tail
+            if best_after.timestamp >= n_timestamps and disagree_start is not None:
+                run_len_tail = n_timestamps - disagree_start
+                if run_len_tail >= min_disagree_run:
+                    updated_best = _apply_conformance(candidate_at_disagree_start, run_len_tail)
+                    beam_state.candidates = [updated_best]
+                    if updated_best.timestamp >= n_timestamps:
+                        completed.append(updated_best)
+                        first_completion_found = True
+                # Reset tracking regardless
+                disagree_start = None
+                candidate_at_disagree_start = None
 
         if first_completion_found:
             patience += 1
