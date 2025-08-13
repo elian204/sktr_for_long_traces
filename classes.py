@@ -984,6 +984,9 @@ class PetriNet:
         return self.get_tau_reachable_transitions(self.final_mark, max_tau_depth)
     
 
+    # [removed] validation helpers (_compute_tau_closure_naive, validate_marking_transition_map, explain_marking_transitions)
+
+
     def dijkstra_no_rg_construct(
         self,
         prob_dict: Optional[Dict[Any, float]] = None,
@@ -1288,23 +1291,48 @@ class PetriNet:
         start = SearchNode(marking=initial_marking, cost=0.0, timestamp=0, last_label=None, path_prefix=tuple())
         heapq.heappush(open_set, (0.0, start))
 
-        # Best-known cost per (marking.places, timestamp)
-        best: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
+        # If switch penalties are active, the future cost depends on last_label.
+        # Extend the state with last_label to preserve optimality under pruning.
+        use_last_label_in_state: bool = switch_penalty_weight > 0.0
+
+        def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str]):
+            return (places, ts, last_label) if use_last_label_in_state else (places, ts)
+
+        # Best-known cost per state key
+        best: Dict[Any, float] = defaultdict(lambda: float('inf'))
+        # Additional dominance pruning across last_label for the same (places, timestamp):
+        # Any two nodes that only differ in last_label can differ at most by one switch penalty
+        # before the next timestamp advance. If a node is already worse than the current best
+        # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
+        best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
 
         while open_set:
             cost, node = heapq.heappop(open_set)
-            key = (node.marking.places, node.timestamp)
+            unlabeled_key = (node.marking.places, node.timestamp)
+            # Dominance prune across different last_label variants
+            if switch_penalty_weight > 0.0:
+                current_best_unlabeled = best_unlabeled[unlabeled_key]
+                # Max possible advantage from a favorable last_label on the very next step
+                max_advantage = switch_penalty_weight
+                if cost > current_best_unlabeled + max_advantage + 1e-12:
+                    continue
+
+            key = make_key(node.marking.places, node.timestamp, node.last_label)
             if cost > best[key]:
                 continue
             best[key] = cost
+            # Update unlabeled best after acceptance
+            if cost < best_unlabeled[unlabeled_key]:
+                best_unlabeled[unlabeled_key] = cost
 
             # Goal reached: consumed all timestamps
             if node.timestamp == n_ts:
-                return {
+                result = {
                     'alignment': node.reconstruct_path(),
                     'total_cost': node.cost,
                     'final_marking': node.marking
                 }
+                return result
 
             enabled = self._find_available_transitions(node.marking.places)
 
@@ -1329,7 +1357,7 @@ class PetriNet:
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + tau_cost_total + c
-                new_key = (new_mark.places, node.timestamp)
+                new_key = make_key(new_mark.places, node.timestamp, node.last_label)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
                         new_cost,
@@ -1364,7 +1392,7 @@ class PetriNet:
                         add_switch = switch_penalty_weight * p_stay
 
                     new_cost = cost + c + add_switch
-                    new_key = (node.marking.places, node.timestamp + 1)
+                    new_key = make_key(node.marking.places, node.timestamp + 1, label)
                     if new_cost < best.get(new_key, float('inf')):
                         heapq.heappush(open_set, (
                             new_cost,
@@ -1419,7 +1447,7 @@ class PetriNet:
                     add_switch = switch_penalty_weight * p_stay
 
                 new_cost = cost + tau_cost_total + c + add_switch
-                new_key = (new_mark.places, node.timestamp + 1)
+                new_key = make_key(new_mark.places, node.timestamp + 1, t.label)
                 if new_cost < best.get(new_key, float('inf')):
                     heapq.heappush(open_set, (
                         new_cost,
