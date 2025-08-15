@@ -329,6 +329,8 @@ def incremental_softmax_recovery(
     marking_transition_map = model.build_marking_transition_map()
     logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
 
+    # [removed] validation logging
+
 
     # 8. Conditional probabilities (build when needed)
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
