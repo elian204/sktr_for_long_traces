@@ -1268,6 +1268,7 @@ class PetriNet:
         eps: float = 1e-12,
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
+        initial_last_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1288,7 +1289,14 @@ class PetriNet:
 
         # Min-heap of (cost, node)
         open_set: List[Tuple[float, SearchNode]] = []
-        start = SearchNode(marking=initial_marking, cost=0.0, timestamp=0, last_label=None, path_prefix=tuple())
+        # Carry over last emitted label if provided (to pay switch penalty at window start)
+        start = SearchNode(
+            marking=initial_marking,
+            cost=0.0,
+            timestamp=0,
+            last_label=initial_last_label,
+            path_prefix=tuple(),
+        )
         heapq.heappush(open_set, (0.0, start))
 
         # If switch penalties are active, the future cost depends on last_label.
@@ -1478,6 +1486,7 @@ class PetriNet:
         progress_prefix: str = "",
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
+        initial_last_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1495,6 +1504,8 @@ class PetriNet:
             raise ValueError("chunk_size must be positive")
 
         current_marking = initial_marking
+        # Track last emitted label across chunks to apply switch penalty at boundaries
+        current_last_label: Optional[str] = initial_last_label
         total_cost = 0.0
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
@@ -1524,6 +1535,7 @@ class PetriNet:
                 eps=eps,
                 prob_dict=prob_dict,
                 switch_penalty_weight=switch_penalty_weight,
+                initial_last_label=current_last_label,
             )
             chunk_end = time.perf_counter()
             elapsed = chunk_end - chunk_start
@@ -1534,6 +1546,13 @@ class PetriNet:
             total_cost += result['total_cost']
             complete_alignment.extend(result['alignment'])
             current_marking = result['final_marking']
+
+            # Update last emitted label from this chunk's alignment, if any
+            # Look for the last move that advances the trace (sync/log)
+            for move_type, move_label, _ in reversed(result['alignment']):
+                if move_type in ('sync', 'log'):
+                    current_last_label = move_label
+                    break
 
             chunk_results.append({
                 'chunk_index': chunk_idx,
