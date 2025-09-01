@@ -1486,7 +1486,6 @@ class PetriNet:
         progress_prefix: str = "",
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
-        initial_last_label: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1499,13 +1498,14 @@ class PetriNet:
             chunk_size: Size of chunks to process
             eps: Minimum probability threshold - activities below this are filtered out
         """
-        n_acts, n_ts = softmax_matrix.shape
+        _, n_ts = softmax_matrix.shape
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
 
         current_marking = initial_marking
         # Track last emitted label across chunks to apply switch penalty at boundaries
-        current_last_label: Optional[str] = initial_last_label
+        # First window should not have any passing label, subsequent windows should
+        current_last_label: Optional[str] = None
         total_cost = 0.0
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
