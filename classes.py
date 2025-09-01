@@ -255,14 +255,28 @@ class PetriNet:
         self.reachability_graph = None
         self.cost_function = None
         self.conditioned_prob_compute = conditioned_prob_compute
-        self.alive_transitions_map = None   
-        
+        self.alive_transitions_map = None
+
         # Build indices safely
         self._build_indices()
         self._finalized = False
         self._enabled_cache = {}
         self._cache_max_size = 10000
         self._use_cache = False  # Initialize caching as disabled by default
+
+        # Memory optimization: lazy loading for marking transition map
+        self._marking_transition_map = None
+        self._marking_transition_map_max_tau = None
+
+    @property
+    def marking_transition_map(self):
+        """Lazy-loaded marking transition map."""
+        return self._marking_transition_map
+
+    @marking_transition_map.setter
+    def marking_transition_map(self, value):
+        """Set the marking transition map."""
+        self._marking_transition_map = value
 
     def finalize(self) -> None:
         """Prepare all transitions for optimized operations."""
@@ -557,14 +571,15 @@ class PetriNet:
         return available_transitions
 
 
-    def _find_available_transitions(self, mark_tuple: Tuple[int, ...]) -> List[Transition]:
+    def _find_available_transitions(self, mark_tuple: Tuple[int, ...], max_tau_depth: int = 100) -> List[Transition]:
         # Use cache if enabled
         if self._use_cache and mark_tuple in self._enabled_cache:
             return self._enabled_cache[mark_tuple]
         
-        # Your existing implementation (which is correct)
-        if hasattr(self, "marking_transition_map") and self.marking_transition_map is not None:
-            entry = self.marking_transition_map.get(mark_tuple)
+        # Use lazy loading for marking transition map
+        transition_map = self.get_or_build_marking_transition_map(max_tau_depth)
+        if transition_map is not None:
+            entry = transition_map.get(mark_tuple)
             if entry and "available_transitions" in entry:
                 # Return the list of non-silent transitions reachable via tau-moves
                 result = list(entry["available_transitions"].keys())
@@ -848,104 +863,140 @@ class PetriNet:
     ) -> Dict[Transition, Tuple[Transition, ...]]:
         """
         Compute all non-silent transitions reachable from marking_places via τ-moves.
-        
+
         Returns a mapping from each reachable non-silent transition to the shortest
         τ-path that enables it.
         """
         if max_tau_depth <= 0:
             raise ValueError("max_tau_depth must be positive")
-        
+
         reachable_transitions: Dict[Transition, Tuple[Transition, ...]] = {}
         queue = deque([(marking_places, tuple())])
         visited_markings: Dict[Tuple[int, ...], int] = {marking_places: 0}
-        
+
+        # Early exit if no silent transitions exist
+        has_tau_transitions = any(t.label is None for t in self.transitions)
+        if not has_tau_transitions:
+            # No tau transitions, so just return directly enabled non-silent transitions
+            try:
+                enabled = self._find_directly_enabled_transitions(marking_places)
+                for transition in enabled:
+                    if transition.label is not None:
+                        reachable_transitions[transition] = tuple()
+                return reachable_transitions
+            except Exception:
+                return {}
+
         while queue:
             current_marking, tau_path = queue.popleft()
-            
+
             # Skip if we've seen this marking with a shorter path
             if visited_markings.get(current_marking, float('inf')) < len(tau_path):
                 continue
-            
+
             try:
                 enabled_transitions = self._find_directly_enabled_transitions(current_marking)
             except Exception as exc:
                 logger.warning(f"Could not get transitions for marking {current_marking}: {exc}")
                 continue
-            
-            for transition in enabled_transitions:
-                if transition.label is None:  # τ transition
-                    if len(tau_path) >= max_tau_depth:
-                        continue
-                        
-                    try:
-                        successor = self._fire_transition(
-                            Marking(current_marking), 
-                            transition
-                        )
-                        new_tau_path = tau_path + (transition,)
-                        
-                        if len(new_tau_path) <= visited_markings.get(successor.places, float('inf')):
-                            visited_markings[successor.places] = len(new_tau_path)
-                            queue.append((successor.places, new_tau_path))
-                            
-                    except Exception as exc:
-                        logger.warning(f"Could not fire τ transition {transition.name}: {exc}")
-                else:  # Non-silent transition
-                    if transition not in reachable_transitions or len(tau_path) < len(reachable_transitions[transition]):
-                        reachable_transitions[transition] = tau_path
-        
+
+            # Process tau transitions first (more common)
+            tau_transitions = [t for t in enabled_transitions if t.label is None]
+            visible_transitions = [t for t in enabled_transitions if t.label is not None]
+
+            # Handle visible transitions (can be reached immediately)
+            for transition in visible_transitions:
+                if transition not in reachable_transitions or len(tau_path) < len(reachable_transitions[transition]):
+                    reachable_transitions[transition] = tau_path
+
+            # Handle tau transitions
+            for transition in tau_transitions:
+                if len(tau_path) >= max_tau_depth:
+                    continue
+
+                try:
+                    successor = self._fire_transition(
+                        Marking(current_marking),
+                        transition
+                    )
+                    new_tau_path = tau_path + (transition,)
+
+                    if len(new_tau_path) <= visited_markings.get(successor.places, float('inf')):
+                        visited_markings[successor.places] = len(new_tau_path)
+                        queue.append((successor.places, new_tau_path))
+
+                except Exception as exc:
+                    logger.warning(f"Could not fire τ transition {transition.name}: {exc}")
+
         return reachable_transitions
 
 
+    def get_or_build_marking_transition_map(self, max_tau_depth: int = 100) -> Dict[Tuple[int, ...], Dict]:
+        """Get existing marking transition map or build it with lazy loading."""
+        if (self._marking_transition_map is None or
+            self._marking_transition_map_max_tau != max_tau_depth):
+            logger.info(f"Building marking transition map (lazy loading) with max_tau_depth={max_tau_depth}")
+            self._marking_transition_map = self.build_marking_transition_map(max_tau_depth)
+            self._marking_transition_map_max_tau = max_tau_depth
+        return self._marking_transition_map
+
     def build_marking_transition_map(self, max_tau_depth: int = 100) -> Dict[Tuple[int, ...], Dict]:
-        """Build complete marking-to-transition map and store on self."""
+        """Build complete marking-to-transition map and store on self with optimizations."""
         if self.init_mark is None:
             raise ValueError("Initial marking must be set before building transition map")
         if max_tau_depth <= 0:
             raise ValueError("max_tau_depth must be positive")
-        
+
         # Ensure optimization before heavy computation
         if not self._finalized:
             self.finalize()
-        
+
         result: Dict[Tuple[int, ...], Dict] = {}
         visited = set()
         queue = deque([self.init_mark.places])
-        
+
+        # Pre-compute directly enabled transitions for all markings we encounter
+        direct_enabled_cache: Dict[Tuple[int, ...], List[Transition]] = {}
+
         while queue:
             current_marking = queue.popleft()
-            
+
             if current_marking in visited:
                 continue
             visited.add(current_marking)
-            
+
             # Compute τ-reachable transitions
             try:
                 tau_reachable = self._compute_reachable_transitions_via_tau(
                     current_marking, max_tau_depth
                 )
                 result[current_marking] = {"available_transitions": tau_reachable}
-                
-                # Add successors to queue
-                try:
-                    enabled_transitions = self._find_directly_enabled_transitions(current_marking)
-                    for transition in enabled_transitions:
-                        try:
-                            successor = self._fire_transition(
-                                Marking(current_marking), 
-                                transition
-                            )
-                            if successor.places not in visited:
-                                queue.append(successor.places)
-                        except Exception as exc:
-                            logger.warning(f"Could not fire {transition.name} from {current_marking}: {exc}")
-                except Exception as exc:
-                    logger.warning(f"Could not get transitions for marking {current_marking}: {exc}")
-                        
+
+                # Cache directly enabled transitions
+                if current_marking not in direct_enabled_cache:
+                    try:
+                        direct_enabled_cache[current_marking] = self._find_directly_enabled_transitions(current_marking)
+                    except Exception:
+                        direct_enabled_cache[current_marking] = []
+
+                # Add successors to queue using cached transitions
+                enabled_transitions = direct_enabled_cache[current_marking]
+                for transition in enabled_transitions:
+                    try:
+                        successor = self._fire_transition(
+                            Marking(current_marking),
+                            transition
+                        )
+                        if successor.places not in visited and successor.places not in direct_enabled_cache:
+                            # Pre-compute enabled transitions for successor to avoid recomputation
+                            direct_enabled_cache[successor.places] = self._find_directly_enabled_transitions(successor.places)
+                            queue.append(successor.places)
+                    except Exception as exc:
+                        logger.warning(f"Could not fire {transition.name} from {current_marking}: {exc}")
             except Exception as exc:
                 logger.warning(f"Could not compute τ-reachability for {current_marking}: {exc}")
                 result[current_marking] = {"available_transitions": {}}
-        
+
         self.marking_transition_map = result
         logger.info(f"Built marking transition map with {len(result)} markings")
         return result
@@ -1269,6 +1320,7 @@ class PetriNet:
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         initial_last_label: Optional[str] = None,
+        state_cache: Optional[Dict] = None,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1306,8 +1358,8 @@ class PetriNet:
         def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str]):
             return (places, ts, last_label) if use_last_label_in_state else (places, ts)
 
-        # Best-known cost per state key
-        best: Dict[Any, float] = defaultdict(lambda: float('inf'))
+        # Best-known cost per state key - use provided cache or create new
+        best: Dict[Any, float] = state_cache if state_cache is not None else defaultdict(lambda: float('inf'))
         # Additional dominance pruning across last_label for the same (places, timestamp):
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
         # before the next timestamp advance. If a node is already worse than the current best
@@ -1486,6 +1538,7 @@ class PetriNet:
         progress_prefix: str = "",
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
+        use_state_caching: bool = True,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1509,6 +1562,9 @@ class PetriNet:
         total_cost = 0.0
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
+
+        # State caching for improved performance across chunks
+        state_cache: Optional[Dict] = {} if use_state_caching else None
 
         total_start = time.perf_counter()
 
@@ -1536,6 +1592,7 @@ class PetriNet:
                 prob_dict=prob_dict,
                 switch_penalty_weight=switch_penalty_weight,
                 initial_last_label=current_last_label,
+                state_cache=state_cache,
             )
             chunk_end = time.perf_counter()
             elapsed = chunk_end - chunk_start

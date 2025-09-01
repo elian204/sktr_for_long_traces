@@ -20,6 +20,7 @@ def process_trace_chunked(
     progress_prefix: str = "",
     prob_dict: Optional[Mapping[Tuple[str, ...], Mapping[str, float]]] = None,
     switch_penalty_weight: float = 0.0,
+    use_state_caching: bool = True,
 ) -> Tuple[List[str], List[float]]:
     """
     Drop-in replacement for process_test_case_beam_search using chunked conformance checking.
@@ -48,4 +49,5 @@ def process_trace_chunked(
         progress_prefix=progress_prefix,
         prob_dict=prob_dict,
         switch_penalty_weight=switch_penalty_weight,
+        use_state_caching=use_state_caching,
     )

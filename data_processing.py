@@ -225,6 +225,11 @@ def _sample_sequential_indices(
     rng: random.Random,
 ) -> List[int]:
     """
+    Sample events sequentially from each run of identical activities.
+
+    This is an optimized version that uses vectorized operations where possible.
+    """
+    """
     Sample up to `n_per_run` positions from each maximal run of identical
     'concept:name' values within the trace. Indices are returned sorted.
 

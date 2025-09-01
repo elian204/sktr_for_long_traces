@@ -10,6 +10,8 @@ from typing import Any, Callable, List, Optional, Tuple, Union, Dict
 import logging
 import pandas as pd
 import numpy as np
+import concurrent.futures
+import multiprocessing
 from utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from petri_model import discover_petri_net, build_probability_dict
@@ -43,6 +45,82 @@ def setup_logging(level=logging.INFO):
             logging.StreamHandler()
         ]
     )
+
+
+def _process_single_test_case(
+    case_id: str,
+    softmax_matrix: np.ndarray,
+    test_df: pd.DataFrame,
+    model: Any,
+    cost_fn: Callable,
+    recovery_method: str,
+    prob_threshold: float,
+    prob_dict: Dict,
+    # Recovery method specific parameters
+    chunk_size: int,
+    beam_width: int,
+    alpha: float,
+    beam_score_alpha: float,
+    completion_patience: int,
+    use_cond_probs: bool,
+    conformance_switch_penalty_weight: float,
+    use_state_caching: bool,
+) -> Tuple[str, List[str], List[float], float, float]:
+    """
+    Process a single test case. Used for parallel processing.
+
+    Returns:
+        Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy)
+    """
+    # Extract ground truth sequence for accuracy computation
+    ground_truth_trace = test_df[test_df['case:concept:name'] == case_id].copy().reset_index(drop=True)
+    ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+
+    # Compute argmax predictions
+    argmax_indices = np.argmax(softmax_matrix, axis=0)
+    argmax_preds = [str(idx) for idx in argmax_indices]
+
+    # Get predicted sequence using selected recovery method
+    if recovery_method == "conformance":
+        sktr_preds, sktr_move_costs = process_trace_chunked(
+            softmax_matrix=softmax_matrix,
+            model=model,
+            cost_fn=cost_fn,
+            chunk_size=chunk_size,
+            eps=prob_threshold,
+            inline_progress=False,  # Disable progress for parallel processing
+            prob_dict=prob_dict,
+            switch_penalty_weight=conformance_switch_penalty_weight,
+            use_state_caching=use_state_caching,
+        )
+    elif recovery_method == "beam_search":
+        sktr_preds, sktr_move_costs = process_test_case_beam_search(
+            softmax_matrix=softmax_matrix,
+            model=model,
+            cost_fn=cost_fn,
+            beam_width=beam_width,
+            alpha=alpha,
+            use_cond_probs=use_cond_probs,
+            prob_dict=prob_dict,
+            activity_prob_threshold=prob_threshold,
+            beam_score_alpha=beam_score_alpha,
+            completion_patience=completion_patience,
+        )
+    else:
+        raise ValueError(f"Unsupported recovery method: {recovery_method}")
+
+    # Compute accuracy
+    records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
+        case_id=case_id,
+        sktr_preds=sktr_preds,
+        argmax_preds=argmax_preds,
+        ground_truth_sequence=ground_truth_sequence,
+        softmax_matrix=softmax_matrix,
+        activity_prob_threshold=prob_threshold,
+        sktr_move_costs=sktr_move_costs
+    )
+
+    return case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df
 
 
 def incremental_softmax_recovery(
@@ -83,6 +161,12 @@ def incremental_softmax_recovery(
     chunk_size: int = 10,
     # Conformance-specific: switch penalty weight on label change (uses bigram prob_dict)
     conformance_switch_penalty_weight: float = 0.0,
+    # Performance optimization parameters
+    adaptive_chunk_sizing: bool = True,
+    max_chunk_size: int = 50,
+    use_state_caching: bool = True,
+    parallel_processing: bool = False,
+    max_workers: Optional[int] = None,
     # Hybrid-specific parameters
     hybrid_conformance_chunk_size: int = 10,
     hybrid_conformance_eps: float = 1e-12,
@@ -377,92 +461,151 @@ def incremental_softmax_recovery(
     test_case_ids = test_df['case:concept:name'].drop_duplicates().tolist()
     logger.info(f"Extracted {len(test_case_ids)} test case IDs for processing.")
     
-    # 11. Incremental beam-search recovery
+    # 11. Incremental recovery with optional parallel processing
     recovery_records: List[dict] = []
     sktr_accs: List[float] = []
     argmax_accs: List[float] = []
-    for idx, (case, softmax_matrix) in enumerate(
-        zip(test_case_ids, test_softmax_matrices), start=1
-    ):
-        # In-place progress update for traces (single updating line)
-        try:
-            sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — {recovery_method}")
-            sys.stdout.flush()
-        except Exception:
-            pass
-        # Avoid extra per-trace INFO logs when using inline progress
-        logger.debug(
-            f"Processing test case {idx}/{len(test_case_ids)} ({case}) using '{recovery_method}'"
-        )
-        
-        # Get predicted sequence using selected recovery method
-        if recovery_method == "conformance":
-            sktr_preds, sktr_move_costs = process_trace_chunked(
-                softmax_matrix=softmax_matrix,
-                model=model,
-                cost_fn=cost_fn,
-                chunk_size=chunk_size,
-                eps=prob_threshold,
-                inline_progress=True,
-                progress_prefix=f"case {idx}/{len(test_case_ids)}",
-                prob_dict=prob_dict,
-                switch_penalty_weight=conformance_switch_penalty_weight,
-            )
-        elif recovery_method == "beam_search":
-            sktr_preds, sktr_move_costs = process_test_case_beam_search(
-                softmax_matrix=softmax_matrix,
-                model=model,
-                cost_fn=cost_fn,
-                beam_width=beam_width,
-                alpha=alpha,
-                use_cond_probs=use_cond_probs,
-                prob_dict=prob_dict,
-                activity_prob_threshold=prob_threshold,
-                beam_score_alpha=beam_score_alpha,
-                completion_patience=completion_patience,
-            )
-        elif recovery_method == "hybrid":
-            sktr_preds, sktr_move_costs = process_test_case_hybrid(
-                softmax_matrix=softmax_matrix,
-                model=model,
-                cost_fn=cost_fn,
-                beam_width=beam_width,
-                alpha=alpha,
-                use_cond_probs=use_cond_probs,
-                prob_dict=prob_dict,
-                activity_prob_threshold=prob_threshold,
-                beam_score_alpha=beam_score_alpha,
-                completion_patience=completion_patience,
-                conformance_chunk_size=hybrid_conformance_chunk_size,
-                conformance_eps=hybrid_conformance_eps,
-                decider=hybrid_decider,
-                min_disagree_run=hybrid_min_disagree_run,
-            )
+
+    # Adaptive chunk sizing based on model complexity (for sequential processing)
+    effective_chunk_size = chunk_size
+    if adaptive_chunk_sizing and not parallel_processing:
+        # Scale chunk size based on model complexity (places + transitions)
+        model_complexity = len(model.places) + len(model.transitions)
+        # Conservative heuristic: slightly smaller chunks for very complex models
+        # to avoid exponential search space growth
+        if model_complexity > 100:
+            # Reduce chunk size for very complex models to control search space
+            complexity_factor = max(0.7, 100 / model_complexity)  # Min 0.7x
+            effective_chunk_size = max(5, int(chunk_size * complexity_factor))
+        elif model_complexity > 50:
+            # Keep original size for moderately complex models
+            effective_chunk_size = chunk_size
         else:
-            raise ValueError(f"Unsupported recovery method: {recovery_method}")
-        
-        # Extract ground truth sequence for accuracy computation
-        ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
-        ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
-        
-        # Compute argmax predictions
-        argmax_indices = np.argmax(softmax_matrix, axis=0)
-        argmax_preds = [str(idx) for idx in argmax_indices]
-        
-        # Compute accuracy and create records
-        records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
-            case_id=case,
-            sktr_preds=sktr_preds,
-            argmax_preds=argmax_preds,
-            ground_truth_sequence=ground_truth_sequence,
-            softmax_matrix=softmax_matrix,
-            activity_prob_threshold=prob_threshold,
-            sktr_move_costs=sktr_move_costs
-        )
-        recovery_records.extend(records_df.to_dict('records'))
-        sktr_accs.append(sktr_acc)
-        argmax_accs.append(argmax_acc)
-        logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+            # Slightly increase for simple models (less overhead)
+            complexity_factor = min(model_complexity / 50, 1.5)  # Max 1.5x
+            effective_chunk_size = min(int(chunk_size * complexity_factor), max_chunk_size)
+
+        if effective_chunk_size != chunk_size:
+            logger.debug(f"Using adaptive chunk size: {effective_chunk_size} (base: {chunk_size}, complexity: {model_complexity})")
+
+    if parallel_processing and len(test_case_ids) > 1:
+        # Parallel processing
+        logger.info(f"Processing {len(test_case_ids)} test cases in parallel")
+
+        # Determine number of workers
+        n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
+        logger.info(f"Using {n_workers} parallel workers")
+
+        # Prepare arguments for parallel processing
+        parallel_args = []
+        for case, softmax_matrix in zip(test_case_ids, test_softmax_matrices):
+            args = (
+                case, softmax_matrix, test_df, model, cost_fn, recovery_method,
+                prob_threshold, prob_dict, effective_chunk_size, beam_width, alpha,
+                beam_score_alpha, completion_patience, use_cond_probs,
+                conformance_switch_penalty_weight, use_state_caching
+            )
+            parallel_args.append(args)
+
+        # Process in parallel
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_process_single_test_case, *args) for args in parallel_args]
+
+            for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+                try:
+                    case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df = future.result()
+                    recovery_records.extend(records_df.to_dict('records'))
+                    sktr_accs.append(sktr_acc)
+                    argmax_accs.append(argmax_acc)
+                    logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+                except Exception as exc:
+                    logger.error(f"Parallel processing failed for case {idx}: {exc}")
+
+    else:
+        # Sequential processing
+        for idx, (case, softmax_matrix) in enumerate(
+            zip(test_case_ids, test_softmax_matrices), start=1
+        ):
+            # In-place progress update for traces (single updating line)
+            try:
+                sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — {recovery_method}")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            # Avoid extra per-trace INFO logs when using inline progress
+            logger.debug(
+                f"Processing test case {idx}/{len(test_case_ids)} ({case}) using '{recovery_method}'"
+            )
+
+            # Get predicted sequence using selected recovery method
+            if recovery_method == "conformance":
+                sktr_preds, sktr_move_costs = process_trace_chunked(
+                    softmax_matrix=softmax_matrix,
+                    model=model,
+                    cost_fn=cost_fn,
+                    chunk_size=effective_chunk_size,
+                    eps=prob_threshold,
+                    inline_progress=True,
+                    progress_prefix=f"case {idx}/{len(test_case_ids)}",
+                    prob_dict=prob_dict,
+                    switch_penalty_weight=conformance_switch_penalty_weight,
+                    use_state_caching=use_state_caching,
+                )
+            elif recovery_method == "beam_search":
+                sktr_preds, sktr_move_costs = process_test_case_beam_search(
+                    softmax_matrix=softmax_matrix,
+                    model=model,
+                    cost_fn=cost_fn,
+                    beam_width=beam_width,
+                    alpha=alpha,
+                    use_cond_probs=use_cond_probs,
+                    prob_dict=prob_dict,
+                    activity_prob_threshold=prob_threshold,
+                    beam_score_alpha=beam_score_alpha,
+                    completion_patience=completion_patience,
+                )
+            elif recovery_method == "hybrid":
+                sktr_preds, sktr_move_costs = process_test_case_hybrid(
+                    softmax_matrix=softmax_matrix,
+                    model=model,
+                    cost_fn=cost_fn,
+                    beam_width=beam_width,
+                    alpha=alpha,
+                    use_cond_probs=use_cond_probs,
+                    prob_dict=prob_dict,
+                    activity_prob_threshold=prob_threshold,
+                    beam_score_alpha=beam_score_alpha,
+                    completion_patience=completion_patience,
+                    conformance_chunk_size=hybrid_conformance_chunk_size,
+                    conformance_eps=hybrid_conformance_eps,
+                    decider=hybrid_decider,
+                    min_disagree_run=hybrid_min_disagree_run,
+                )
+            else:
+                raise ValueError(f"Unsupported recovery method: {recovery_method}")
+
+            # Extract ground truth sequence for accuracy computation
+            ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
+            ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+
+            # Compute argmax predictions
+            argmax_indices = np.argmax(softmax_matrix, axis=0)
+            argmax_preds = [str(idx) for idx in argmax_indices]
+
+            # Compute accuracy and create records
+            records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
+                case_id=case,
+                sktr_preds=sktr_preds,
+                argmax_preds=argmax_preds,
+                ground_truth_sequence=ground_truth_sequence,
+                softmax_matrix=softmax_matrix,
+                activity_prob_threshold=prob_threshold,
+                sktr_move_costs=sktr_move_costs
+            )
+            recovery_records.extend(records_df.to_dict('records'))
+            sktr_accs.append(sktr_acc)
+            argmax_accs.append(argmax_acc)
+            logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
 
     # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
