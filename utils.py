@@ -404,10 +404,17 @@ def prepare_df(
     dataset_name : str
         One of: '50salads', 'gtea', 'breakfast'.
     path : str or Path, optional
-        Base directory containing:
+        Base directory containing the dataset pickles. This can point either
+        directly to the directory with the files or to a parent directory that
+        contains a 'video' subfolder. If None, the function will try, in order:
+          1) Environment variables 'SKTR_DATASETS_DIR' and 'DATASETS_DIR' (both
+             the value itself and '<value>/video')
+          2) The user's home directory under 'Datasets/video' and 'Datasets'
+          3) Common project-relative locations: 'Datasets/video' and 'Datasets'
+             one, two, and three levels above this file
+        Required files:
           - {dataset_name}_softmax_lst.pickle
           - {dataset_name}_target_lst.pickle
-        If None, tries three common relative locations.
     return_mapping : bool, optional
         If True, returns the mapping dict as the third element.
 
@@ -428,14 +435,38 @@ def prepare_df(
 
     # 2) resolve path
     dirs_to_try = []
+
+    # If explicit path provided, prefer a 'video' child first, then the path itself
     if path:
-        dirs_to_try.append(Path(path))
+        base = Path(path)
+        dirs_to_try += [base / 'video', base]
     else:
+        # Environment variables
+        for env_var in ('SKTR_DATASETS_DIR', 'DATASETS_DIR'):
+            env_val = os.environ.get(env_var)
+            if env_val:
+                env_base = Path(env_val)
+                # Try the 'video' subfolder first
+                dirs_to_try += [env_base / 'video', env_base]
+
+        # Home directory conventions: ~/Datasets/video or ~/Datasets (common on servers)
+        home = Path.home()
+        dirs_to_try += [
+            home / 'Datasets' / 'video',
+            home / 'Datasets',
+            home / 'datasets' / 'video',
+            home / 'datasets',
+        ]
+
+        # Project-relative fallbacks
         here = Path(__file__).resolve().parent
         dirs_to_try += [
             here / 'Datasets' / 'video',
+            here / 'Datasets',
             here.parent / 'Datasets' / 'video',
-            here.parents[1] / 'Datasets' / 'video'
+            here.parent / 'Datasets',
+            here.parents[1] / 'Datasets' / 'video',
+            here.parents[1] / 'Datasets'
         ]
 
     for d in dirs_to_try:
@@ -443,7 +474,10 @@ def prepare_df(
             data_dir = d
             break
     else:
-        raise FileNotFoundError(f"Could not find Datasets/video in {dirs_to_try}")
+        raise FileNotFoundError(
+            "Could not locate dataset directory. Tried (in order): "
+            + ", ".join(str(p) for p in dirs_to_try)
+        )
 
     sf_path = data_dir / f"{dataset_name}_softmax_lst.pickle"
     tg_path = data_dir / f"{dataset_name}_target_lst.pickle"
