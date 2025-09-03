@@ -831,3 +831,38 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
         # If neither format worked, raise an exception
         if not saved_paths:
             raise RuntimeError("Failed to generate visualization in both PNG and PDF formats")
+
+
+def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute SKTR and Argmax accuracy for each case in the results DataFrame.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        DataFrame containing the results for recovered traces (must include
+        'case:concept:name', 'sktr_activity', 'argmax_activity', and 'ground_truth' columns).
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns ['case:concept:name', 'sktr_accuracy', 'argmax_accuracy'].
+        The last row contains the mean accuracy for both columns (case:concept:name = 'MEAN').
+    """
+    def _case_acc(group):
+        return pd.Series({
+            'sktr_accuracy': (group['sktr_activity'] == group['ground_truth']).mean(),
+            'argmax_accuracy': (group['argmax_activity'] == group['ground_truth']).mean()
+        })
+    acc_df = results_df.groupby('case:concept:name').apply(_case_acc, include_groups=False).reset_index()
+    # Compute mean accuracies
+    mean_sktr = acc_df['sktr_accuracy'].mean()
+    mean_argmax = acc_df['argmax_accuracy'].mean()
+    # Append mean row
+    mean_row = pd.DataFrame({
+        'case:concept:name': ['MEAN'],
+        'sktr_accuracy': [mean_sktr],
+        'argmax_accuracy': [mean_argmax]
+    })
+    acc_df = pd.concat([acc_df, mean_row], ignore_index=True)
+    return acc_df

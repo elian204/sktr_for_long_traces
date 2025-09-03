@@ -1378,7 +1378,7 @@ class PetriNet:
                     continue
 
             key = make_key(node.marking.places, node.timestamp, node.last_label)
-            if cost > best[key]:
+            if cost > best.get(key, float('inf')):
                 continue
             best[key] = cost
             # Update unlabeled best after acceptance
@@ -1563,8 +1563,9 @@ class PetriNet:
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
 
-        # State caching for improved performance across chunks
-        state_cache: Optional[Dict] = {} if use_state_caching else None
+        # State caching scoped per chunk to avoid cross-chunk pruning altering behavior
+        # (each chunk will get its own fresh cache)
+        state_cache: Optional[Dict] = None
 
         total_start = time.perf_counter()
 
@@ -1592,7 +1593,7 @@ class PetriNet:
                 prob_dict=prob_dict,
                 switch_penalty_weight=switch_penalty_weight,
                 initial_last_label=current_last_label,
-                state_cache=state_cache,
+                state_cache=({} if use_state_caching else None),
             )
             chunk_end = time.perf_counter()
             elapsed = chunk_end - chunk_start
@@ -1657,6 +1658,7 @@ class PetriNet:
         progress_prefix: str = "",
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
+        use_state_caching: bool = True,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1687,6 +1689,7 @@ class PetriNet:
             progress_prefix=progress_prefix,
             prob_dict=prob_dict,
             switch_penalty_weight=switch_penalty_weight,
+            use_state_caching=use_state_caching,
         )
         
         # Extract sequence and costs from alignment
