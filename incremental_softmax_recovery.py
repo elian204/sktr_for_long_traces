@@ -117,7 +117,8 @@ def _process_single_test_case(
         ground_truth_sequence=ground_truth_sequence,
         softmax_matrix=softmax_matrix,
         activity_prob_threshold=prob_threshold,
-        sktr_move_costs=sktr_move_costs
+        sktr_move_costs=sktr_move_costs,
+        chunk_size=chunk_size if recovery_method == "conformance" else None
     )
 
     return case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df
@@ -270,6 +271,8 @@ def incremental_softmax_recovery(
         DataFrame with columns:
           - case:concept:name, step, predicted_activity, ground_truth,
             beam_probability, is_correct, cumulative_accuracy
+        Note: 'step' column contains window-relative steps (0 to chunk_size-1 repeating)
+        when using conformance recovery method, otherwise uses global step numbering (0 to seq_len-1)
     accuracy_dict : Dict[str, List[float]]
         Dictionary with keys 'sktr_accuracy' and 'argmax_accuracy',
         each containing a list of per-trace accuracies (fraction of correct predictions in the trace).
@@ -600,7 +603,8 @@ def incremental_softmax_recovery(
                 ground_truth_sequence=ground_truth_sequence,
                 softmax_matrix=softmax_matrix,
                 activity_prob_threshold=prob_threshold,
-                sktr_move_costs=sktr_move_costs
+                sktr_move_costs=sktr_move_costs,
+                chunk_size=effective_chunk_size if recovery_method == "conformance" else None
             )
             recovery_records.extend(records_df.to_dict('records'))
             sktr_accs.append(sktr_acc)
@@ -631,11 +635,12 @@ def _compute_accuracy_records(
     ground_truth_sequence: List[str],
     softmax_matrix: np.ndarray,
     activity_prob_threshold: float = 0.0,
-    sktr_move_costs: List[float] = None
+    sktr_move_costs: List[float] = None,
+    chunk_size: int = None
 ) -> Tuple[pd.DataFrame, float, float]:
     """
     Compute accuracy records and trace-level accuracies by comparing SKTR, argmax, and ground truth sequences.
-    
+
     Parameters
     ----------
     case_id : str
@@ -646,16 +651,25 @@ def _compute_accuracy_records(
         Argmax predicted sequence
     ground_truth_sequence : List[str]
         Ground truth activity sequence
-        
+    activity_prob_threshold : float, default=0.0
+        Minimum probability threshold for activity filtering
+    sktr_move_costs : List[float], optional
+        Move costs for SKTR predictions
+    chunk_size : int, optional
+        Size of processing chunks. If provided, steps will be relative to each window (0 to chunk_size-1)
+        rather than global (0 to seq_len-1). If None, uses global step numbering.
+
     Returns
     -------
     pd.DataFrame
-        DataFrame with per-step accuracy metrics for SKTR predictions
+        DataFrame with per-step accuracy metrics for SKTR predictions.
+        Step column uses window-relative numbering (0 to chunk_size-1 repeating) if chunk_size provided,
+        otherwise uses global step numbering (0 to seq_len-1).
     float
         Trace-level SKTR accuracy (fraction correct)
     float
         Trace-level argmax accuracy (fraction correct)
-        
+
     Raises
     ------
     ValueError
@@ -693,10 +707,20 @@ def _compute_accuracy_records(
         all_probs_filtered.append(filtered_probs)
         all_activities_filtered.append(filtered_acts)
     
+    # Create window-relative steps
+    if chunk_size is not None and chunk_size > 0:
+        # Create steps within each window: 0, 1, 2, ..., chunk_size-1, 0, 1, 2, ...
+        window_steps = []
+        for i in range(seq_len):
+            window_steps.append(i % chunk_size)
+    else:
+        # Fall back to global steps if no chunk_size provided
+        window_steps = list(range(seq_len))
+
     # Add to data
     data = {
         'case:concept:name': [case_id] * seq_len,
-        'step': list(range(seq_len)),
+        'step': window_steps,
         'sktr_activity': sktr_preds,
         'argmax_activity': argmax_preds,
         'ground_truth': ground_truth_sequence,
