@@ -1321,6 +1321,7 @@ class PetriNet:
         switch_penalty_weight: float = 0.0,
         initial_last_label: Optional[str] = None,
         state_cache: Optional[Dict] = None,
+        restrict_to_observed_moves: bool = False,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1365,6 +1366,21 @@ class PetriNet:
         # before the next timestamp advance. If a node is already worse than the current best
         # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
         best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
+
+        # Helper: check if a labeled next move is observed in training
+        def _is_observed_next(label: str, last_label: Optional[str]) -> bool:
+            if not restrict_to_observed_moves:
+                return True
+            if not prob_dict:
+                # If restriction requested but no dictionary, disallow
+                return False
+            # Prefer bigram if available
+            if last_label is not None:
+                nexts = prob_dict.get((last_label,), {})
+                if label in nexts:
+                    return True
+            # Fallback to unigram: observed anywhere
+            return label in prob_dict.get((), {})
 
         while open_set:
             cost, node = heapq.heappop(open_set)
@@ -1413,7 +1429,6 @@ class PetriNet:
                 else:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
-
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + tau_cost_total + c
@@ -1478,6 +1493,9 @@ class PetriNet:
                 # Filter out activities below threshold (same as beam search)
                 if raw_p < eps:
                     continue
+                # Restrict labeled sync moves if requested
+                if not _is_observed_next(t.label, node.last_label):
+                    continue
                 p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
 
@@ -1540,6 +1558,7 @@ class PetriNet:
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
         merge_mismatched_boundaries: bool = True,
+        restrict_to_observed_moves: bool = False,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1634,6 +1653,7 @@ class PetriNet:
                     switch_penalty_weight=switch_penalty_weight,
                     initial_last_label=current_last_label,
                     state_cache=({} if use_state_caching else None),
+                    restrict_to_observed_moves=restrict_to_observed_moves,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
                 c1_steps = end_ts1 - start_ts
@@ -1680,6 +1700,7 @@ class PetriNet:
                 switch_penalty_weight=switch_penalty_weight,
                 initial_last_label=last_label_c1,
                 state_cache=({} if use_state_caching else None),
+                restrict_to_observed_moves=restrict_to_observed_moves,
             )
             c2_elapsed = time.perf_counter() - c2_start
             c2_steps = end_ts2 - end_ts1
@@ -1701,6 +1722,7 @@ class PetriNet:
                     switch_penalty_weight=switch_penalty_weight,
                     initial_last_label=state_before_chunk1_last_label,
                     state_cache=({} if use_state_caching else None),
+                    restrict_to_observed_moves=restrict_to_observed_moves,
                 )
                 m_elapsed = time.perf_counter() - m_start
                 m_steps = end_ts2 - start_ts
@@ -1795,6 +1817,7 @@ class PetriNet:
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
         merge_mismatched_boundaries: bool = True,
+        restrict_to_observed_moves: bool = False,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1827,6 +1850,7 @@ class PetriNet:
             switch_penalty_weight=switch_penalty_weight,
             use_state_caching=use_state_caching,
             merge_mismatched_boundaries=merge_mismatched_boundaries,
+            restrict_to_observed_moves=restrict_to_observed_moves,
         )
         
         # Extract sequence and costs from alignment

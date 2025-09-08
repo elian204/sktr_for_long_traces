@@ -22,6 +22,7 @@ def process_trace_chunked(
     switch_penalty_weight: float = 0.0,
     use_state_caching: bool = True,
     merge_mismatched_boundaries: bool = True,
+    restrict_to_observed_moves: bool = False,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -38,6 +39,7 @@ def process_trace_chunked(
         switch_penalty_weight: Weight for penalizing label switches across chunks
         use_state_caching: Enable caching of intermediate states for speed
         merge_mismatched_boundaries: If True, merge adjacent chunks when boundary labels disagree
+        restrict_to_observed_moves: If True, allow only labeled model/sync moves observed in training (per prob_dict)
     
     Returns:
         Tuple[List[str], List[float]]: (predicted_sequence, move_costs)
@@ -53,4 +55,5 @@ def process_trace_chunked(
         switch_penalty_weight=switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,
+        restrict_to_observed_moves=restrict_to_observed_moves,
     )
