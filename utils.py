@@ -26,7 +26,6 @@ def validate_input_parameters(
     n_indices: int,
     round_precision: int,
     non_sync_penalty: float,
-    alpha: float,
     temp_bounds: Tuple[Union[int, float], Union[int, float]],
 ) -> None:
     """
@@ -40,8 +39,6 @@ def validate_input_parameters(
         Digits to round probabilities to. Must be non-negative.
     non_sync_penalty : float
         Penalty weight for non-synchronous transitions. Must be non-negative.
-    alpha : float
-        Blending parameter for conditional probabilities. Must be between 0 and 1.
     temp_bounds : Tuple[float, float]
         Temperature bounds for calibration. Must be a valid range with min < max.
         The values must be positive.
@@ -70,12 +67,6 @@ def validate_input_parameters(
     if non_sync_penalty < 0:
         raise ValueError(f"non_sync_penalty must be non-negative, got {non_sync_penalty}")
     
-    # Validate alpha
-    if not isinstance(alpha, (int, float)):
-        raise TypeError(f"alpha must be a number, got {type(alpha)}")
-    if not 0 <= alpha <= 1:
-        raise ValueError(f"alpha must be between 0 and 1, got {alpha}")
-    
     # Validate temp_bounds
     if not isinstance(temp_bounds, tuple):
         raise TypeError(f"temp_bounds must be a tuple, got {type(temp_bounds)}")
@@ -99,7 +90,7 @@ def make_cost_function(
     round_precision: int = 2
 ) -> Callable[[float, MoveType], float]:
     """
-    Build f(p: float, move_type: MoveType) → cost.
+    Build f(p: float, move_type: MoveType) ג†’ cost.
 
     Defaults:
       - sync: `base` (linear/logarithmic/callable)
@@ -166,7 +157,7 @@ def inverse_softmax(
     --------
     >>> probs = np.array([[0.7, 0.2], [0.3, 0.8]])
     >>> logits = inverse_softmax(probs)
-    >>> # logits ≈ [[-0.357, -1.609], [-1.204, -0.223]]
+    >>> # logits ג‰ˆ [[-0.357, -1.609], [-1.204, -0.223]]
     """
     # Clip probabilities to avoid log(0) and log(1)
     probs = np.clip(softmax_probs, epsilon, 1.0 - epsilon)
@@ -497,7 +488,7 @@ def prepare_df(
         arr = np.squeeze(arr)
         L = len(target_list[idx])
         if arr.ndim == 1:
-            # reshape 1D → (n_classes, L)
+            # reshape 1D ג†’ (n_classes, L)
             c = arr.size // L
             if arr.size % L:
                 raise ValueError(f"Cannot reshape array of size {arr.size} to match length {L}")
@@ -785,7 +776,7 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
             tokens = marking_dict[place.name]
             if tokens > 0:
                 # Add a large token to the label with larger font size
-                label += f"\n<FONT POINT-SIZE='30'>●</FONT>"
+                label += f"\n<FONT POINT-SIZE='30'>ג—</FONT>"
         
         # Ensure that the label is treated as an HTML-like label
         viz.node(str(place), label=f"<{label}>", shape='circle', style='filled', fillcolor='white', fixedsize='true', width='0.75', height='0.75')
@@ -831,6 +822,233 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
         # If neither format worked, raise an exception
         if not saved_paths:
             raise RuntimeError("Failed to generate visualization in both PNG and PDF formats")
+
+
+def sample_sequence_preserving_runs(sequence: Union[str, List[str]], sampling_ratio: float, min_run_length: int = 1) -> Union[str, List[str]]:
+    """
+    Sample a sequence while preserving the frequency and structure of activity runs.
+
+    This function identifies contiguous runs of the same activity and samples from each run
+    proportionally to the desired sampling ratio, ensuring each run is represented by at least
+    min_run_length activities. The goal is to maintain the approximate frequency distribution
+    of activities while reducing sequence length.
+
+    Parameters
+    ----------
+    sequence : str or List[str]
+        The input sequence to sample from. Can be a string or list of activity labels.
+    sampling_ratio : float
+        The fraction of the original sequence to retain (between 0 and 1).
+        For example, 0.2 means approximately 20% of activities will be kept.
+    min_run_length : int, default=1
+        Minimum number of activities to preserve from each run. Each run will have
+        at least this many activities in the sampled sequence.
+
+    Returns
+    -------
+    str or List[str]
+        The sampled sequence with the same type as input (string or list).
+
+    Examples
+    --------
+    >>> sample_sequence_preserving_runs("aaaaaaaaaabbbbbaaaaacccc", 0.2)
+    'aabac'
+
+    >>> sample_sequence_preserving_runs(['a', 'a', 'a', 'b', 'b', 'c'], 0.5)
+    ['a', 'a', 'b', 'c']
+
+    Notes
+    -----
+    - Each run in the original sequence is guaranteed to have at least min_run_length
+      activities in the sampled sequence.
+    - The sampling ratio is approximate and may vary slightly due to the minimum run
+      length constraint.
+    - Run structure is preserved: activities from the same run remain contiguous in
+      the sampled sequence.
+    """
+    if not sequence:
+        return sequence
+
+    # Convert string to list for processing if needed
+    is_string = isinstance(sequence, str)
+    if is_string:
+        seq_list = list(sequence)
+    else:
+        seq_list = sequence.copy()
+
+    if sampling_ratio <= 0:
+        return [] if not is_string else ""
+    if sampling_ratio >= 1:
+        return sequence
+
+    # Identify runs in the sequence
+    runs = []
+    current_run = [seq_list[0]]
+
+    for activity in seq_list[1:]:
+        if activity == current_run[-1]:
+            current_run.append(activity)
+        else:
+            runs.append(current_run)
+            current_run = [activity]
+    runs.append(current_run)  # Don't forget the last run
+
+    # Allocate samples per run using proportional ceil while
+    # enforcing a minimum per-run length and not exceeding run size.
+    sampled_runs = []
+    for run in runs:
+        run_length = len(run)
+        # Proportional target from this run (ceil to avoid under-sampling long runs)
+        proportional = int(np.ceil(run_length * sampling_ratio))
+        samples_from_run = min(run_length, max(min_run_length, proportional))
+        sampled_runs.append(run[:samples_from_run])
+
+    # Flatten the sampled runs back into a sequence
+    sampled_sequence = []
+    for run in sampled_runs:
+        sampled_sequence.extend(run)
+
+    # Convert back to original type
+    if is_string:
+        return ''.join(sampled_sequence)
+    else:
+        return sampled_sequence
+
+
+def get_activity_run_lengths_by_case(
+    df: pd.DataFrame,
+    activity_label: str,
+    min_runs: int = 0,
+    include_preceding_sequence: bool = False,
+    exclude_empty_cases: bool = True
+) -> Union[Dict[str, List[int]], Dict[str, Tuple[List[int], List[Tuple[str, ...]]]]]:
+    """
+    Compute the lengths of each sequential run of a specific activity label in each case.
+
+    A "run" is a maximal contiguous block of the same activity within a trace.
+    For example, if a trace has activities [A, B, B, B, A, C, C] and we look for runs of B,
+    the runs would be [3] (one run of length 3).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame containing 'case:concept:name' and 'concept:name' columns.
+    activity_label : str
+        The activity label to find runs for.
+    min_runs : int, default=0
+        Minimum number of runs required for a case to be included in the result.
+        Cases with fewer runs than this threshold will be excluded from the dictionary.
+    include_preceding_sequence : bool, default=False
+        If True, also track the sequence of activities that preceded each run.
+        For each run, includes a string showing one activity from each run that
+        appeared before the current run in the trace (excluding the current run).
+    exclude_empty_cases : bool, default=True
+        If True, cases with zero runs of the target activity are not returned.
+        If False, such cases are included with an empty list.
+
+    Returns
+    -------
+    Dict[str, List[int]] or Dict[str, Tuple[List[int], List[Tuple[str, ...]]]]
+        - If include_preceding_sequence=False:
+          case_id -> [run_length, ...]
+        - If include_preceding_sequence=True:
+          case_id -> ([run_length, ...], [preceding_sequence, ...]) where each preceding_sequence
+          is a tuple of one activity label per prior run (excluding the current run). The preceding
+          sequence updates only after the activity switches.
+        Only cases with at least min_runs runs of the activity are included (and cases with zero
+        runs are excluded by default unless exclude_empty_cases=False).
+
+    Examples
+    --------
+    >>> df = pd.DataFrame({
+    ...     'case:concept:name': ['case1', 'case1', 'case1', 'case2', 'case2', 'case3', 'case3'],
+    ...     'concept:name': ['A', 'B', 'B', 'A', 'B', 'A', 'A']
+    ... })
+    >>> get_activity_run_lengths_by_case(df, 'B')
+    {'case1': [2], 'case2': [1]}
+    >>> get_activity_run_lengths_by_case(df, 'B', min_runs=2)
+    {'case1': [2]}
+    >>> get_activity_run_lengths_by_case(df, 'B', include_preceding_sequence=True)
+    {'case1': ([2], [('A',)]), 'case2': ([1], [('A',)])}
+    >>> # For sequence 'aaaabbbccccaaa', tracking 'a' gives:
+    >>> # {'case1': ([4, 3], [(), ('a', 'b', 'c')])}
+    """
+    # Ensure required columns exist
+    required_cols = {"case:concept:name", "concept:name"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+
+    if min_runs < 0:
+        raise ValueError(f"min_runs must be non-negative, got {min_runs}")
+
+    if include_preceding_sequence:
+        result: Dict[str, Tuple[List[int], List[Tuple[str, ...]]]] = {}
+    else:
+        result: Dict[str, List[int]] = {}
+
+    # Group by case and process each trace
+    for case_id, group in df.groupby("case:concept:name", sort=False):
+        labels = group["concept:name"].tolist()
+        if not labels:
+            continue
+
+        if include_preceding_sequence:
+            # Find all runs in the sequence and their preceding context
+            run_lengths: List[int] = []
+            preceding_list: List[Tuple[str, ...]] = []
+            current_run_length = 0
+            prior_runs: List[str] = []  # One activity from each prior run
+
+            i = 0
+            while i < len(labels):
+                if labels[i] == activity_label:
+                    # Start of a target activity run
+                    while i < len(labels) and labels[i] == activity_label:
+                        current_run_length += 1
+                        i += 1
+
+                    # Build sequence of runs seen so far (excluding current)
+                    preceding_seq = tuple(prior_runs)
+                    run_lengths.append(current_run_length)
+                    preceding_list.append(preceding_seq)
+                    # Add current run to prior_runs for future runs
+                    prior_runs.append(activity_label)
+                    current_run_length = 0
+                else:
+                    # Non-target activity - find the run it belongs to
+                    run_activity = labels[i]
+                    while i < len(labels) and labels[i] == run_activity:
+                        i += 1
+                    # Add this activity to prior runs (one from each run)
+                    prior_runs.append(run_activity)
+
+            # Only include cases that meet the minimum runs threshold
+            if len(run_lengths) >= min_runs and (len(run_lengths) > 0 or not exclude_empty_cases):
+                result[str(case_id)] = (run_lengths, preceding_list)
+        else:
+            # Original logic for just run lengths
+            run_lengths: List[int] = []
+            current_run_length = 0
+
+            for label in labels:
+                if label == activity_label:
+                    current_run_length += 1
+                else:
+                    # End of a run
+                    if current_run_length > 0:
+                        run_lengths.append(current_run_length)
+                        current_run_length = 0
+
+            # Don't forget the last run if it ends with the activity
+            if current_run_length > 0:
+                run_lengths.append(current_run_length)
+
+            # Only include cases that meet the minimum runs threshold
+            if len(run_lengths) >= min_runs and (len(run_lengths) > 0 or not exclude_empty_cases):
+                result[str(case_id)] = run_lengths
+
+    return result
 
 
 def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:

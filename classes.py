@@ -1539,6 +1539,7 @@ class PetriNet:
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
+        merge_mismatched_boundaries: bool = True,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1686,8 +1687,8 @@ class PetriNet:
 
             first_label_c2 = _first_trace_label(result2['alignment'])
 
-            # Decide merge on boundary mismatch
-            if last_label_c1 is not None and first_label_c2 is not None and last_label_c1 != first_label_c2:
+            # Decide merge on boundary mismatch (configurable)
+            if merge_mismatched_boundaries and last_label_c1 is not None and first_label_c2 is not None and last_label_c1 != first_label_c2:
                 # Merge the two windows and recompute on the combined subtrace
                 merged_chunk = softmax_matrix[:, start_ts:end_ts2]
                 m_start = time.perf_counter()
@@ -1793,6 +1794,7 @@ class PetriNet:
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
+        merge_mismatched_boundaries: bool = True,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1824,6 +1826,7 @@ class PetriNet:
             prob_dict=prob_dict,
             switch_penalty_weight=switch_penalty_weight,
             use_state_caching=use_state_caching,
+            merge_mismatched_boundaries=merge_mismatched_boundaries,
         )
         
         # Extract sequence and costs from alignment

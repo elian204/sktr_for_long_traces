@@ -16,13 +16,7 @@ from utils import validate_input_parameters, make_cost_function, visualize_petri
 from data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from petri_model import discover_petri_net, build_probability_dict
 from calibration import calibrate_probabilities, calibrate_softmax
-from beam_search import process_test_case_beam_search, process_test_case_hybrid
 from conformance_checking import process_trace_chunked
-try:
-    # Optional convenience import: user can define `decide` here
-    from hybrid_deciders import decide as default_hybrid_decider
-except Exception:
-    default_hybrid_decider = None
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -53,24 +47,18 @@ def _process_single_test_case(
     test_df: pd.DataFrame,
     model: Any,
     cost_fn: Callable,
-    recovery_method: str,
     prob_threshold: float,
     prob_dict: Dict,
-    # Recovery method specific parameters
     chunk_size: int,
-    beam_width: int,
-    alpha: float,
-    beam_score_alpha: float,
-    completion_patience: int,
-    use_cond_probs: bool,
     conformance_switch_penalty_weight: float,
     use_state_caching: bool,
-) -> Tuple[str, List[str], List[float], float, float]:
+    merge_mismatched_boundaries: bool,
+) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
-    Process a single test case. Used for parallel processing.
+    Process a single test case using conformance checking. Used for parallel processing.
 
     Returns:
-        Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy)
+        Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy, records_df)
     """
     # Extract ground truth sequence for accuracy computation
     ground_truth_trace = test_df[test_df['case:concept:name'] == case_id].copy().reset_index(drop=True)
@@ -80,34 +68,19 @@ def _process_single_test_case(
     argmax_indices = np.argmax(softmax_matrix, axis=0)
     argmax_preds = [str(idx) for idx in argmax_indices]
 
-    # Get predicted sequence using selected recovery method
-    if recovery_method == "conformance":
-        sktr_preds, sktr_move_costs = process_trace_chunked(
-            softmax_matrix=softmax_matrix,
-            model=model,
-            cost_fn=cost_fn,
-            chunk_size=chunk_size,
-            eps=prob_threshold,
-            inline_progress=False,  # Disable progress for parallel processing
-            prob_dict=prob_dict,
-            switch_penalty_weight=conformance_switch_penalty_weight,
-            use_state_caching=use_state_caching,
-        )
-    elif recovery_method == "beam_search":
-        sktr_preds, sktr_move_costs = process_test_case_beam_search(
-            softmax_matrix=softmax_matrix,
-            model=model,
-            cost_fn=cost_fn,
-            beam_width=beam_width,
-            alpha=alpha,
-            use_cond_probs=use_cond_probs,
-            prob_dict=prob_dict,
-            activity_prob_threshold=prob_threshold,
-            beam_score_alpha=beam_score_alpha,
-            completion_patience=completion_patience,
-        )
-    else:
-        raise ValueError(f"Unsupported recovery method: {recovery_method}")
+    # Conformance prediction
+    sktr_preds, sktr_move_costs = process_trace_chunked(
+        softmax_matrix=softmax_matrix,
+        model=model,
+        cost_fn=cost_fn,
+        chunk_size=chunk_size,
+        eps=prob_threshold,
+        inline_progress=False,  # Disable progress for parallel processing
+        prob_dict=prob_dict,
+        switch_penalty_weight=conformance_switch_penalty_weight,
+        use_state_caching=use_state_caching,
+        merge_mismatched_boundaries=merge_mismatched_boundaries,
+    )
 
     # Compute accuracy
     records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
@@ -118,7 +91,7 @@ def _process_single_test_case(
         softmax_matrix=softmax_matrix,
         activity_prob_threshold=prob_threshold,
         sktr_move_costs=sktr_move_costs,
-        chunk_size=chunk_size if recovery_method == "conformance" else None
+        chunk_size=chunk_size
     )
 
     return case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df
@@ -137,15 +110,8 @@ def incremental_softmax_recovery(
     model_move_cost: Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     log_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     tau_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1e-6,
-    beam_width: int = 10,
     prob_threshold: float = 1e-12,
-    use_cond_probs: bool = False,
     max_hist_len: int = 3,
-    lambdas: Optional[List[float]] = None,
-    alpha: float = 0.5,
-    beam_score_alpha: float = 0.5,
-    completion_patience: int = 5,
-    use_ngram_smoothing: bool = True,
     use_calibration: bool = False,
     temp_bounds: Tuple[float, float] = (1.0, 10.0),
     temperature: Optional[float] = None,
@@ -158,7 +124,6 @@ def incremental_softmax_recovery(
     save_model_path: str = "./discovered_petri_net",
     save_model: bool = True,
     non_sync_penalty: float = 1.0,
-    recovery_method: str = "conformance",
     chunk_size: int = 10,
     # Conformance-specific: switch penalty weight on label change (uses bigram prob_dict)
     conformance_switch_penalty_weight: float = 0.0,
@@ -168,152 +133,23 @@ def incremental_softmax_recovery(
     use_state_caching: bool = True,
     parallel_processing: bool = False,
     max_workers: Optional[int] = None,
-    # Hybrid-specific parameters
-    hybrid_conformance_chunk_size: int = 10,
-    hybrid_conformance_eps: float = 1e-12,
-    hybrid_decider: Optional[Callable[[int, np.ndarray, Any, Any], Optional[int]]] = None,
-    hybrid_min_disagree_run: int = 1,
-
+    merge_mismatched_boundaries: bool = True,
     verbose: bool = True,
     log_level: int = logging.INFO,
 ) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]]]:
     """
-    Recover activity sequences from softmax matrices using Petri net models.
+    Recover activity sequences from softmax matrices using Petri net models (conformance only).
 
     Discovers a Petri net model from training traces, then processes test softmax
-    matrices using either beam search or chunked conformance checking. The method
-    can be selected via the recovery_method parameter.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Event log with 'case:concept:name' and 'concept:name' columns.
-        **IMPORTANT**: Case IDs must be sequential strings starting from '0'.
-        The case IDs must be exactly ['0', '1', '2', ..., 'N-1'] in order
-        to maintain alignment with the softmax_lst matrices. This is a 
-        restrictive requirement of the current implementation.
-    softmax_lst : List[np.ndarray]
-        Softmax matrices per trace (required). Must be aligned with case IDs:
-        softmax_lst[0] corresponds to case '0', softmax_lst[1] to case '1', etc.
-    n_train_traces : int, default=10
-        Number of traces for model discovery (ignored if train_cases is set).
-    n_test_traces : int, default=10
-        Number of traces to test (ignored if test_cases is set).
-    train_cases, test_cases : Optional[List[Any]], default=None
-        Specific case IDs for training/testing (overrides respective counts).
-        If provided, must follow the sequential string format.
-    ensure_train_variant_diversity, ensure_test_variant_diversity : bool, default=False
-        Enforce distinct trace variants in train/test splits.
-    cost_function : str or callable, default='linear'
-        'linear', 'logarithmic', or a callable mapping float→float.
-    beam_width : int, default=10
-        **[BEAM SEARCH ONLY]** Beam search width (number of candidates retained).
-    prob_threshold : float, default=1e-12
-        Minimum probability threshold for activity filtering. Activities with probabilities
-        below this threshold are ignored by both methods. Used for:
-        - **[BEAM SEARCH]**: Minimum softmax probability to consider an activity
-        - **[CONFORMANCE]**: Minimum probability threshold to filter activities
-    use_cond_probs : bool, default=False
-        **[BEAM SEARCH ONLY]** Whether to use conditional probabilities based on trace history.
-    max_hist_len : int, default=3
-        **[BEAM SEARCH ONLY]** Maximum history length for conditional probabilities.
-    lambdas : Optional[List[float]], default=None
-        **[BEAM SEARCH ONLY]** Blending weights for conditional probability computation.
-    alpha : float, default=0.5
-        **[BEAM SEARCH ONLY]** Blending parameter for conditional probabilities (0=history only, 1=base only).
-    beam_score_alpha : float, default=0.5
-        **[BEAM SEARCH ONLY]** Beam scoring alpha for blending normalized and total costs.
-    completion_patience : int, default=5
-        **[BEAM SEARCH ONLY]** Number of extra iterations to continue beam search after first completion.
-    use_ngram_smoothing : bool, default=True
-        **[BEAM SEARCH ONLY]** Whether to apply n-gram smoothing for conditional probabilities.
-    use_calibration : bool, default=False
-        Whether to apply temperature scaling for probability calibration.
-    temp_bounds : Tuple[float, float], default=(1.0, 10.0)
-        Temperature bounds for calibration optimization.
-    temperature : Optional[float], default=None
-        Manual temperature value (bypasses optimization if provided).
-    n_indices : Optional[int], default=None
-        Total number of events to sample per trace (for uniform sampling).
-        Used when sequential_sampling=False. Mutually exclusive with n_per_run.
-    n_per_run : Optional[int], default=None
-        Number of events to sample from each activity run (for sequential sampling).
-        Used when sequential_sampling=True. Mutually exclusive with n_indices.
-    sequential_sampling : bool, default=False
-        If True, sample from each run of identical activities using n_per_run.
-        If False, sample uniformly from entire trace using n_indices.
-    independent_sampling : bool, default=True
-        If True, each trace uses a different random seed derived from base seed.
-        If False, all traces use the same random state for sampling.
-    round_precision : int, default=2
-        Digits to round probabilities to.
-    random_seed : int, default=42
-        Seed for reproducibility.
-    save_model_path : str, default="./discovered_petri_net"
-        Path (without .pdf extension) to save the Petri net visualization.
-    save_model : bool, default=True
-        If True, save the Petri net visualization to the specified path.
-    recovery_method : str, default="conformance"
-        Method for trace recovery. Options:
-        - "conformance": Use chunked conformance checking (deterministic, accurate)
-        - "beam_search": Use beam search algorithm (heuristic, faster for some cases)
-    chunk_size : int, default=10
-        **[CONFORMANCE ONLY]** Size of chunks for processing softmax matrices iteratively.
-        Larger chunks may be more accurate but use more memory and computation.
-    verbose : bool, default=True
-        If True, set up logging to display progress information.
-    log_level : int, default=logging.INFO
-        Logging level (logging.DEBUG for more detailed output).
-    
-    Returns
-    -------
-    results_df : pd.DataFrame
-        DataFrame with columns:
-          - case:concept:name, step, predicted_activity, ground_truth,
-            beam_probability, is_correct, cumulative_accuracy
-        Note: 'step' column contains window-relative steps (0 to chunk_size-1 repeating)
-        when using conformance recovery method, otherwise uses global step numbering (0 to seq_len-1)
-    accuracy_dict : Dict[str, List[float]]
-        Dictionary with keys 'sktr_accuracy' and 'argmax_accuracy',
-        each containing a list of per-trace accuracies (fraction of correct predictions in the trace).
-    prob_dict : Dict[Tuple[str, ...], Dict[str, float]]
-        Conditional probability dictionary (empty if use_cond_probs=False)
-        
-    Raises
-    ------
-    ValueError
-        If case IDs don't follow the sequential string format ['0', '1', '2', ...].
-        If parameter combinations are invalid (e.g., both n_indices and n_per_run specified).
-        If required data is missing or misaligned.
-        
-    Notes
-    -----
-    This implementation has a restrictive assumption about case ID format:
-    - Case IDs must be sequential strings: ['0', '1', '2', ..., 'N-1']
-    - The order in the DataFrame must match the softmax matrix order
-    - softmax_lst[i] must correspond to case ID str(i)
-    
-    For datasets with non-sequential case IDs (e.g., 'CASE_001', 'CASE_042'), 
-    you must preprocess to convert to sequential format.
-        
-    Examples
-    --------
-    >>> # Correct case ID format
-    >>> df = pd.DataFrame({
-    ...     'case:concept:name': ['0', '0', '1', '1', '2', '2'],
-    ...     'concept:name': ['A', 'B', 'A', 'C', 'B', 'C']
-    ... })
-    >>> softmax_matrices = [matrix_0, matrix_1, matrix_2]  # Aligned order
-    >>> results_df, accuracy_dict = incremental_softmax_recovery(df, softmax_matrices, n_indices=2)
+    matrices using chunked conformance checking.
     """
     if verbose:
         setup_logging(log_level)
     
-    logger.info("Starting incremental softmax recovery.")
+    logger.info("Starting incremental softmax recovery (conformance-only).")
 
     # Prepare default containers
-    lambdas = lambdas or []
-
+    
     # 0. Early validation of sequential case ID assumption
     validate_sequential_case_ids(df, softmax_lst)
     logger.info(f"Validated sequential case IDs (found {len(df['case:concept:name'].unique())} unique cases) and {len(softmax_lst)} softmax matrices.")
@@ -332,23 +168,16 @@ def incremental_softmax_recovery(
     sampling_param_value = n_per_run if sequential_sampling else n_indices
     logger.info(f"Validated sampling parameters: {sampling_method} with {sampling_param_name}={sampling_param_value}.")
 
-    # 2. Validate recovery method
-    valid_methods = ["conformance", "beam_search", "hybrid"]
-    if recovery_method not in valid_methods:
-        raise ValueError(f"recovery_method must be one of {valid_methods}, got '{recovery_method}'")
-    logger.info(f"Using recovery method: {recovery_method}")
-    if recovery_method == "hybrid" and hybrid_decider is None and default_hybrid_decider is not None:
-        hybrid_decider = default_hybrid_decider
-
-    # 3. Validate other inputs
+    # 2. Validate other inputs
     sampling_param = n_per_run if sequential_sampling else n_indices
     assert sampling_param is not None, "sampling_param should not be None after validation"
+    # alpha removed from validation, default a safe value for API compatibility
     validate_input_parameters(
-        sampling_param, round_precision, non_sync_penalty, alpha, temp_bounds
+        sampling_param, round_precision, non_sync_penalty, temp_bounds
     )
-    logger.info(f"Validated input parameters: beam_width={beam_width}, alpha={alpha}, round_precision={round_precision}, prob_threshold={prob_threshold}.")
+    logger.info(f"Validated input parameters: round_precision={round_precision}, prob_threshold={prob_threshold}.")
 
-    # 4. Cost function
+    # 3. Cost function
     cost_fn = make_cost_function(
         base=cost_function,
         model_move=model_move_cost,
@@ -416,12 +245,9 @@ def incremental_softmax_recovery(
     marking_transition_map = model.build_marking_transition_map()
     logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
 
-    # [removed] validation logging
-
-
-    # 8. Conditional probabilities (build when needed)
+    # 8. Conditional probabilities (build when needed for switch penalty)
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    if use_cond_probs or (recovery_method in {"conformance", "hybrid"} and conformance_switch_penalty_weight > 0.0):
+    if conformance_switch_penalty_weight > 0.0:
         prob_dict = build_probability_dict(train_df, max_hist_len)
         n_histories = len(prob_dict)
         avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
@@ -503,10 +329,10 @@ def incremental_softmax_recovery(
         parallel_args = []
         for case, softmax_matrix in zip(test_case_ids, test_softmax_matrices):
             args = (
-                case, softmax_matrix, test_df, model, cost_fn, recovery_method,
-                prob_threshold, prob_dict, effective_chunk_size, beam_width, alpha,
-                beam_score_alpha, completion_patience, use_cond_probs,
-                conformance_switch_penalty_weight, use_state_caching
+                case, softmax_matrix, test_df, model, cost_fn,
+                prob_threshold, prob_dict, effective_chunk_size,
+                conformance_switch_penalty_weight, use_state_caching,
+                merge_mismatched_boundaries,
             )
             parallel_args.append(args)
 
@@ -520,7 +346,7 @@ def incremental_softmax_recovery(
                     recovery_records.extend(records_df.to_dict('records'))
                     sktr_accs.append(sktr_acc)
                     argmax_accs.append(argmax_acc)
-                    logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+                    logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
                 except Exception as exc:
                     logger.error(f"Parallel processing failed for case {idx}: {exc}")
 
@@ -531,61 +357,28 @@ def incremental_softmax_recovery(
         ):
             # In-place progress update for traces (single updating line)
             try:
-                sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — {recovery_method}")
+                sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — conformance")
                 sys.stdout.flush()
             except Exception:
                 pass
             # Avoid extra per-trace INFO logs when using inline progress
             logger.debug(
-                f"Processing test case {idx}/{len(test_case_ids)} ({case}) using '{recovery_method}'"
+                f"Processing test case {idx}/{len(test_case_ids)} ({case}) using 'conformance'"
             )
 
-            # Get predicted sequence using selected recovery method
-            if recovery_method == "conformance":
-                sktr_preds, sktr_move_costs = process_trace_chunked(
-                    softmax_matrix=softmax_matrix,
-                    model=model,
-                    cost_fn=cost_fn,
-                    chunk_size=effective_chunk_size,
-                    eps=prob_threshold,
-                    inline_progress=True,
-                    progress_prefix=f"case {idx}/{len(test_case_ids)}",
-                    prob_dict=prob_dict,
-                    switch_penalty_weight=conformance_switch_penalty_weight,
-                    use_state_caching=use_state_caching,
-                )
-            elif recovery_method == "beam_search":
-                sktr_preds, sktr_move_costs = process_test_case_beam_search(
-                    softmax_matrix=softmax_matrix,
-                    model=model,
-                    cost_fn=cost_fn,
-                    beam_width=beam_width,
-                    alpha=alpha,
-                    use_cond_probs=use_cond_probs,
-                    prob_dict=prob_dict,
-                    activity_prob_threshold=prob_threshold,
-                    beam_score_alpha=beam_score_alpha,
-                    completion_patience=completion_patience,
-                )
-            elif recovery_method == "hybrid":
-                sktr_preds, sktr_move_costs = process_test_case_hybrid(
-                    softmax_matrix=softmax_matrix,
-                    model=model,
-                    cost_fn=cost_fn,
-                    beam_width=beam_width,
-                    alpha=alpha,
-                    use_cond_probs=use_cond_probs,
-                    prob_dict=prob_dict,
-                    activity_prob_threshold=prob_threshold,
-                    beam_score_alpha=beam_score_alpha,
-                    completion_patience=completion_patience,
-                    conformance_chunk_size=hybrid_conformance_chunk_size,
-                    conformance_eps=hybrid_conformance_eps,
-                    decider=hybrid_decider,
-                    min_disagree_run=hybrid_min_disagree_run,
-                )
-            else:
-                raise ValueError(f"Unsupported recovery method: {recovery_method}")
+            sktr_preds, sktr_move_costs = process_trace_chunked(
+                softmax_matrix=softmax_matrix,
+                model=model,
+                cost_fn=cost_fn,
+                chunk_size=effective_chunk_size,
+                eps=prob_threshold,
+                inline_progress=True,
+                progress_prefix=f"case {idx}/{len(test_case_ids)}",
+                prob_dict=prob_dict,
+                switch_penalty_weight=conformance_switch_penalty_weight,
+                use_state_caching=use_state_caching,
+                merge_mismatched_boundaries=merge_mismatched_boundaries,
+            )
 
             # Extract ground truth sequence for accuracy computation
             ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
@@ -604,12 +397,12 @@ def incremental_softmax_recovery(
                 softmax_matrix=softmax_matrix,
                 activity_prob_threshold=prob_threshold,
                 sktr_move_costs=sktr_move_costs,
-                chunk_size=effective_chunk_size if recovery_method == "conformance" else None
+                chunk_size=effective_chunk_size
             )
             recovery_records.extend(records_df.to_dict('records'))
             sktr_accs.append(sktr_acc)
             argmax_accs.append(argmax_acc)
-            logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [{recovery_method}]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+            logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
 
     # 12. Build and return results
     results_df = pd.DataFrame(recovery_records)
@@ -624,7 +417,7 @@ def incremental_softmax_recovery(
     except Exception:
         pass
     logger.info("Built results DataFrame and accuracy dictionary.")
-    logger.info(f"Softmax trace recovery completed using {recovery_method} method.")
+    logger.info("Softmax trace recovery completed using conformance method.")
     return results_df, accuracy_dict, prob_dict
 
 
@@ -640,40 +433,6 @@ def _compute_accuracy_records(
 ) -> Tuple[pd.DataFrame, float, float]:
     """
     Compute accuracy records and trace-level accuracies by comparing SKTR, argmax, and ground truth sequences.
-
-    Parameters
-    ----------
-    case_id : str
-        Case identifier
-    sktr_preds : List[str]
-        SKTR predicted activity sequence (beam search)
-    argmax_preds : List[str]
-        Argmax predicted sequence
-    ground_truth_sequence : List[str]
-        Ground truth activity sequence
-    activity_prob_threshold : float, default=0.0
-        Minimum probability threshold for activity filtering
-    sktr_move_costs : List[float], optional
-        Move costs for SKTR predictions
-    chunk_size : int, optional
-        Size of processing chunks. If provided, steps will be relative to each window (0 to chunk_size-1)
-        rather than global (0 to seq_len-1). If None, uses global step numbering.
-
-    Returns
-    -------
-    pd.DataFrame
-        DataFrame with per-step accuracy metrics for SKTR predictions.
-        Step column uses window-relative numbering (0 to chunk_size-1 repeating) if chunk_size provided,
-        otherwise uses global step numbering (0 to seq_len-1).
-    float
-        Trace-level SKTR accuracy (fraction correct)
-    float
-        Trace-level argmax accuracy (fraction correct)
-
-    Raises
-    ------
-    ValueError
-        If the sequences have different lengths
     """
     # Check that all sequences have the same length
     seq_len = len(ground_truth_sequence)
