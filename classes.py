@@ -1368,19 +1368,18 @@ class PetriNet:
         best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
 
         # Helper: check if a labeled next move is observed in training
-        def _is_observed_next(label: str, last_label: Optional[str]) -> bool:
+        def _is_observed_next(label: str, last_label: Optional[str], timestamp: int) -> bool:
             if not restrict_to_observed_moves:
                 return True
             if not prob_dict:
                 # If restriction requested but no dictionary, disallow
                 return False
-            # Prefer bigram if available
-            if last_label is not None:
-                nexts = prob_dict.get((last_label,), {})
-                if label in nexts:
-                    return True
-            # Fallback to unigram: observed anywhere
-            return label in prob_dict.get((), {})
+            # At t=0 (no emitted labels yet), allow only if unigram observed
+            if timestamp == 0 or last_label is None:
+                return label in prob_dict.get((), {})
+            # For t>0 require strict bigram last_label -> label
+            nexts = prob_dict.get((last_label,), {})
+            return label in nexts
 
         while open_set:
             cost, node = heapq.heappop(open_set)
@@ -1493,8 +1492,8 @@ class PetriNet:
                 # Filter out activities below threshold (same as beam search)
                 if raw_p < eps:
                     continue
-                # Restrict labeled sync moves if requested
-                if not _is_observed_next(t.label, node.last_label):
+                # Restrict labeled sync moves if requested (strict bigram for t>0, unigram only at t=0)
+                if not _is_observed_next(t.label, node.last_label, node.timestamp):
                     continue
                 p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
