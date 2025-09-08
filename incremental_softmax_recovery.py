@@ -53,7 +53,6 @@ def _process_single_test_case(
     conformance_switch_penalty_weight: float,
     use_state_caching: bool,
     merge_mismatched_boundaries: bool,
-    restrict_to_observed_moves: bool,
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -81,7 +80,6 @@ def _process_single_test_case(
         switch_penalty_weight=conformance_switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,
-        restrict_to_observed_moves=restrict_to_observed_moves,
     )
 
     # Compute accuracy
@@ -136,7 +134,7 @@ def incremental_softmax_recovery(
     parallel_processing: bool = False,
     max_workers: Optional[int] = None,
     merge_mismatched_boundaries: bool = True,
-    restrict_to_observed_moves: bool = False,
+    # removed: restrict_to_observed_moves
     verbose: bool = True,
     log_level: int = logging.INFO,
 ) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]]]:
@@ -250,7 +248,7 @@ def incremental_softmax_recovery(
 
     # 8. Conditional probabilities (build when needed for switch penalty)
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    if conformance_switch_penalty_weight > 0.0 or restrict_to_observed_moves:
+    if conformance_switch_penalty_weight > 0.0:
         prob_dict = build_probability_dict(train_df, max_hist_len)
         n_histories = len(prob_dict)
         avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
@@ -335,7 +333,7 @@ def incremental_softmax_recovery(
                 case, softmax_matrix, test_df, model, cost_fn,
                 prob_threshold, prob_dict, effective_chunk_size,
                 conformance_switch_penalty_weight, use_state_caching,
-                merge_mismatched_boundaries, restrict_to_observed_moves,
+                merge_mismatched_boundaries,
             )
             parallel_args.append(args)
 
@@ -381,7 +379,6 @@ def incremental_softmax_recovery(
                 switch_penalty_weight=conformance_switch_penalty_weight,
                 use_state_caching=use_state_caching,
                 merge_mismatched_boundaries=merge_mismatched_boundaries,
-                restrict_to_observed_moves=restrict_to_observed_moves,
             )
 
             # Extract ground truth sequence for accuracy computation
