@@ -1374,12 +1374,15 @@ class PetriNet:
             if not prob_dict:
                 # If restriction requested but no dictionary, disallow
                 return False
-            # At t=0 (no emitted labels yet), allow only if unigram observed
-            if timestamp == 0 or last_label is None:
+            # At the first step of a chunk (timestamp==0), allow unigram regardless of last_label
+            if timestamp == 0:
                 return label in prob_dict.get((), {})
-            # For t>0 require strict bigram last_label -> label
-            nexts = prob_dict.get((last_label,), {})
-            return label in nexts
+            # For subsequent steps require strict bigram if we have a last_label
+            if last_label is not None:
+                nexts = prob_dict.get((last_label,), {})
+                return label in nexts
+            # True start of the overall trace (no last_label) also uses unigram
+            return label in prob_dict.get((), {})
 
         while open_set:
             cost, node = heapq.heappop(open_set)
