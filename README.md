@@ -1,15 +1,15 @@
 # Incremental Softmax Recovery for Long Traces
 
-A Python system for incrementally recovering activity sequences from softmax probability matrices using beam search with Petri nets.
+A Python system for incrementally recovering activity sequences from softmax probability matrices using conformance checking with Petri nets.
 
 ## 🎯 Overview
 
-This system performs **incremental trace recovery** - predicting activity sequences step-by-step from neural network softmax outputs. It uses:
+This system performs incremental trace recovery - predicting activity sequences step-by-step from neural network softmax outputs. It uses:
 
-- **Petri Net Discovery**: Learns process models from training traces
-- **Beam Search**: Maintains multiple candidate paths for robust prediction  
-- **Conditional Probabilities**: Incorporates sequence history for better accuracy
-- **Flexible Sampling**: Supports both uniform and sequential event sampling
+- Petri Net Discovery: Learns process models from training traces
+- Conformance Checking: Deterministic, chunked recovery under Petri net constraints
+- Conditional Probabilities (optional): Bigram history for label-switch penalty
+- Flexible Sampling: Supports both uniform and sequential event sampling
 
 ## 📋 Requirements
 
@@ -37,18 +37,20 @@ df = pd.DataFrame({
 # Softmax matrices aligned with cases
 softmax_matrices = [matrix_0, matrix_1, matrix_2]  # One per case
 
-# Run incremental recovery
-results = incremental_softmax_recovery(
+# Run incremental recovery (conformance-only)
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df,
     softmax_lst=softmax_matrices,
     n_train_traces=10,
     n_test_traces=5,
-    n_indices=4,  # Sample 4 events per trace
-    beam_width=10,
-    random_seed=42
+    n_indices=4,     # Sample 4 events per trace (when sequential_sampling=False)
+    sequential_sampling=False,
+    prob_threshold=1e-6,
+    chunk_size=15,
+    conformance_switch_penalty_weight=1.0,
 )
 
-print(f"Final accuracy: {results.groupby('case:concept:name')['cumulative_accuracy'].last().mean():.3f}")
+print(f"Final accuracy: {pd.Series(accuracy_dict['sktr_accuracy']).mean():.3f}")
 ```
 
 ## 🧪 Testing
@@ -60,83 +62,64 @@ jupyter notebook test_incremental_recovery.ipynb
 ```
 
 The notebook includes:
-- ✅ Synthetic data generation
-- ✅ Core functionality testing  
-- ✅ Error handling validation
-- ✅ Performance benchmarking
-- ✅ Results visualization
+- Synthetic data generation
+- Core functionality testing  
+- Error handling validation
+- Performance benchmarking
+- Results visualization
 
 ## ⚙️ Key Parameters
 
 | Parameter | Description | Default | Notes |
 |-----------|-------------|---------|--------|
-| `beam_width` | Number of candidates to maintain | 10 | Higher = better accuracy, slower |
-| `n_indices` | Events to sample per trace | None | Required for uniform sampling |
-| `n_per_run` | Events per activity run | None | Required for sequential sampling |
-| `use_cond_probs` | Enable conditional probabilities | False | Improves accuracy |
-| `alpha` | History vs base probability weight | 0.5 | 0=history only, 1=base only |
+| `prob_threshold` | Minimum probability to consider activity | 1e-12 | Applies during filtering |
+| `chunk_size` | Window size for conformance processing | 10 | Larger may be more accurate |
+| `conformance_switch_penalty_weight` | Weight on label-switch penalty | 0.0 | Uses `prob_dict` if > 0 |
+| `max_hist_len` | History length for `prob_dict` | 3 | Used when switch penalty enabled |
+| `n_indices` / `n_per_run` | Sampling controls | None | Required based on sampling mode |
 
 ## 📊 Output Format
 
-Returns a DataFrame with:
+Returns a tuple `(results_df, accuracy_dict, prob_dict)` where `results_df` contains:
 - `case:concept:name`: Test case ID
-- `step`: Event position in sequence  
-- `predicted_activity`: Beam search prediction
+- `step`: Window-relative step (0..chunk_size-1 repeating)
+- `sktr_activity`: Conformance prediction
+- `argmax_activity`: Argmax baseline prediction
 - `ground_truth`: Actual activity
+- `all_probs`: Per-step filtered probabilities
+- `all_activities`: Activity labels for `all_probs`
 - `is_correct`: Boolean correctness
 - `cumulative_accuracy`: Running accuracy
+- `sktr_move_cost`: Per-move costs
 
 ## 🔧 Advanced Features
 
-**Conditional Probabilities**:
-```python
-results = incremental_softmax_recovery(
-    df=df, softmax_lst=softmax_list,
-    use_cond_probs=True,
-    max_hist_len=3,
-    alpha=0.7,
-    use_ngram_smoothing=True
-)
-```
-
 **Temperature Calibration**:
 ```python
-results = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     use_calibration=True,
-    temp_bounds=(0.5, 5.0)
+    temp_bounds=(0.5, 5.0),
+    n_indices=4,
 )
 ```
 
 **Sequential Sampling**:
 ```python
-results = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     sequential_sampling=True,
     n_per_run=2  # Sample 2 events from each activity run
 )
 ```
 
-## 🐛 Bug Status
-
-**✅ Code Verification Complete**
-- No critical bugs found
-- Comprehensive input validation
-- Proper state management
-- Good error handling
-
-**Minor Notes**:
-- Comment mismatch in line 302 (cosmetic only)
-- Strict data format requirements (well documented)
-
 ## 📁 Module Structure
 
 ```
-├── incremental_softmax_recovery.py  # Main entry point
-├── beam_search.py                   # Beam search algorithm
+├── incremental_softmax_recovery.py  # Main entry point (conformance-only)
 ├── classes.py                       # Petri net classes
 ├── data_processing.py               # Data utilities
-├── petri_model.py                   # Model discovery
+├── petri_model.py                   # Model discovery and prob_dict builder
 ├── calibration.py                   # Temperature scaling
 ├── utils.py                         # Helper functions
 ├── test_incremental_recovery.ipynb  # Test notebook

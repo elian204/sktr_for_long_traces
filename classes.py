@@ -1321,6 +1321,7 @@ class PetriNet:
         switch_penalty_weight: float = 0.0,
         initial_last_label: Optional[str] = None,
         state_cache: Optional[Dict] = None,
+        # removed: restrict_to_observed_moves
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1365,6 +1366,8 @@ class PetriNet:
         # before the next timestamp advance. If a node is already worse than the current best
         # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
         best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
+
+        # removed observed-move restriction helper
 
         while open_set:
             cost, node = heapq.heappop(open_set)
@@ -1413,7 +1416,6 @@ class PetriNet:
                 else:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
-
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + tau_cost_total + c
@@ -1478,6 +1480,7 @@ class PetriNet:
                 # Filter out activities below threshold (same as beam search)
                 if raw_p < eps:
                     continue
+                # no observed-move restriction
                 p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
 
@@ -1539,6 +1542,8 @@ class PetriNet:
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
+        merge_mismatched_boundaries: bool = True,
+        # removed: restrict_to_observed_moves
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1557,73 +1562,207 @@ class PetriNet:
 
         current_marking = initial_marking
         # Track last emitted label across chunks to apply switch penalty at boundaries
-        # First window should not have any passing label, subsequent windows should
         current_last_label: Optional[str] = None
         total_cost = 0.0
         complete_alignment: List[Tuple[str, str]] = []
         chunk_results: List[Dict[str, Any]] = []
 
-        # State caching scoped per chunk to avoid cross-chunk pruning altering behavior
-        # (each chunk will get its own fresh cache)
-        state_cache: Optional[Dict] = None
-
         total_start = time.perf_counter()
 
-        total_chunks = (n_ts + chunk_size - 1) // chunk_size
-        # Suppress sequential info notifications; only inline progress or total summary
+        # Helpers to get first/last predicted labels in a chunk alignment
+        def _first_trace_label(alignment: List[Tuple[str, str, float]]) -> Optional[str]:
+            for move_type, move_label, _ in alignment:
+                if move_type in ('sync', 'log'):
+                    return move_label
+            return None
 
-        for chunk_idx, start_ts in enumerate(range(0, n_ts, chunk_size)):
-            # In-place progress update
+        def _last_trace_label(alignment: List[Tuple[str, str, float]]) -> Optional[str]:
+            for move_type, move_label, _ in reversed(alignment):
+                if move_type in ('sync', 'log'):
+                    return move_label
+            return None
+
+        # Progress visualization uses nominal number of windows
+        nominal_total_chunks = (n_ts + chunk_size - 1) // chunk_size
+        display_chunk_idx = 0
+
+        # Cache next-window computation to avoid recomputation when no merge occurs
+        pending_result: Optional[Dict[str, Any]] = None
+        pending_start_ts: Optional[int] = None
+        pending_end_ts: Optional[int] = None
+        pending_elapsed: Optional[float] = None
+        pending_rate: Optional[float] = None
+
+        start_ts = 0
+        while start_ts < n_ts:
+            display_chunk_idx += 1
             if inline_progress:
                 try:
                     prefix = (progress_prefix + " ") if progress_prefix else ""
-                    sys.stdout.write(f"\r{prefix}chunk {chunk_idx + 1}/{total_chunks}")
+                    sys.stdout.write(f"\r{prefix}chunk {min(display_chunk_idx, nominal_total_chunks)}/{nominal_total_chunks}")
                     sys.stdout.flush()
                 except Exception:
                     pass
-            end_ts = min(start_ts + chunk_size, n_ts)
-            chunk = softmax_matrix[:, start_ts:end_ts]
 
-            chunk_start = time.perf_counter()
-            result = self.partial_trace_conformance(
-                softmax_matrix=chunk,
-                initial_marking=current_marking,
+            # Compute current window result (standalone), reusing cached result when possible
+            end_ts1 = min(start_ts + chunk_size, n_ts)
+            # Save state before chunk1 (for potential merge)
+            state_before_chunk1_marking = current_marking
+            state_before_chunk1_last_label = current_last_label
+
+            if (
+                pending_result is not None
+                and pending_start_ts == start_ts
+                and pending_end_ts == end_ts1
+            ):
+                # Reuse cached computation for this window
+                result1 = pending_result
+                c1_elapsed = pending_elapsed if pending_elapsed is not None else 0.0
+                c1_steps = end_ts1 - start_ts
+                c1_rate = pending_rate if pending_rate is not None else ((c1_steps / c1_elapsed) if c1_elapsed > 0 else float('inf'))
+                # Clear cache after use
+                pending_result = None
+                pending_start_ts = None
+                pending_end_ts = None
+                pending_elapsed = None
+                pending_rate = None
+            else:
+                chunk1 = softmax_matrix[:, start_ts:end_ts1]
+                c1_start = time.perf_counter()
+                result1 = self.partial_trace_conformance(
+                    softmax_matrix=chunk1,
+                    initial_marking=current_marking,
+                    cost_fn=cost_fn,
+                    eps=eps,
+                    prob_dict=prob_dict,
+                    switch_penalty_weight=switch_penalty_weight,
+                    initial_last_label=current_last_label,
+                    state_cache=({} if use_state_caching else None),
+                )
+                c1_elapsed = time.perf_counter() - c1_start
+                c1_steps = end_ts1 - start_ts
+                c1_rate = (c1_steps / c1_elapsed) if c1_elapsed > 0 else float('inf')
+
+            # If there's no next window, accept chunk1 and finish
+            if end_ts1 >= n_ts:
+                total_cost += result1['total_cost']
+                complete_alignment.extend(result1['alignment'])
+                current_marking = result1['final_marking']
+                current_last_label = _last_trace_label(result1['alignment'])
+
+                chunk_results.append({
+                    'chunk_index': len(chunk_results),
+                    'start_timestamp': start_ts,
+                    'end_timestamp': end_ts1,
+                    'chunk_cost': result1['total_cost'],
+                    'chunk_alignment_length': len(result1['alignment']),
+                    'final_marking': result1['final_marking'],
+                    'processing_seconds': c1_elapsed,
+                    'processing_rate_steps_per_s': c1_rate,
+                    'merged': False,
+                })
+                # Ensure no stale pending cache remains
+                pending_result = None
+                pending_start_ts = None
+                pending_end_ts = None
+                pending_elapsed = None
+                pending_rate = None
+                break
+
+            # Look ahead one window and compare boundary labels
+            last_label_c1 = _last_trace_label(result1['alignment'])
+
+            end_ts2 = min(end_ts1 + chunk_size, n_ts)
+            chunk2 = softmax_matrix[:, end_ts1:end_ts2]
+            c2_start = time.perf_counter()
+            result2 = self.partial_trace_conformance(
+                softmax_matrix=chunk2,
+                initial_marking=result1['final_marking'],
                 cost_fn=cost_fn,
                 eps=eps,
                 prob_dict=prob_dict,
                 switch_penalty_weight=switch_penalty_weight,
-                initial_last_label=current_last_label,
+                initial_last_label=last_label_c1,
                 state_cache=({} if use_state_caching else None),
             )
-            chunk_end = time.perf_counter()
-            elapsed = chunk_end - chunk_start
-            num_steps = end_ts - start_ts
-            rate = (num_steps / elapsed) if elapsed > 0 else float('inf')
+            c2_elapsed = time.perf_counter() - c2_start
+            c2_steps = end_ts2 - end_ts1
+            c2_rate = (c2_steps / c2_elapsed) if c2_elapsed > 0 else float('inf')
 
-            # Accumulate
-            total_cost += result['total_cost']
-            complete_alignment.extend(result['alignment'])
-            current_marking = result['final_marking']
+            first_label_c2 = _first_trace_label(result2['alignment'])
 
-            # Update last emitted label from this chunk's alignment, if any
-            # Look for the last move that advances the trace (sync/log)
-            for move_type, move_label, _ in reversed(result['alignment']):
-                if move_type in ('sync', 'log'):
-                    current_last_label = move_label
-                    break
+            # Decide merge on boundary mismatch (configurable)
+            if merge_mismatched_boundaries and last_label_c1 is not None and first_label_c2 is not None and last_label_c1 != first_label_c2:
+                # Merge the two windows and recompute on the combined subtrace
+                merged_chunk = softmax_matrix[:, start_ts:end_ts2]
+                m_start = time.perf_counter()
+                merged_result = self.partial_trace_conformance(
+                    softmax_matrix=merged_chunk,
+                    initial_marking=state_before_chunk1_marking,
+                    cost_fn=cost_fn,
+                    eps=eps,
+                    prob_dict=prob_dict,
+                    switch_penalty_weight=switch_penalty_weight,
+                    initial_last_label=state_before_chunk1_last_label,
+                    state_cache=({} if use_state_caching else None),
+                )
+                m_elapsed = time.perf_counter() - m_start
+                m_steps = end_ts2 - start_ts
+                m_rate = (m_steps / m_elapsed) if m_elapsed > 0 else float('inf')
 
-            chunk_results.append({
-                'chunk_index': chunk_idx,
-                'start_timestamp': start_ts,
-                'end_timestamp': end_ts,
-                'chunk_cost': result['total_cost'],
-                'chunk_alignment_length': len(result['alignment']),
-                'final_marking': result['final_marking'],
-                'processing_seconds': elapsed,
-                'processing_rate_steps_per_s': rate,
-            })
+                total_cost += merged_result['total_cost']
+                complete_alignment.extend(merged_result['alignment'])
+                current_marking = merged_result['final_marking']
+                current_last_label = _last_trace_label(merged_result['alignment'])
 
-            # Skip per-chunk info logs; show only inline progress and the total summary
+                chunk_results.append({
+                    'chunk_index': len(chunk_results),
+                    'start_timestamp': start_ts,
+                    'end_timestamp': end_ts2,
+                    'chunk_cost': merged_result['total_cost'],
+                    'chunk_alignment_length': len(merged_result['alignment']),
+                    'final_marking': merged_result['final_marking'],
+                    'processing_seconds': m_elapsed,
+                    'processing_rate_steps_per_s': m_rate,
+                    'merged': True,
+                    'merged_from': [start_ts, end_ts1],
+                })
+
+                # Advance by two windows and clear any pending cache
+                start_ts = end_ts2
+                pending_result = None
+                pending_start_ts = None
+                pending_end_ts = None
+                pending_elapsed = None
+                pending_rate = None
+            else:
+                # Accept the first window and continue
+                total_cost += result1['total_cost']
+                complete_alignment.extend(result1['alignment'])
+                current_marking = result1['final_marking']
+                current_last_label = last_label_c1
+
+                chunk_results.append({
+                    'chunk_index': len(chunk_results),
+                    'start_timestamp': start_ts,
+                    'end_timestamp': end_ts1,
+                    'chunk_cost': result1['total_cost'],
+                    'chunk_alignment_length': len(result1['alignment']),
+                    'final_marking': result1['final_marking'],
+                    'processing_seconds': c1_elapsed,
+                    'processing_rate_steps_per_s': c1_rate,
+                    'merged': False,
+                })
+
+                # Cache the look-ahead result to avoid recomputing next iteration
+                pending_result = result2
+                pending_start_ts = end_ts1
+                pending_end_ts = end_ts2
+                pending_elapsed = c2_elapsed
+                pending_rate = c2_rate
+
+                # Move to next window
+                start_ts = end_ts1
 
         total_elapsed = time.perf_counter() - total_start
         total_rate = (n_ts / total_elapsed) if total_elapsed > 0 else float('inf')
@@ -1659,6 +1798,8 @@ class PetriNet:
         prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
+        merge_mismatched_boundaries: bool = True,
+        # removed: restrict_to_observed_moves
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1690,6 +1831,8 @@ class PetriNet:
             prob_dict=prob_dict,
             switch_penalty_weight=switch_penalty_weight,
             use_state_caching=use_state_caching,
+            merge_mismatched_boundaries=merge_mismatched_boundaries,
+            # no observed restriction
         )
         
         # Extract sequence and costs from alignment
