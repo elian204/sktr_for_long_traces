@@ -565,33 +565,56 @@ def select_softmax_matrices(
 
 
 def _convert_case_ids_to_indices(
-    case_ids: List[Union[str, int]], 
+    case_ids: List[Union[str, int]],
     max_matrices: int
 ) -> List[int]:
     """
     Convert case IDs to valid matrix indices.
-    
+
     Supports both integer and string case IDs.
     """
     indices = []
-    
+
     for case_id in case_ids:
         try:
             # Convert to integer index
             idx = int(case_id)
-                
+
             # Validate bounds
             if idx < 0:
                 raise ValueError(f"Negative case ID not allowed: {case_id}")
             if idx >= max_matrices:
                 raise ValueError(f"Case ID {case_id} out of bounds (max: {max_matrices - 1})")
-                
+
             indices.append(idx)
-            
+
         except (ValueError, TypeError) as e:
             if "invalid literal" in str(e):
                 raise ValueError(f"Case ID '{case_id}' is not convertible to integer")
             raise ValueError(f"Invalid case ID '{case_id}': {e}")
-    
+
     return indices
 
+
+def write_collapsed_traces_to_file(
+    df: pd.DataFrame,
+    output_file_path: str,
+    case_column: str = 'case:concept:name',
+    activity_column: str = 'concept:name',
+    separator: str = ' '
+) -> None:
+    """
+    Compatibility wrapper. Use trace_export.write_collapsed_traces instead.
+    """
+    # Absolute import so it works in notebooks/scripts without a package context
+    from trace_export import write_collapsed_traces  # type: ignore
+
+    write_collapsed_traces(
+        df=df,
+        output_file_path=output_file_path,
+        case_column=case_column,
+        activity_column=activity_column,
+        separator=separator,
+        line_prefix='* ',
+        line_suffix=' #',
+    )
