@@ -6,17 +6,21 @@ using beam search with Petri nets, following the pattern of the existing
 compare_stochastic_vs_argmax_random_indices function.
 """
 
+import os
+import io
 import pickle
-from typing import Tuple, Union, Callable, Optional, Dict, List
+import logging
+from pathlib import Path
+
+from typing import (
+    Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+)
+
 import numpy as np
 import pandas as pd
 import torch
-from pathlib import Path
-import io
 from graphviz import Digraph
-import os
-from contextlib import redirect_stderr
-import logging
+
 
 MoveType = str
 
@@ -580,6 +584,160 @@ def group_cases_by_trace(df: pd.DataFrame) -> pd.DataFrame:
     })
     
     return result
+
+
+def get_ground_truth_sequences(df: pd.DataFrame, case_ids: List[str]) -> List[str]:
+    """
+    Get ground truth activity sequences for specified case IDs as a single sequential list.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns,
+        typically from prepare_df().
+    case_ids : List[str]
+        List of case IDs (as strings) to get sequences for.
+
+    Returns
+    -------
+    List[str]
+        Single sequential list containing all ground truth activities from the
+        specified cases in order. Activities from each case are appended in sequence.
+
+    Example
+    -------
+    >>> result = prepare_df('50salads')
+    >>> df, softmax_lst = result
+    >>> sequence = get_ground_truth_sequences(df, ['20', '12'])
+    >>> # sequence contains activities for case '20' followed by activities for case '12'
+    """
+    all_activities = []
+    for case_id in case_ids:
+        # Filter to this case and get the concept:name sequence
+        case_df = df[df['case:concept:name'] == case_id]
+        sequence = case_df['concept:name'].tolist()
+        all_activities.extend(sequence)
+    return all_activities
+
+
+def get_ground_truth_sequences_by_case(df: pd.DataFrame, case_ids: List[str]) -> List[List[str]]:
+    """
+    Get ground truth activity sequences for specified case IDs as a list of lists.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns,
+        typically from prepare_df().
+    case_ids : List[str]
+        List of case IDs (as strings) to get sequences for.
+
+    Returns
+    -------
+    List[List[str]]
+        List of lists, where each inner list contains the ground truth activities
+        for the corresponding case in case_ids (in the same order).
+
+    Example
+    -------
+    >>> result = prepare_df('50salads')
+    >>> df, softmax_lst = result
+    >>> sequences = get_ground_truth_sequences_by_case(df, ['20', '12'])
+    >>> # sequences[0] contains activities for case '20'
+    >>> # sequences[1] contains activities for case '12'
+    """
+    all_sequences = []
+    for case_id in case_ids:
+        # Filter to this case and get the concept:name sequence
+        case_df = df[df['case:concept:name'] == case_id]
+        sequence = case_df['concept:name'].tolist()
+        all_sequences.append(sequence)
+    return all_sequences
+
+
+def get_sequences_by_case(df: pd.DataFrame, case_ids: List[str], label_col: str = 'concept:name') -> List[List[str]]:
+    """
+    Get sequences for specified case IDs from any label column as a list of lists.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and the specified label column.
+    case_ids : List[str]
+        List of case IDs (as strings) to get sequences for.
+    label_col : str, default 'concept:name'
+        Column name containing the labels/activities to extract.
+
+    Returns
+    -------
+    List[List[str]]
+        List of lists, where each inner list contains the labels
+        for the corresponding case in case_ids (in the same order).
+
+    Example
+    -------
+    >>> result = prepare_df('50salads')
+    >>> df, softmax_lst = result
+    >>> gt_sequences = get_sequences_by_case(df, ['20', '12'], 'concept:name')
+    >>> pred_sequences = get_sequences_by_case(df, ['20', '12'], 'predictions')
+    """
+    all_sequences = []
+    for case_id in case_ids:
+        # Filter to this case and get the label sequence
+        case_df = df[df['case:concept:name'] == case_id]
+        sequence = case_df[label_col].tolist()
+        all_sequences.append(sequence)
+    return all_sequences
+
+
+def normalize_sequences_for_evaluation(gt_sequences: List[List[str]], pred_sequences: List[np.ndarray]) -> Tuple[List[List[str]], List[List[str]]]:
+    """
+    Normalize ground truth and prediction sequences to the same type for evaluation.
+
+    This function ensures both sequences are lists of lists of strings, which is
+    the expected format for evaluation functions like tas_metrics.
+
+    Parameters
+    ----------
+    gt_sequences : List[List[str]]
+        Ground truth sequences as lists of strings.
+    pred_sequences : List[np.ndarray]
+        Prediction sequences as numpy arrays (typically of int64).
+
+    Returns
+    -------
+    Tuple[List[List[str]], List[List[str]]]
+        Normalized (gt_sequences, pred_sequences) where both are lists of lists of strings.
+
+    Raises
+    ------
+    ValueError
+        If the sequences have different lengths or if individual sequences don't match in length.
+
+    Example
+    -------
+    >>> gt_seqs = [['17', '11', '13'], ['17', '7', '8']]
+    >>> pred_seqs = [np.array([17, 11, 13]), np.array([17, 7, 8])]
+    >>> gt_norm, pred_norm = normalize_sequences_for_evaluation(gt_seqs, pred_seqs)
+    >>> # Both are now lists of lists of strings
+    """
+    if len(gt_sequences) != len(pred_sequences):
+        raise ValueError(f"Number of sequences don't match: GT has {len(gt_sequences)}, Pred has {len(pred_sequences)}")
+
+    normalized_pred_sequences = []
+
+    for i, (gt_seq, pred_seq) in enumerate(zip(gt_sequences, pred_sequences)):
+        # Convert numpy array to list of strings
+        pred_seq_list = pred_seq.tolist() if hasattr(pred_seq, 'tolist') else list(pred_seq)
+        pred_seq_str = [str(x) for x in pred_seq_list]
+
+        # Check lengths match
+        if len(gt_seq) != len(pred_seq_str):
+            raise ValueError(f"Sequence {i} length mismatch: GT has {len(gt_seq)}, Pred has {len(pred_seq_str)}")
+
+        normalized_pred_sequences.append(pred_seq_str)
+
+    return gt_sequences, normalized_pred_sequences
 
 
 def compute_activity_run_counts(
