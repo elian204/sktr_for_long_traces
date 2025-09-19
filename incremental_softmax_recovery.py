@@ -6,7 +6,7 @@ softmax probability matrices using Petri net models. Supports both beam search
 and conformance checking approaches for flexible trace recovery.
 """
 
-from typing import Any, Callable, List, Optional, Tuple, Union, Dict
+from typing import Any, Callable, List, Optional, Tuple, Union, Dict, Set
 import logging
 import pandas as pd
 import numpy as np
@@ -106,6 +106,7 @@ def incremental_softmax_recovery(
     test_cases: Optional[List[Any]] = None,
     ensure_train_variant_diversity: bool = False,
     ensure_test_variant_diversity: bool = False,
+    allow_train_cases_in_test: bool = False,
     cost_function: Union[str, Callable[[float], float]] = "linear",
     model_move_cost: Optional[Union[float, str, Callable[[float], float]]] = 1.0,
     log_move_cost:   Optional[Union[float, str, Callable[[float], float]]] = 1.0,
@@ -219,11 +220,16 @@ def incremental_softmax_recovery(
         test_cases,
         ensure_train_variant_diversity=ensure_train_variant_diversity,
         ensure_test_variant_diversity=ensure_test_variant_diversity,
+        allow_train_cases_in_test=allow_train_cases_in_test,
         random_seed=random_seed,
     )
     n_train_cases = len(train_df['case:concept:name'].unique())
     n_test_cases = len(test_df['case:concept:name'].unique())
     logger.info(f"Performed train/test split: {n_train_cases} train cases, {n_test_cases} test cases.")
+    overlap_cases = set(train_df['case:concept:name'].unique()).intersection(test_df['case:concept:name'].unique())
+    if overlap_cases:
+        logger.info(f"Train/test overlap enabled for {len(overlap_cases)} case(s).")
+    print(test_df['case:concept:name'].unique())
 
     # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
@@ -261,6 +267,7 @@ def incremental_softmax_recovery(
         raise ValueError("Filtered softmax matrices are required but none were generated")
     
     test_softmax_matrices = select_softmax_matrices(filtered_softmax, test_df)
+    
     if use_calibration:
         # Learn temperature on FULL, unfiltered training traces to ensure alignment
         train_case_ids = train_df['case:concept:name'].drop_duplicates().tolist()
@@ -494,4 +501,157 @@ def _compute_accuracy_records(
     return pd.DataFrame(data), sktr_acc, argmax_acc
 
 
+def _build_prefix_to_next_run_duration_map_from_labels(
+   labels: List[Any],
+   prefix_len: int,
+   key_by_activity: bool = False,
+) -> Dict[Union[Tuple[Any, ...], Tuple[Tuple[Any, ...], Any]], Set[int]]:
+   """
+   Internal helper: compute the prefix-to-next-run-duration map for a single
+   sequence of labels (already provided as a list).
+   
+   Parameters
+   ----------
+   labels : List[Any]
+       Sequence of activity labels.
+   prefix_len : int
+       Exact prefix length to extract.
+   key_by_activity : bool, default=False
+       If True, use (prefix, next_activity) as the key; otherwise use prefix only.
+       This allows separating durations by the next activity to avoid false conflicts.
+       
+   Returns
+   -------
+   Dict[Union[Tuple[Any, ...], Tuple[Tuple[Any, ...], Any]], Set[int]]
+       Mapping from key to the set of observed next run durations. The key is either the
+       prefix tuple (when key_by_activity=False) or a 2-tuple of (prefix tuple, next activity)
+       when key_by_activity=True.
+   """
+   if prefix_len <= 0 or not labels:
+       return {}
 
+   collapsed_labels: List[Any] = []
+   run_lengths: List[int] = []
+   for label in labels:
+       if not collapsed_labels or label != collapsed_labels[-1]:
+           collapsed_labels.append(label)
+           run_lengths.append(1)
+       else:
+           run_lengths[-1] += 1
+
+   num_runs = len(collapsed_labels)
+   if num_runs <= prefix_len:
+       return {}
+
+   result: Dict[Union[Tuple[Any, ...], Tuple[Tuple[Any, ...], Any]], Set[int]] = {}
+   for start_idx in range(0, num_runs - prefix_len):
+       prefix = tuple(collapsed_labels[start_idx:start_idx + prefix_len])
+       next_activity = collapsed_labels[start_idx + prefix_len]
+       key = (prefix, next_activity) if key_by_activity else prefix
+       next_run_length = run_lengths[start_idx + prefix_len]
+       
+       if key in result:
+           result[key].add(next_run_length)
+       else:
+           result[key] = {next_run_length}
+
+   return result
+
+
+def build_prefix_to_next_run_duration_map(
+  df: pd.DataFrame,
+  prefix_len: int,
+  case_col: str = 'case:concept:name',
+  activity_col: str = 'concept:name',
+  key_by_activity: bool = False,
+) -> Union[Dict[Tuple[Any, ...], int], Dict[Tuple[Any, ...], Dict[Any, int]]]:
+  """
+  Build a dictionary mapping run-collapsed prefixes of EXACT length `prefix_len` to
+  the next activity's run duration by aggregating across all cases in a DataFrame.
+
+  Parameters
+  ----------
+  df : pd.DataFrame
+      Event log containing at least case and activity columns.
+  prefix_len : int
+      Exact prefix length to include per case/run-collapsed sequence.
+  case_col : str, default='case:concept:name'
+      Column name identifying the case identifier.
+  activity_col : str, default='concept:name'
+      Column name identifying the activity label.
+  key_by_activity : bool, default=False
+      If True, keys are (prefix tuple, next activity) and values are (duration, activity).
+      If False, keys are prefix tuples and values are durations.
+
+  Returns
+  -------
+  Union[Dict[Tuple[Any, ...], int], Dict[Tuple[Any, ...], Dict[Any, int]]]
+      When key_by_activity=False: Dict[prefix_tuple, duration]
+      When key_by_activity=True: Dict[prefix_tuple, Dict[next_activity, duration]]
+      Aggregated across all cases. Keys with conflicting durations are dropped.
+
+  Raises
+  ------
+  ValueError
+      If required columns are missing from the DataFrame.
+
+  Notes
+  -----
+  - Grouping preserves the row order within each case as it appears in `df`.
+  - If you require a different ordering, pre-sort `df` before calling this function.
+  - When conflicts occur, the key is dropped.
+
+  Examples
+  --------
+  >>> df = pd.DataFrame({
+  ...     'case:concept:name': ['case1', 'case1', 'case1', 'case1', 'case1'],
+  ...     'concept:name': ['A', 'A', 'B', 'B', 'C']
+  ... })
+  >>> build_prefix_to_next_run_duration_map(df, prefix_len=2)
+  {('A', 'B'): 1}
+  >>> build_prefix_to_next_run_duration_map(df, prefix_len=1, key_by_activity=True)
+  {('A',): {'B': 2}, ('B',): {'C': 1}}
+  """
+  if prefix_len <= 0:
+      return {}
+
+  if case_col not in df.columns or activity_col not in df.columns:
+      raise ValueError(
+          f"DataFrame must contain columns '{case_col}' and '{activity_col}'."
+      )
+
+  aggregated_sets: Dict[Union[Tuple[Any, ...], Tuple[Tuple[Any, ...], Any]], Set[int]] = {}
+  for _, case_df in df.groupby(case_col, sort=False):
+      labels = case_df[activity_col].tolist()
+      local_map = _build_prefix_to_next_run_duration_map_from_labels(labels, prefix_len, key_by_activity=key_by_activity)
+      for key, duration_set in local_map.items():
+          if key in aggregated_sets:
+              aggregated_sets[key].update(duration_set)
+          else:
+              aggregated_sets[key] = set(duration_set)
+
+  # Keep only keys with a single unique duration; drop conflicting ones
+  if key_by_activity:
+      nested: Dict[Tuple[Any, ...], Dict[Any, int]] = {}
+      for key, duration_set in aggregated_sets.items():
+          if len(duration_set) == 1:
+              duration = next(iter(duration_set))
+              prefix, next_activity = key  # key is (prefix, next_activity)
+              if prefix not in nested:
+                  nested[prefix] = {}
+              nested[prefix][next_activity] = duration
+          else:
+              logger.warning(
+                  f"Removing key {key} due to conflicting durations: {sorted(duration_set)}"
+              )
+      return nested
+  else:
+      flat: Dict[Tuple[Any, ...], int] = {}
+      for key, duration_set in aggregated_sets.items():
+          if len(duration_set) == 1:
+              flat[key] = next(iter(duration_set))  # key is prefix
+          else:
+              logger.warning(
+                  f"Removing key {key} due to conflicting durations: {sorted(duration_set)}"
+              )
+      return flat

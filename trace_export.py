@@ -73,3 +73,4 @@ def write_collapsed_traces(
             f.write(f"{line_prefix}{line}{line_suffix}\n")
 
 
+

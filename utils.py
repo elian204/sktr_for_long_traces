@@ -1242,3 +1242,284 @@ def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:
     })
     acc_df = pd.concat([acc_df, mean_row], ignore_index=True)
     return acc_df
+
+
+def compute_evaluation_metrics(results_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    """
+    Compute comprehensive TAS evaluation metrics for SKTR and argmax predictions.
+
+    This function takes a results DataFrame (typically from recovery experiments)
+    and computes the standard Temporal Action Segmentation (TAS) metrics for both
+    SKTR and argmax predictions. It uses the evaluation functions from evaluation.py
+    following the standard TAS protocol.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        DataFrame containing recovery results with columns:
+        - 'case:concept:name': case identifier
+        - 'sktr_activity': SKTR predicted activities
+        - 'argmax_activity': argmax predicted activities
+        - 'ground_truth': ground truth activities
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Nested dictionary with metrics for SKTR and argmax:
+        {
+            'sktr': {
+                'acc_micro': micro frame accuracy,
+                'edit': macro mean edit score,
+                'f1@10': macro mean F1@10,
+                'f1@25': macro mean F1@25,
+                'f1@50': macro mean F1@50
+            },
+            'argmax': {
+                same metrics as above
+            }
+        }
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from utils import compute_evaluation_metrics
+    >>> # Load your recovery results CSV
+    >>> df = pd.read_csv('recovery_results_50salads_complete_15.csv')
+    >>> metrics = compute_evaluation_metrics(df)
+    >>> print("SKTR F1@10:", metrics['sktr']['f1@10'])
+    >>> print("Argmax F1@10:", metrics['argmax']['f1@10'])
+
+    Notes
+    -----
+    - Uses compute_tas_metrics_macro from evaluation.py
+    - Follows standard TAS evaluation protocol with macro averaging for Edit/F1
+    - Micro accuracy is computed globally over all frames
+    - Activities are automatically converted to string format if needed
+    - Returns separate metrics for SKTR and argmax approaches
+    """
+    try:
+        from .evaluation import compute_tas_metrics_macro
+    except ImportError:
+        # If running as standalone script, try direct import
+        try:
+            from evaluation import compute_tas_metrics_macro
+        except ImportError:
+            raise ImportError("Cannot import compute_tas_metrics_macro from evaluation.py")
+
+    # Validate required columns
+    required_cols = {'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth'}
+    missing = required_cols.difference(results_df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {sorted(missing)}")
+
+    # Make a copy to avoid modifying original data
+    df = results_df.copy()
+
+    # Convert activity columns to strings if they're numeric
+    for col in ['sktr_activity', 'argmax_activity', 'ground_truth']:
+        if df[col].dtype != 'object':
+            df[col] = df[col].astype(str)
+
+    print(f"Computing evaluation metrics for {df['case:concept:name'].nunique()} cases...")
+
+    # Compute metrics for SKTR
+    print("Computing SKTR metrics...")
+    sktr_metrics = compute_tas_metrics_macro(
+        df=df,
+        pred_col='sktr_activity',
+        gt_col='ground_truth',
+        case_col='case:concept:name'
+    )
+
+    # Compute metrics for argmax
+    print("Computing argmax metrics...")
+    argmax_metrics = compute_tas_metrics_macro(
+        df=df,
+        pred_col='argmax_activity',
+        gt_col='ground_truth',
+        case_col='case:concept:name'
+    )
+
+    # Organize results
+    results = {
+        'sktr': sktr_metrics,
+        'argmax': argmax_metrics
+    }
+
+    print("Evaluation metrics computed successfully!")
+    return results
+
+
+def compute_kari_metrics(
+    pkl_file_path: Union[str, Path],
+    df: pd.DataFrame,
+    case_id_order: List[str],
+    method_name: str = "kari",
+    background: Optional[Any] = '0',
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute TAS evaluation metrics for KARI approach predictions.
+
+    This function loads KARI results from a pickle file, extracts frame-level
+    predictions from the 'labels' field, and computes comprehensive TAS metrics
+    exactly like compute_evaluation_metrics.
+
+    Parameters
+    ----------
+    pkl_file_path : str or Path
+        Path to the pickle file containing KARI results with 'labels' field
+        containing frame-level predictions.
+    df : pd.DataFrame
+        DataFrame containing ground truth sequences with 'case:concept:name'
+        and 'concept:name' columns.
+    case_id_order : List[str]
+        List of case IDs in the order they appear in the pickle file results.
+        Each element should be a string matching the case identifiers in df.
+    method_name : str, default "kari"
+        Name/key to use for the results dictionary.
+    background : Any, optional
+        Background label for edit/F1 computation (default '0').
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Dictionary with method name as key and metrics as values:
+        {
+            method_name: {
+                'acc_micro': global frame accuracy,
+                'edit': macro mean edit score,
+                'f1@10': macro mean F1@10,
+                'f1@25': macro mean F1@25,
+                'f1@50': macro mean F1@50
+            }
+        }
+
+    Raises
+    ------
+    FileNotFoundError
+        If pickle file doesn't exist.
+    ValueError
+        If sequence lengths don't match or other validation errors.
+    """
+    import pickle
+    try:
+        # Try relative import (for when used as part of the package)
+        from .evaluation import compute_tas_metrics_from_sequences
+    except ImportError:
+        # Fall back to absolute import (for standalone usage)
+        from evaluation import compute_tas_metrics_from_sequences
+
+    # Load KARI results
+    pkl_path = Path(pkl_file_path)
+    if not pkl_path.exists():
+        raise FileNotFoundError(f"KARI results file not found: {pkl_path}")
+
+    with open(pkl_path, 'rb') as f:
+        kari_results = pickle.load(f)
+
+    # Validate we have the expected number of results
+    if len(kari_results) != len(case_id_order):
+        raise ValueError(
+            f"Number of KARI results ({len(kari_results)}) doesn't match "
+            f"number of case IDs ({len(case_id_order)})"
+        )
+
+    # Get ground truth sequences
+    gt_sequences = get_sequences_by_case(df, case_id_order)
+
+    # Extract predictions from labels field
+    pred_sequences = []
+    for i, result in enumerate(kari_results):
+        case_id = case_id_order[i]
+
+        # Validate that 'labels' field exists
+        if 'labels' not in result:
+            raise ValueError(f"Result for case {case_id} missing 'labels' field")
+
+        # Convert numpy array to list of strings to match ground truth format
+        labels_array = result['labels']
+        pred_seq = [str(x) for x in labels_array]
+        pred_sequences.append(pred_seq)
+
+    # Validate that all sequences have matching lengths
+    length_mismatches = []
+    for i, (gt_seq, pred_seq) in enumerate(zip(gt_sequences, pred_sequences)):
+        if len(gt_seq) != len(pred_seq):
+            length_mismatches.append(
+                f"Case {case_id_order[i]}: GT={len(gt_seq)}, Pred={len(pred_seq)}"
+            )
+
+    if length_mismatches:
+        raise ValueError(
+            f"Sequence length mismatches found:\n" + "\n".join(length_mismatches)
+        )
+
+    # Compute metrics using the standard function
+    metrics = compute_tas_metrics_from_sequences(
+        gt_sequences=gt_sequences,
+        pred_sequences=pred_sequences,
+        background=background
+    )
+
+    return {method_name: metrics}
+
+
+def compute_kari_metrics_from_pkl(
+    pkl_file_path: Union[str, Path],
+    dataset_name: str = "50salads",
+    case_id_order: Optional[List[str]] = None,
+    method_name: str = "kari",
+    background: Optional[Any] = '0',
+    path: Optional[Union[str, Path]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """
+    Convenience function to compute KARI metrics with automatic DataFrame loading.
+
+    This function automatically loads the DataFrame using prepare_df and
+    provides a default case_id_order for 50salads dataset.
+
+    Parameters
+    ----------
+    pkl_file_path : str or Path
+        Path to the pickle file containing KARI results.
+    dataset_name : str, default "50salads"
+        Dataset name for prepare_df.
+    case_id_order : List[str], optional
+        List of case IDs in correct order. If None, uses default order for 50salads.
+    method_name : str, default "kari"
+        Name/key for results dictionary.
+    background : Any, optional
+        Background label (default '0').
+    path : str or Path, optional
+        Path parameter for prepare_df.
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Same format as compute_kari_metrics.
+    """
+    # Load DataFrame
+    # Only pass path if it's not None or empty string
+    if path:
+        result = prepare_df(dataset_name, path=path)
+    else:
+        result = prepare_df(dataset_name)
+    if len(result) == 2:
+        df, _ = result
+    else:
+        df, _, _ = result
+
+    # Default case order for 50salads
+    if case_id_order is None:
+        case_id_order = ['30', '17', '9', '8', '20', '7', '23', '5', '28', '2', '1', '0',
+                        '13', '36', '33', '3', '14', '10', '31', '22', '34', '38', '37', '6',
+                        '24', '27', '21', '15', '11', '19', '16', '12', '32', '25', '35', '39',
+                        '26', '29', '4', '18']
+
+    return compute_kari_metrics(
+        pkl_file_path=pkl_file_path,
+        df=df,
+        case_id_order=case_id_order,
+        method_name=method_name,
+        background=background
+    )

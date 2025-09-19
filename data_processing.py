@@ -343,6 +343,7 @@ def split_train_test(
     test_cases: Optional[List[Any]] = None,
     ensure_train_variant_diversity: bool = False,
     ensure_test_variant_diversity: bool = False,
+    allow_train_cases_in_test: bool = False,
     random_seed: int = 42
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
@@ -368,6 +369,9 @@ def split_train_test(
     ensure_test_variant_diversity : bool, default=False
         If True, select test cases from different trace variants.
         Only used when test_cases is None.
+    allow_train_cases_in_test : bool, default=False
+        If True, allow train cases to remain eligible for test selection.
+        Applies only when test_cases is None.
     random_seed : int, default=42
         Random seed for reproducible selection.
         
@@ -398,17 +402,20 @@ def split_train_test(
     else:
         final_train_cases = _select_random_cases(all_cases, n_train_traces, train_seed)
     
-    # Determine test cases (excluding train cases to prevent data leakage)
-    remaining_cases = [c for c in all_cases if c not in final_train_cases]
-    
+    # Determine test cases (optionally allowing overlap with training cases)
+    if allow_train_cases_in_test:
+        remaining_cases = all_cases
+    else:
+        remaining_cases = [c for c in all_cases if c not in final_train_cases]
+
     if test_cases is not None:
         final_test_cases = test_cases
     elif ensure_test_variant_diversity:
-        remaining_df = df.loc[df['case:concept:name'].isin(remaining_cases)]
-        final_test_cases = _select_diverse_cases(remaining_df, n_test_traces, test_seed)
+        candidate_df = df if allow_train_cases_in_test else df.loc[df['case:concept:name'].isin(remaining_cases)]
+        final_test_cases = _select_diverse_cases(candidate_df, n_test_traces, test_seed)
     else:
         final_test_cases = _select_random_cases(remaining_cases, n_test_traces, test_seed)
-    
+
     # Create train and test DataFrames
     train_df = _extract_cases(df, final_train_cases)
     test_df = _extract_cases(df, final_test_cases)
@@ -617,4 +624,89 @@ def write_collapsed_traces_to_file(
         separator=separator,
         line_prefix='* ',
         line_suffix=' #',
+    )
+
+
+def sample_and_write_collapsed_traces(
+    df: pd.DataFrame,
+    trace_groups: pd.DataFrame,
+    n: int,
+    output_file_path: str,
+    case_column: str = 'case:concept:name',
+    activity_column: str = 'concept:name',
+    random_seed: Optional[int] = None,
+    verbose: bool = True
+) -> None:
+    """
+    Sample n unique trace variants from trace_groups and write one trace from each variant to a file.
+
+    This function samples n different trace variants and then selects exactly one trace
+    from each sampled variant, resulting in exactly n traces in the output file.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        Original dataframe containing the event log data
+    trace_groups : pd.DataFrame
+        DataFrame from group_cases_by_trace() with 'case_list' column
+    n : int
+        Number of unique trace variants to sample (will result in n traces)
+    output_file_path : str
+        Path where to write the collapsed traces
+    case_column : str, default 'case:concept:name'
+        Name of the case identifier column in df
+    activity_column : str, default 'concept:name'
+        Name of the activity column in df
+    random_seed : int, optional
+        Random seed for reproducible sampling
+    verbose : bool, default True
+        Whether to print the sampled trace IDs
+
+    Raises:
+    -------
+    ValueError
+        If n is greater than the number of available trace variants
+
+    Example:
+    --------
+    >>> trace_groups = group_cases_by_trace(df)
+    >>> sample_and_write_collapsed_traces(df, trace_groups, 5, 'sampled_traces.txt')
+    # Results in exactly 5 traces, one from each of 5 different variants
+    # Prints: "Sampled 5 trace IDs: ['case1', 'case2', 'case3', 'case4', 'case5']"
+    """
+    if 'case_list' not in trace_groups.columns:
+        raise ValueError("trace_groups must have a 'case_list' column (result from group_cases_by_trace)")
+
+    if n > len(trace_groups):
+        raise ValueError(f"Cannot sample {n} variants from {len(trace_groups)} available variants")
+
+    # Set random seed for reproducibility
+    if random_seed is not None:
+        np.random.seed(random_seed)
+        random.seed(random_seed)
+
+    # Sample n variants from trace_groups
+    sampled_variants = trace_groups.sample(n=n, random_state=random_seed if random_seed is not None else None)
+
+    # Select exactly one case ID from each sampled variant
+    sampled_case_ids = []
+    for case_list in sampled_variants['case_list']:
+        if case_list:  # Ensure the variant has at least one case
+            # Randomly select one case from this variant
+            selected_case = random.choice(case_list)
+            sampled_case_ids.append(selected_case)
+
+    # Print sampled trace IDs if verbose is True
+    if verbose:
+        print(f"Sampled {len(sampled_case_ids)} trace IDs: {sampled_case_ids}")
+
+    # Filter original dataframe to only include sampled cases (one from each variant)
+    filtered_df = df[df[case_column].isin(sampled_case_ids)].copy()
+
+    # Write collapsed traces to file
+    write_collapsed_traces_to_file(
+        df=filtered_df,
+        output_file_path=output_file_path,
+        case_column=case_column,
+        activity_column=activity_column
     )
