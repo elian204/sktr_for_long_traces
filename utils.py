@@ -1209,6 +1209,296 @@ def get_activity_run_lengths_by_case(
     return result
 
 
+def compute_argmax_accuracy_from_softmax(
+    df: pd.DataFrame,
+    softmax_lst: List[np.ndarray],
+    case_ids: List[str]
+) -> float:
+    """
+    Compute argmax accuracy for specified cases from softmax matrices.
+
+    For each case, computes the accuracy as the proportion of timesteps where
+    the argmax (highest probability) prediction matches the ground truth.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns.
+    softmax_lst : List[np.ndarray]
+        List of softmax probability matrices, where each matrix has shape
+        (n_classes, n_timesteps) and corresponds to a case.
+    case_ids : List[str]
+        List of case IDs to compute accuracy for.
+
+    Returns
+    -------
+    float
+        Mean argmax accuracy across all specified cases.
+    """
+    total_correct = 0
+    total_predictions = 0
+
+    for case_id in case_ids:
+        # Get ground truth sequence for this case
+        case_df = df[df['case:concept:name'] == case_id]
+        gt_sequence = case_df['concept:name'].tolist()
+
+        if not gt_sequence:
+            continue
+
+        # Get softmax matrix for this case (case_id is the index)
+        case_idx = int(case_id)
+        if case_idx >= len(softmax_lst):
+            continue
+
+        softmax_matrix = softmax_lst[case_idx]
+
+        # Compute argmax predictions
+        argmax_predictions = np.argmax(softmax_matrix, axis=0)
+
+        # Convert ground truth to indices (assuming they are string labels)
+        # For now, we'll assume ground truth is already in the correct format
+        # This might need adjustment based on your specific label encoding
+        gt_indices = [int(label) for label in gt_sequence]
+
+        # Count correct predictions
+        correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+        total_correct += correct
+        total_predictions += len(gt_sequence)
+
+    if total_predictions == 0:
+        return 0.0
+
+    return total_correct / total_predictions
+
+
+def compute_group_statistics(
+    df: pd.DataFrame,
+    softmax_lst: List[np.ndarray],
+    group1_cases: List[str],
+    group2_cases: List[str]
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute argmax accuracy statistics for two groups of cases.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns.
+    softmax_lst : List[np.ndarray]
+        List of softmax probability matrices.
+    group1_cases : List[str]
+        List of case IDs for the first group.
+    group2_cases : List[str]
+        List of case IDs for the second group.
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Dictionary with group statistics:
+        {
+            'group1': {
+                'mean_accuracy': float,
+                'individual_accuracies': List[float],
+                'num_cases': int
+            },
+            'group2': {
+                'mean_accuracy': float,
+                'individual_accuracies': List[float],
+                'num_cases': int
+            }
+        }
+    """
+    results = {}
+
+    for group_name, cases in [('group1', group1_cases), ('group2', group2_cases)]:
+        accuracies = []
+
+        for case_id in cases:
+            case_df = df[df['case:concept:name'] == case_id]
+            gt_sequence = case_df['concept:name'].tolist()
+
+            if not gt_sequence:
+                continue
+
+            case_idx = int(case_id)
+            if case_idx >= len(softmax_lst):
+                continue
+
+            softmax_matrix = softmax_lst[case_idx]
+            argmax_predictions = np.argmax(softmax_matrix, axis=0)
+
+            # Convert ground truth to indices
+            gt_indices = [int(label) for label in gt_sequence]
+
+            # Compute accuracy for this case
+            if len(argmax_predictions) == len(gt_indices):
+                correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+                accuracy = correct / len(gt_sequence)
+                accuracies.append(accuracy)
+
+        if accuracies:
+            mean_accuracy = np.mean(accuracies)
+            results[group_name] = {
+                'mean_accuracy': mean_accuracy,
+                'individual_accuracies': accuracies,
+                'num_cases': len(accuracies)
+            }
+        else:
+            results[group_name] = {
+                'mean_accuracy': 0.0,
+                'individual_accuracies': [],
+                'num_cases': 0
+            }
+
+    return results
+
+
+def compute_entropy(probs: np.ndarray, axis: int = 0) -> np.ndarray:
+    """
+    Compute entropy of probability distributions.
+
+    Parameters
+    ----------
+    probs : np.ndarray
+        Probability matrix of shape (n_classes, n_timesteps)
+    axis : int, default=0
+        Axis along which to compute entropy (0 for per timestep, 1 for per class)
+
+    Returns
+    -------
+    np.ndarray
+        Entropy values
+    """
+    # Clip probabilities to avoid log(0)
+    probs = np.clip(probs, 1e-10, 1.0)
+    # Compute entropy: -sum(p * log(p))
+    entropy = -np.sum(probs * np.log(probs), axis=axis)
+    return entropy
+
+
+def compute_comprehensive_group_statistics(
+    df: pd.DataFrame,
+    softmax_lst: List[np.ndarray],
+    group1_cases: List[str],
+    group2_cases: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Compute comprehensive statistics for two groups of cases including:
+    - Argmax accuracy
+    - Sequence length statistics
+    - Prediction confidence statistics
+    - Entropy statistics (prediction uncertainty)
+    - Class distribution statistics
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns.
+    softmax_lst : List[np.ndarray]
+        List of softmax probability matrices.
+    group1_cases : List[str]
+        List of case IDs for the first group.
+    group2_cases : List[str]
+        List of case IDs for the second group.
+
+    Returns
+    -------
+    Dict[str, Dict[str, Any]]
+        Dictionary with comprehensive statistics for each group.
+    """
+    results = {}
+
+    for group_name, cases in [('group1', group1_cases), ('group2', group2_cases)]:
+        accuracies = []
+        sequence_lengths = []
+        max_probs = []
+        entropies = []
+        gt_class_counts = {}
+        pred_class_counts = {}
+
+        for case_id in cases:
+            case_df = df[df['case:concept:name'] == case_id]
+            gt_sequence = case_df['concept:name'].tolist()
+
+            if not gt_sequence:
+                continue
+
+            case_idx = int(case_id)
+            if case_idx >= len(softmax_lst):
+                continue
+
+            softmax_matrix = softmax_lst[case_idx]
+            argmax_predictions = np.argmax(softmax_matrix, axis=0)
+            max_prob_values = np.max(softmax_matrix, axis=0)
+
+            # Compute entropy per timestep
+            timestep_entropies = compute_entropy(softmax_matrix, axis=0)
+            entropies.extend(timestep_entropies)
+
+            # Convert ground truth to indices
+            gt_indices = [int(label) for label in gt_sequence]
+
+            # Only process if lengths match
+            if len(argmax_predictions) == len(gt_indices):
+                # Accuracy
+                correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+                accuracy = correct / len(gt_sequence)
+                accuracies.append(accuracy)
+
+                # Sequence length
+                sequence_lengths.append(len(gt_sequence))
+
+                # Prediction confidence (max probabilities)
+                max_probs.extend(max_prob_values)
+
+                # Class distributions
+                for gt_class in gt_indices:
+                    gt_class_counts[gt_class] = gt_class_counts.get(gt_class, 0) + 1
+
+                for pred_class in argmax_predictions:
+                    pred_class_counts[pred_class] = pred_class_counts.get(pred_class, 0) + 1
+
+        if accuracies:
+            results[group_name] = {
+                'mean_accuracy': np.mean(accuracies),
+                'std_accuracy': np.std(accuracies),
+                'individual_accuracies': accuracies,
+                'num_cases': len(accuracies),
+                'mean_sequence_length': np.mean(sequence_lengths),
+                'std_sequence_length': np.std(sequence_lengths),
+                'sequence_lengths': sequence_lengths,
+                'mean_max_prob': np.mean(max_probs),
+                'std_max_prob': np.std(max_probs),
+                'max_probs': max_probs,
+                'mean_entropy': np.mean(entropies),
+                'std_entropy': np.std(entropies),
+                'entropies': entropies,
+                'gt_class_distribution': gt_class_counts,
+                'pred_class_distribution': pred_class_counts
+            }
+        else:
+            results[group_name] = {
+                'mean_accuracy': 0.0,
+                'std_accuracy': 0.0,
+                'individual_accuracies': [],
+                'num_cases': 0,
+                'mean_sequence_length': 0.0,
+                'std_sequence_length': 0.0,
+                'sequence_lengths': [],
+                'mean_max_prob': 0.0,
+                'std_max_prob': 0.0,
+                'max_probs': [],
+                'mean_entropy': 0.0,
+                'std_entropy': 0.0,
+                'entropies': [],
+                'gt_class_distribution': {},
+                'pred_class_distribution': {}
+            }
+
+    return results
+
+
 def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute SKTR and Argmax accuracy for each case in the results DataFrame.
@@ -1244,7 +1534,83 @@ def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:
     return acc_df
 
 
-def compute_evaluation_metrics(results_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+def compute_group_accuracies_from_results(results_df: pd.DataFrame, group1_cases: List[str], group2_cases: List[str]) -> Dict[str, Dict[str, float]]:
+    """
+    Compute SKTR and argmax accuracies for two groups of cases from results DataFrame.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        DataFrame with 'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth' columns.
+    group1_cases : List[str]
+        List of case IDs for the first group.
+    group2_cases : List[str]
+        List of case IDs for the second group.
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Dictionary with group statistics:
+        {
+            'group1': {
+                'sktr_accuracy': float,
+                'argmax_accuracy': float,
+                'sktr_individual': List[float],
+                'argmax_individual': List[float],
+                'num_cases': int
+            },
+            'group2': {
+                'sktr_accuracy': float,
+                'argmax_accuracy': float,
+                'sktr_individual': List[float],
+                'argmax_individual': List[float],
+                'num_cases': int
+            }
+        }
+    """
+    def _compute_case_accuracies(group):
+        sktr_correct = (group['sktr_activity'] == group['ground_truth']).sum()
+        argmax_correct = (group['argmax_activity'] == group['ground_truth']).sum()
+        total = len(group)
+        return pd.Series({
+            'sktr_accuracy': sktr_correct / total if total > 0 else 0,
+            'argmax_accuracy': argmax_correct / total if total > 0 else 0
+        })
+
+    results = {}
+
+    for group_name, cases in [('group1', group1_cases), ('group2', group2_cases)]:
+        # Filter to cases in this group
+        group_df = results_df[results_df['case:concept:name'].isin(cases)]
+
+        if len(group_df) > 0:
+            # Compute per-case accuracies
+            case_accuracies = group_df.groupby('case:concept:name').apply(_compute_case_accuracies, include_groups=False).reset_index()
+
+            # Overall group statistics
+            sktr_individual = case_accuracies['sktr_accuracy'].tolist()
+            argmax_individual = case_accuracies['argmax_accuracy'].tolist()
+
+            results[group_name] = {
+                'sktr_accuracy': np.mean(sktr_individual),
+                'argmax_accuracy': np.mean(argmax_individual),
+                'sktr_individual': sktr_individual,
+                'argmax_individual': argmax_individual,
+                'num_cases': len(sktr_individual)
+            }
+        else:
+            results[group_name] = {
+                'sktr_accuracy': 0.0,
+                'argmax_accuracy': 0.0,
+                'sktr_individual': [],
+                'argmax_individual': [],
+                'num_cases': 0
+            }
+
+    return results
+
+
+def compute_evaluation_metrics(results_df: pd.DataFrame, *, background: Optional[Any] = '0') -> Dict[str, Dict[str, float]]:
     """
     Compute comprehensive TAS evaluation metrics for SKTR and argmax predictions.
 
@@ -1328,7 +1694,8 @@ def compute_evaluation_metrics(results_df: pd.DataFrame) -> Dict[str, Dict[str, 
         df=df,
         pred_col='sktr_activity',
         gt_col='ground_truth',
-        case_col='case:concept:name'
+        case_col='case:concept:name',
+        background=background
     )
 
     # Compute metrics for argmax
@@ -1337,7 +1704,8 @@ def compute_evaluation_metrics(results_df: pd.DataFrame) -> Dict[str, Dict[str, 
         df=df,
         pred_col='argmax_activity',
         gt_col='ground_truth',
-        case_col='case:concept:name'
+        case_col='case:concept:name',
+        background=background
     )
 
     # Organize results
@@ -1348,6 +1716,234 @@ def compute_evaluation_metrics(results_df: pd.DataFrame) -> Dict[str, Dict[str, 
 
     print("Evaluation metrics computed successfully!")
     return results
+
+
+def compute_comprehensive_tas_comparison(
+    results_df: pd.DataFrame,
+    kari_pkl_path: str,
+    dataset_name: str = "50salads"
+) -> Dict[str, Dict[str, float]]:
+    """
+    Compute comprehensive TAS statistics for all three approaches: argmax, SKTR, and KARI.
+
+    This function takes recovery results (for SKTR/argmax) and KARI results, then computes
+    TAS metrics for all three approaches using the appropriate evaluation functions.
+
+    Parameters
+    ----------
+    results_df : pd.DataFrame
+        DataFrame containing recovery results with columns:
+        - 'case:concept:name': case identifier
+        - 'sktr_activity': SKTR predicted activities
+        - 'argmax_activity': argmax predicted activities
+        - 'ground_truth': ground truth activities
+    kari_pkl_path : str
+        Path to the pickle file containing KARI results
+    dataset_name : str, default "50salads"
+        Dataset name for loading ground truth data
+
+    Returns
+    -------
+    Dict[str, Dict[str, float]]
+        Nested dictionary with metrics for all three approaches:
+        {
+            'sktr': {
+                'acc_micro': micro frame accuracy,
+                'edit': macro mean edit score,
+                'f1@10': macro mean F1@10,
+                'f1@25': macro mean F1@25,
+                'f1@50': macro mean F1@50
+            },
+            'argmax': {
+                same metrics as above
+            },
+            'kari': {
+                same metrics as above
+            }
+        }
+
+    Raises
+    ------
+    FileNotFoundError
+        If KARI pickle file doesn't exist.
+    ValueError
+        If required columns are missing or data validation fails.
+
+    Examples
+    --------
+    >>> import pandas as pd
+    >>> from utils import compute_comprehensive_tas_comparison
+    >>> # Load recovery results
+    >>> results = pd.read_csv('recovery_results_50salads_complete_15.csv')
+    >>> # Compute comprehensive comparison
+    >>> all_metrics = compute_comprehensive_tas_comparison(results, 'kari_results_50salads_complete.pkl')
+    >>> print("SKTR F1@10:", all_metrics['sktr']['f1@10'])
+    >>> print("Argmax F1@10:", all_metrics['argmax']['f1@10'])
+    >>> print("KARI F1@10:", all_metrics['kari']['f1@10'])
+    """
+    from pathlib import Path
+
+    # Validate inputs
+    required_cols = {'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth'}
+    missing = required_cols.difference(results_df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in results_df: {sorted(missing)}")
+
+    # Check KARI file exists
+    pkl_path = Path(kari_pkl_path)
+    if not pkl_path.exists():
+        raise FileNotFoundError(f"KARI results file not found: {pkl_path}")
+
+    print(f"Computing comprehensive TAS comparison for {results_df['case:concept:name'].nunique()} cases...")
+
+    # Compute SKTR and argmax metrics using existing function
+    print("Computing SKTR and argmax metrics...")
+    sktr_argmax_metrics = compute_evaluation_metrics(results_df)
+
+    # Compute KARI metrics using existing function
+    print("Computing KARI metrics...")
+    case_order = results_df['case:concept:name'].astype(str).drop_duplicates().tolist()
+    # Adapt results_df to the schema expected by compute_kari_metrics/get_sequences_by_case:
+    # it needs a DataFrame with columns 'case:concept:name' and 'concept:name' for GT.
+    gt_df_for_kari = (
+        results_df[["case:concept:name", "ground_truth"]]
+        .rename(columns={"ground_truth": "concept:name"})
+        .copy()
+    )
+    # Ensure both columns are strings so filtering by case_id matches
+    gt_df_for_kari["concept:name"] = gt_df_for_kari["concept:name"].astype(str)
+    gt_df_for_kari["case:concept:name"] = gt_df_for_kari["case:concept:name"].astype(str)
+    kari_metrics = compute_kari_metrics(pkl_path, gt_df_for_kari, case_order, method_name="kari")
+
+    # Combine all metrics into a single comparison dictionary
+    comprehensive_comparison = {
+        'sktr': sktr_argmax_metrics['sktr'],
+        'argmax': sktr_argmax_metrics['argmax'],
+        'kari': kari_metrics['kari']
+    }
+
+    print("✅ Comprehensive TAS comparison completed!")
+    print(f"SKTR F1@10: {comprehensive_comparison['sktr']['f1@10']:.3f}")
+    print(f"Argmax F1@10: {comprehensive_comparison['argmax']['f1@10']:.3f}")
+    print(f"KARI F1@10: {comprehensive_comparison['kari']['f1@10']:.3f}")
+
+    return comprehensive_comparison
+
+
+def print_tas_comparison(
+    metrics: Dict[str, Dict[str, float]],
+    sort_by: Optional[str] = "f1@10",
+    ascending: bool = False,
+    highlight_best: bool = False,
+    return_df: bool = False,
+    precision: int = 2,
+) -> Optional[pd.DataFrame]:
+    """
+    Print a compact comparison table of TAS metrics.
+
+    Rows correspond to approaches (argmax, sktr, kari) and columns to metrics.
+    By default no special highlighting is applied; set ``highlight_best=True``
+    to show a short summary of the best performer per metric.
+    """
+    import pandas as pd
+
+    metric_names = ["acc_micro", "edit", "f1@10", "f1@25", "f1@50"]
+
+    # Build table with approaches as rows
+    desired_order = ["argmax", "sktr", "kari"]
+    df = pd.DataFrame.from_dict(metrics, orient="index")
+    existing_rows = [row for row in desired_order if row in df.index]
+    # Append any unexpected rows at the end to avoid dropping information
+    existing_rows += [row for row in df.index if row not in existing_rows]
+    df = df.loc[existing_rows]
+    # Keep only known metric columns (in order) that exist
+    existing = [m for m in metric_names if m in df.columns]
+    df = df.reindex(columns=existing)
+
+    df_sorted = df.copy()
+    if sort_by is not None:
+        if sort_by not in df_sorted.columns:
+            # Fall back gracefully to first metric if available
+            sort_by = existing[0] if existing else None
+        if sort_by is not None:
+            df_sorted = df_sorted.sort_values(by=sort_by, ascending=ascending)
+
+    # Optional highlighting of best values per column
+    df_display = df_sorted.round(precision)
+
+    if sort_by is None:
+        print("\nTAS comparison (original order)")
+    else:
+        print("\nTAS comparison (sorted by '{}' {})".format(sort_by, "asc" if ascending else "desc"))
+    print(df_display.to_string())
+
+    if highlight_best:
+        print("\nBest per metric:")
+        for col in df_sorted.columns:
+            best_row = df_sorted[col].idxmax()
+            best_val = df_sorted.loc[best_row, col]
+            print(f"  {col}: {best_row} ({best_val:.{precision}f})")
+
+    if return_df:
+        return df_sorted
+    return None
+
+
+def example_comprehensive_tas_comparison():
+    """
+    Example usage of the comprehensive TAS comparison function.
+
+    This example shows how to:
+    1. Load recovery results from CSV
+    2. Compute comprehensive TAS metrics for all approaches
+    3. Display results in a formatted table
+    4. Extract specific metrics for analysis
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    # Example usage (uncomment to run):
+    """
+    # Load recovery results
+    results_df = pd.read_csv('recovery_results_50salads_complete_15.csv')
+
+    # Compute comprehensive TAS comparison
+    all_metrics = compute_comprehensive_tas_comparison(
+        results_df=results_df,
+        kari_pkl_path='kari_results_50salads_complete.pkl'
+    )
+
+    # Display formatted comparison table
+    print_tas_comparison(all_metrics, sort_by="f1@10")
+
+    # Extract specific metrics for analysis
+    sktr_f1_10 = all_metrics['sktr']['f1@10']
+    argmax_f1_10 = all_metrics['argmax']['f1@10']
+    kari_f1_10 = all_metrics['kari']['f1@10']
+
+    print(f"\nF1@10 Comparison:")
+    print(f"SKTR:   {sktr_f1_10:.3f}")
+    print(f"Argmax: {argmax_f1_10:.3f}")
+    print(f"KARI:   {kari_f1_10:.3f}")
+
+    # Find best performing approach for each metric
+    best_approaches = {}
+    for metric in ['acc_micro', 'edit', 'f1@10', 'f1@25', 'f1@50']:
+        best_score = -1
+        best_approach = None
+        for approach in ['sktr', 'argmax', 'kari']:
+            score = all_metrics[approach][metric]
+            if score > best_score:
+                best_score = score
+                best_approach = approach.upper()
+        best_approaches[metric] = best_approach
+
+    print("
+Best approaches by metric:")
+    for metric, approach in best_approaches.items():
+        print(f"{metric"8s"}: {approach}")
+    """
+    print("Example function created! Uncomment the code above to run the comprehensive TAS comparison.")
 
 
 def compute_kari_metrics(
@@ -1464,6 +2060,65 @@ def compute_kari_metrics(
     return {method_name: metrics}
 
 
+def filter_dataframe_by_case_ids(
+    df: pd.DataFrame,
+    case_ids: List[str]
+) -> pd.DataFrame:
+    """
+    Filter a DataFrame to include only specified case IDs in the exact order provided.
+
+    This function selects specific cases from the DataFrame while preserving the exact
+    order of activities within each case as they appear in the original DataFrame.
+    The output DataFrame will contain only the specified case IDs in the order given,
+    with all activities from each case preserved in their original sequence.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        DataFrame with 'case:concept:name' and 'concept:name' columns,
+        typically from prepare_df().
+    case_ids : List[str]
+        List of case IDs (as strings) to include in the filtered DataFrame.
+        Cases will appear in the output DataFrame in the same order as in this list.
+
+    Returns
+    -------
+    pd.DataFrame
+        Filtered DataFrame containing only the specified case IDs in the order provided,
+        with the exact activity sequences preserved within each case.
+
+    Example
+    -------
+    >>> result = prepare_df('50salads')
+    >>> df, softmax_lst = result
+    >>> test_cases = ['20', '11', '5', '36', '14']
+    >>> filtered_df = filter_dataframe_by_case_ids(df, test_cases)
+    >>> # filtered_df now contains only cases '20', '11', '5', '36', '14'
+    >>> # in that exact order, with activities in original sequence per case
+    """
+    # Validate required columns exist
+    required_cols = {"case:concept:name", "concept:name"}
+    missing = required_cols.difference(df.columns)
+    if missing:
+        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+
+    # Create a categorical with the specified order to preserve case order
+    df = df.copy()  # Avoid modifying the original DataFrame
+    df['case:concept:name'] = pd.Categorical(
+        df['case:concept:name'],
+        categories=case_ids,
+        ordered=True
+    )
+
+    # Filter to only the specified case IDs and sort by the categorical order
+    filtered_df = df[df['case:concept:name'].isin(case_ids)].sort_values('case:concept:name')
+
+    # Reset the categorical to regular strings to avoid issues downstream
+    filtered_df['case:concept:name'] = filtered_df['case:concept:name'].astype(str)
+
+    return filtered_df
+
+
 def compute_kari_metrics_from_pkl(
     pkl_file_path: Union[str, Path],
     dataset_name: str = "50salads",
@@ -1523,3 +2178,4 @@ def compute_kari_metrics_from_pkl(
         method_name=method_name,
         background=background
     )
+
