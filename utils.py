@@ -380,6 +380,152 @@ def find_longest_prefix(
     return None
 
 
+def linear_prob_combiner(
+    observed: float,
+    conditioned: float,
+    alpha: float
+) -> float:
+    """
+    Linearly combine observed and conditioned probabilities.
+
+    Returns (1 - alpha) * conditioned + alpha * observed, mirroring the
+    blending convention used elsewhere in this module.
+    """
+    return (1.0 - alpha) * float(conditioned) + float(alpha) * float(observed)
+
+
+def get_run_context_labels(
+    predicted_sequence: Sequence[str]
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Return the (current_run_label, last_different_label) from a predicted sequence.
+
+    - current_run_label: the label of the final contiguous run (i.e., last element).
+    - last_different_label: the most recent label in the sequence that differs from
+      the current run label (i.e., label of the previous run). If none exists,
+      returns None.
+    """
+    if not predicted_sequence:
+        return None, None
+
+    current_label = predicted_sequence[-1]
+
+    # Walk backwards to find the last label that differs from the current run
+    i = len(predicted_sequence) - 1
+    while i >= 0 and predicted_sequence[i] == current_label:
+        i -= 1
+
+    last_different = predicted_sequence[i] if i >= 0 else None
+    return current_label, last_different
+
+
+def adjust_probs_with_conditioning_vector(
+    observed_probs: np.ndarray,
+    class_labels: Sequence[str],
+    *,
+    current_run_label: Optional[str],
+    last_different_label: Optional[str],
+    cond_prob_bigram: Dict[str, Dict[str, float]],
+    alpha: float = 0.5,
+    combine_fn: Optional[Callable[[float, float, float], float]] = None,
+) -> np.ndarray:
+    """
+    Adjust a single timestep's probability vector using conditioned probabilities
+    based on the run context, then normalize to sum to 1.
+
+    Rules (using example current run label 'b' and last different label 'a'):
+      - For any activity c != 'b': blend observed P(c) with conditioned P(c|'b').
+      - For activity 'b' itself: blend observed P('b') with conditioned P('b'|'a').
+        If there is no last different label (first run), leave as observed.
+
+    Parameters
+    ----------
+    observed_probs : np.ndarray
+        1D array of size C with observed probabilities (e.g., softmax at time t).
+    class_labels : Sequence[str]
+        Labels corresponding to indices of observed_probs.
+    current_run_label : Optional[str]
+        Label of the current run (last predicted label).
+    last_different_label : Optional[str]
+        Label of the previous run (most recent label that differs from current).
+    cond_prob_bigram : Dict[str, Dict[str, float]]
+        Bigram conditional probabilities mapping prev -> {next -> P(next|prev)}.
+    alpha : float, default 0.5
+        Blend weight: result = (1 - alpha)*conditioned + alpha*observed.
+    combine_fn : Optional[Callable]
+        Custom combiner (observed, conditioned, alpha) -> float. Defaults to linear.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized adjusted probabilities (1D array of size C).
+    """
+    if combine_fn is None:
+        combine_fn = linear_prob_combiner
+
+    probs = np.asarray(observed_probs, dtype=float).copy()
+    if probs.ndim != 1 or len(probs) != len(class_labels):
+        raise ValueError("observed_probs must be 1D and match class_labels length")
+
+    # If we don't have a current run label or no conditioning dict, return observed (normalized)
+    if current_run_label is None or not cond_prob_bigram:
+        s = probs.sum()
+        return probs / s if s > 0 else probs
+
+    adjusted = np.zeros_like(probs)
+
+    # Pre-fetch conditional maps with graceful fallbacks
+    cond_from_current = cond_prob_bigram.get(current_run_label, {})
+    cond_from_previous = cond_prob_bigram.get(last_different_label, {}) if last_different_label is not None else {}
+
+    for idx, label in enumerate(class_labels):
+        observed_p = probs[idx]
+        if label == current_run_label:
+            # For the current run label 'b', use P(b|'a') if available; if not, keep observed
+            if last_different_label is None:
+                conditioned_p = observed_p
+            else:
+                conditioned_p = cond_from_previous.get(label, observed_p)
+        else:
+            # For any other label c, use P(c|'b')
+            conditioned_p = cond_from_current.get(label, observed_p)
+
+        adjusted[idx] = combine_fn(observed_p, conditioned_p, alpha)
+
+    total = float(adjusted.sum())
+    if total <= 0:
+        # Degenerate case: fallback to observed
+        s = probs.sum()
+        return probs / s if s > 0 else probs
+
+    return adjusted / total
+
+
+def adjust_probs_with_sequence_context(
+    observed_probs: np.ndarray,
+    class_labels: Sequence[str],
+    predicted_sequence: Sequence[str],
+    *,
+    cond_prob_bigram: Dict[str, Dict[str, float]],
+    alpha: float = 0.5,
+    combine_fn: Optional[Callable[[float, float, float], float]] = None,
+) -> np.ndarray:
+    """
+    Convenience wrapper: derives run context from the predicted sequence and
+    applies adjust_probs_with_conditioning_vector.
+    """
+    current_label, last_diff = get_run_context_labels(predicted_sequence)
+    return adjust_probs_with_conditioning_vector(
+        observed_probs,
+        class_labels,
+        current_run_label=current_label,
+        last_different_label=last_diff,
+        cond_prob_bigram=cond_prob_bigram,
+        alpha=alpha,
+        combine_fn=combine_fn,
+    )
+
+
 def prepare_df(
     dataset_name: str,
     path: Optional[Union[str, Path]] = None,
@@ -1899,8 +2045,6 @@ def example_comprehensive_tas_comparison():
     3. Display results in a formatted table
     4. Extract specific metrics for analysis
     """
-    import pandas as pd
-    from pathlib import Path
 
     # Example usage (uncomment to run):
     """

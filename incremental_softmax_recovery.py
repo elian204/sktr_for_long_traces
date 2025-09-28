@@ -53,6 +53,8 @@ def _process_single_test_case(
     conformance_switch_penalty_weight: float,
     use_state_caching: bool,
     merge_mismatched_boundaries: bool,
+    conditioning_alpha: Optional[float],
+    conditioning_combine_fn: Optional[Callable[[float, float, float], float]],
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -80,6 +82,8 @@ def _process_single_test_case(
         switch_penalty_weight=conformance_switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,
+        conditioning_alpha=conditioning_alpha,
+        conditioning_combine_fn=conditioning_combine_fn,
     )
 
     # Compute accuracy
@@ -128,6 +132,8 @@ def incremental_softmax_recovery(
     chunk_size: int = 10,
     # Conformance-specific: switch penalty weight on label change (uses bigram prob_dict)
     conformance_switch_penalty_weight: float = 0.0,
+    conditioning_alpha: Optional[float] = None,
+    conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = True,
     max_chunk_size: int = 50,
@@ -252,9 +258,9 @@ def incremental_softmax_recovery(
     marking_transition_map = model.build_marking_transition_map()
     logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
 
-    # 8. Conditional probabilities (build when needed for switch penalty)
+    # 8. Conditional probabilities (build when needed for switch penalty or conditioning)
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    if conformance_switch_penalty_weight > 0.0:
+    if conformance_switch_penalty_weight > 0.0 or (conditioning_alpha is not None):
         prob_dict = build_probability_dict(train_df, max_hist_len)
         n_histories = len(prob_dict)
         avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
@@ -341,6 +347,7 @@ def incremental_softmax_recovery(
                 prob_threshold, prob_dict, effective_chunk_size,
                 conformance_switch_penalty_weight, use_state_caching,
                 merge_mismatched_boundaries,
+                conditioning_alpha, conditioning_combine_fn,
             )
             parallel_args.append(args)
 
@@ -386,6 +393,8 @@ def incremental_softmax_recovery(
                 switch_penalty_weight=conformance_switch_penalty_weight,
                 use_state_caching=use_state_caching,
                 merge_mismatched_boundaries=merge_mismatched_boundaries,
+                conditioning_alpha=conditioning_alpha,
+                conditioning_combine_fn=conditioning_combine_fn,
             )
 
             # Extract ground truth sequence for accuracy computation

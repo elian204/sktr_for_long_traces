@@ -31,6 +31,7 @@ from heapq import heappush, heappop
 from typing import Callable, Dict, List, Optional, Set, Tuple, Any, Union
 from collections import defaultdict
 import heapq
+from utils import adjust_probs_with_sequence_context
 
 # Configure logger
 logger = logging.getLogger(__name__)
@@ -1321,7 +1322,8 @@ class PetriNet:
         switch_penalty_weight: float = 0.0,
         initial_last_label: Optional[str] = None,
         state_cache: Optional[Dict] = None,
-        # removed: restrict_to_observed_moves
+        conditioning_alpha: Optional[float] = None,
+        conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1339,6 +1341,14 @@ class PetriNet:
         """
         n_acts, n_ts = softmax_matrix.shape
         label2idx = {str(i): i for i in range(n_acts)}
+        idx2label = {i: str(i) for i in range(n_acts)}
+
+        # Extract bigram map prev -> {next -> P(next|prev)} if provided
+        bigram_map: Dict[str, Dict[str, float]] = {}
+        if prob_dict is not None:
+            for prefix, next_map in prob_dict.items():
+                if isinstance(prefix, tuple) and len(prefix) == 1:
+                    bigram_map[prefix[0]] = dict(next_map)
 
         # Min-heap of (cost, node)
         open_set: List[Tuple[float, SearchNode]] = []
@@ -1399,6 +1409,20 @@ class PetriNet:
 
             enabled = self._find_available_transitions(node.marking.places)
 
+            # Prepare per-timestamp probability vector (optionally conditioned)
+            raw_vec = softmax_matrix[:, node.timestamp]
+            if conditioning_alpha is not None and bigram_map:
+                prob_vec = adjust_probs_with_sequence_context(
+                    observed_probs=raw_vec,
+                    class_labels=[idx2label[i] for i in range(n_acts)],
+                    predicted_sequence=list(node.path_prefix),
+                    cond_prob_bigram=bigram_map,
+                    alpha=conditioning_alpha,
+                    combine_fn=conditioning_combine_fn,
+                )
+            else:
+                prob_vec = raw_vec
+
             # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
             for t in enabled:
                 tau_cost_total = 0.0
@@ -1439,11 +1463,11 @@ class PetriNet:
             # 2) Log moves (advance timestamp without firing any transition)
             if node.timestamp < n_ts:
                 for label, idx in label2idx.items():
-                    raw_p = softmax_matrix[idx, node.timestamp]
-                    # Filter out activities below threshold (same as beam search)
-                    if raw_p < eps:
+                    p_adj = float(prob_vec[idx])
+                    # Filter out activities below threshold after adjustment
+                    if p_adj < eps:
                         continue
-                    p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
+                    p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                     c = cost_fn(p, 'log')
                     # Switch penalty from prob_dict using bigram p(x_n | x_{n-1})
                     add_switch = 0.0
@@ -1476,12 +1500,12 @@ class PetriNet:
                 if t.label is None or t.label not in label2idx:
                     continue
                 idx = label2idx[t.label]
-                raw_p = softmax_matrix[idx, node.timestamp]
-                # Filter out activities below threshold (same as beam search)
-                if raw_p < eps:
+                p_adj = float(prob_vec[idx])
+                # Filter out activities below threshold after adjustment
+                if p_adj < eps:
                     continue
                 # no observed-move restriction
-                p = max(raw_p, 1e-12)  # Small epsilon for numerical stability
+                p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                 c = cost_fn(p, 'sync')
 
                 tau_cost_total = 0.0

@@ -22,6 +22,8 @@ def process_trace_chunked(
     switch_penalty_weight: float = 0.0,
     use_state_caching: bool = True,
     merge_mismatched_boundaries: bool = True,
+    conditioning_alpha: Optional[float] = None,
+    conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -54,4 +56,6 @@ def process_trace_chunked(
         switch_penalty_weight=switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,
+        conditioning_alpha=conditioning_alpha,
+        conditioning_combine_fn=conditioning_combine_fn,
     )
