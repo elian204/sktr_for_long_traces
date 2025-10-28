@@ -26,7 +26,7 @@ pip install pandas numpy scipy matplotlib seaborn pm4py scikit-learn
 ## 🚀 Quick Start
 
 ```python
-from incremental_softmax_recovery import incremental_softmax_recovery
+from src.incremental_softmax_recovery import incremental_softmax_recovery
 
 # Your data must follow the sequential format
 df = pd.DataFrame({
@@ -77,6 +77,8 @@ The notebook includes:
 | `conformance_switch_penalty_weight` | Weight on label-switch penalty | 0.0 | Uses `prob_dict` if > 0 |
 | `max_hist_len` | History length for `prob_dict` | 3 | Used when switch penalty enabled |
 | `n_indices` / `n_per_run` | Sampling controls | None | Required based on sampling mode |
+| `save_model_path` | Path for Petri net visualization | `./results/discovered_petri_net` | Saves PDF and PNG |
+| `save_model` | Whether to save Petri net visualization | `True` | Set to `False` to skip saving |
 
 ## 📊 Output Format
 
@@ -113,18 +115,40 @@ results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
 )
 ```
 
-## 📁 Module Structure
+## 📁 Project Structure
 
 ```
-├── incremental_softmax_recovery.py  # Main entry point (conformance-only)
-├── classes.py                       # Petri net classes
-├── data_processing.py               # Data utilities
-├── petri_model.py                   # Model discovery and prob_dict builder
-├── calibration.py                   # Temperature scaling
-├── utils.py                         # Helper functions
-├── test_incremental_recovery.ipynb  # Test notebook
-└── README.md                        # This file
+SKTR_for_Long_Traces/
+├── src/                              # Source code modules
+│   ├── __init__.py                   # Package initialization
+│   ├── incremental_softmax_recovery.py  # Main entry point
+│   ├── classes.py                    # Petri net classes
+│   ├── data_processing.py            # Data utilities
+│   ├── petri_model.py               # Model discovery and prob_dict builder
+│   ├── calibration.py               # Temperature scaling
+│   ├── conformance_checking.py      # Conformance checking algorithms
+│   ├── evaluation.py                # Evaluation metrics
+│   ├── utils.py                     # Helper functions
+│   └── trace_export.py               # Trace export utilities
+├── results/                          # Experiment results (CSV, PKL, PDF files)
+│   ├── incremental_recovery_*.csv   # CSV result files
+│   ├── sktr_*.csv                   # SKTR result files
+│   ├── kari_*.csv                   # KARI comparison results
+│   ├── kari_50salads_results.pkl   # Pickled results
+│   └── discovered_petri_net.pdf     # Petri net visualizations
+├── data/                             # Data files
+│   ├── ground_truth_50salads_sequences.csv
+│   └── sampled_traces.txt
+├── test_incremental_recovery.ipynb   # Main test notebook
+├── activity_distibution_investigation.ipynb
+├── complete_traces_investigation.ipynb
+├── kari.ipynb
+└── README.md                         # This file
 ```
+
+**Note**: All Python modules are now organized in the `src/` directory. Update your imports accordingly:
+- Old: `from incremental_softmax_recovery import ...`
+- New: `from src.incremental_softmax_recovery import ...`
 
 ## 📝 Citation
 
