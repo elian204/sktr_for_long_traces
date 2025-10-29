@@ -638,7 +638,8 @@ def adjust_probs_with_conditioning_vector_extended(
     *,
     current_run_label: Optional[str],
     previous_different_labels: List[str],
-    prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
+    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]],
+    prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
     alpha: float = 0.5,
     combine_fn: Optional[Callable[[float, float, float], float]] = None,
     interpolation_weights: Optional[List[float]] = None,
@@ -648,12 +649,15 @@ def adjust_probs_with_conditioning_vector_extended(
     probabilities based on multiple previous different labels, then normalize to sum to 1.
 
     This is the extended version that supports N previous different labels with
-    interpolation smoothing.
+    interpolation smoothing and uses TWO probability dictionaries:
+    - Uncollapsed dict for CONTINUATION probability (current run label)
+    - Collapsed dict for TRANSITION probability (other labels)
 
     Rules (using example current='D', previous_different=['C','B','A']):
-      - For any activity x != 'D': blend observed P(x) with interpolated P(x|'D','C','B').
-      - For activity 'D' itself: blend observed P('D') with interpolated P('D'|'C','B','A').
-        If there are no previous different labels, leave as observed.
+      - For activity 'D' (current run): blend observed P('D') with interpolated
+        P('D'|'C','B','A') using UNCOLLAPSED dictionary (captures within-run transitions).
+      - For any activity x != 'D': blend observed P(x) with interpolated P(x|'D','C','B')
+        using COLLAPSED dictionary (captures run-to-run transitions).
 
     Interpolation example for P(x|'D','C','B') with weights [0.5, 0.3, 0.2]:
         P_interp = 0.5 * P(x|'D') + 0.3 * P(x|'D','C') + 0.2 * P(x|'D','C','B')
@@ -668,8 +672,11 @@ def adjust_probs_with_conditioning_vector_extended(
         Label of the current run (last predicted label).
     previous_different_labels : List[str]
         List of previous different labels, ordered from most recent to oldest.
-    prob_dict : Dict[Tuple[str, ...], Dict[str, float]]
-        N-gram probability dictionary mapping history tuples to next-label distributions.
+    prob_dict_uncollapsed : Dict[Tuple[str, ...], Dict[str, float]]
+        N-gram probability dictionary built from UNCOLLAPSED traces (for continuation).
+    prob_dict_collapsed : Optional[Dict[Tuple[str, ...], Dict[str, float]]]
+        N-gram probability dictionary built from COLLAPSED traces (for transitions).
+        If None, uses prob_dict_uncollapsed for both (backward compatibility).
     alpha : float, default 0.5
         Blend weight: result = (1 - alpha)*conditioned + alpha*observed.
     combine_fn : Optional[Callable]
@@ -685,12 +692,16 @@ def adjust_probs_with_conditioning_vector_extended(
     if combine_fn is None:
         combine_fn = linear_prob_combiner
 
+    # Backward compatibility: if no collapsed dict provided, use uncollapsed for both
+    if prob_dict_collapsed is None:
+        prob_dict_collapsed = prob_dict_uncollapsed
+
     probs = np.asarray(observed_probs, dtype=float).copy()
     if probs.ndim != 1 or len(probs) != len(class_labels):
         raise ValueError("observed_probs must be 1D and match class_labels length")
 
     # If we don't have a current run label or no conditioning dict, return observed (normalized)
-    if current_run_label is None or not prob_dict:
+    if current_run_label is None or not prob_dict_uncollapsed:
         s = probs.sum()
         return probs / s if s > 0 else probs
 
@@ -700,7 +711,8 @@ def adjust_probs_with_conditioning_vector_extended(
         observed_p = probs[idx]
 
         if label == current_run_label:
-            # For the current run label, use P(current|previous_different_labels)
+            # CONTINUATION: For the current run label, use P(current|previous_different_labels)
+            # Use UNCOLLAPSED dictionary to capture within-run transition patterns
             if not previous_different_labels:
                 conditioned_p = observed_p
             else:
@@ -709,20 +721,21 @@ def adjust_probs_with_conditioning_vector_extended(
                 conditioned_p = interpolate_conditional_probs(
                     target_label=label,
                     context_history=context_history,
-                    prob_dict=prob_dict,
+                    prob_dict=prob_dict_uncollapsed,  # UNCOLLAPSED for continuation
                     interpolation_weights=interpolation_weights,
                 )
                 # If interpolation returns 0 (no n-grams available), use observed
                 if conditioned_p == 0.0:
                     conditioned_p = observed_p
         else:
-            # For any other label, use P(label|current, previous_different_labels)
+            # TRANSITION: For any other label, use P(label|current, previous_different_labels)
+            # Use COLLAPSED dictionary to capture run-to-run transition patterns
             # Build context: current + previous different labels
             context_history = [current_run_label] + previous_different_labels
             conditioned_p = interpolate_conditional_probs(
                 target_label=label,
                 context_history=context_history,
-                prob_dict=prob_dict,
+                prob_dict=prob_dict_collapsed,  # COLLAPSED for transitions
                 interpolation_weights=interpolation_weights,
             )
             # If interpolation returns 0 (no n-grams available), use observed
@@ -746,7 +759,8 @@ def adjust_probs_with_sequence_context(
     predicted_sequence: Sequence[str],
     *,
     cond_prob_bigram: Optional[Dict[str, Dict[str, float]]] = None,
-    prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+    prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+    prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
     alpha: float = 0.5,
     combine_fn: Optional[Callable[[float, float, float], float]] = None,
     n_prev_labels: int = 1,
@@ -759,7 +773,7 @@ def adjust_probs_with_sequence_context(
     Supports both legacy (single previous label) and extended (multiple previous labels)
     conditioning modes:
     - If n_prev_labels=1 and cond_prob_bigram is provided: uses legacy mode
-    - If n_prev_labels>1 or prob_dict is provided: uses extended mode with interpolation
+    - If n_prev_labels>1 or prob_dict_uncollapsed is provided: uses extended mode with interpolation
 
     Parameters
     ----------
@@ -771,8 +785,10 @@ def adjust_probs_with_sequence_context(
         Sequence of predicted labels so far.
     cond_prob_bigram : Optional[Dict[str, Dict[str, float]]]
         Legacy bigram map (for backward compatibility). Used when n_prev_labels=1.
-    prob_dict : Optional[Dict[Tuple[str, ...], Dict[str, float]]]
-        Full n-gram probability dictionary. Used for extended mode.
+    prob_dict_uncollapsed : Optional[Dict[Tuple[str, ...], Dict[str, float]]]
+        N-gram probability dictionary built from UNCOLLAPSED traces (for continuation).
+    prob_dict_collapsed : Optional[Dict[Tuple[str, ...], Dict[str, float]]]
+        N-gram probability dictionary built from COLLAPSED traces (for transitions).
     alpha : float, default 0.5
         Blend weight: result = (1 - alpha)*conditioned + alpha*observed.
     combine_fn : Optional[Callable]
@@ -790,7 +806,7 @@ def adjust_probs_with_sequence_context(
         Normalized adjusted probabilities.
     """
     # Legacy mode: n_prev_labels=1 with cond_prob_bigram
-    if n_prev_labels == 1 and cond_prob_bigram is not None and prob_dict is None:
+    if n_prev_labels == 1 and cond_prob_bigram is not None and prob_dict_uncollapsed is None:
         current_label, last_diff = get_run_context_labels(predicted_sequence)
         return adjust_probs_with_conditioning_vector(
             observed_probs,
@@ -802,8 +818,8 @@ def adjust_probs_with_sequence_context(
             combine_fn=combine_fn,
         )
 
-    # Extended mode: n_prev_labels>=1 with prob_dict
-    if prob_dict is not None:
+    # Extended mode: n_prev_labels>=1 with prob_dict_uncollapsed
+    if prob_dict_uncollapsed is not None:
         current_label, previous_labels = get_run_context_labels_extended(
             predicted_sequence, n_prev_labels=n_prev_labels
         )
@@ -812,7 +828,8 @@ def adjust_probs_with_sequence_context(
             class_labels,
             current_run_label=current_label,
             previous_different_labels=previous_labels,
-            prob_dict=prob_dict,
+            prob_dict_uncollapsed=prob_dict_uncollapsed,
+            prob_dict_collapsed=prob_dict_collapsed,
             alpha=alpha,
             combine_fn=combine_fn,
             interpolation_weights=interpolation_weights,

@@ -18,7 +18,8 @@ def process_trace_chunked(
     eps: float = 1e-12,
     inline_progress: bool = False,
     progress_prefix: str = "",
-    prob_dict: Optional[Mapping[Tuple[str, ...], Mapping[str, float]]] = None,
+    prob_dict_uncollapsed: Optional[Mapping[Tuple[str, ...], Mapping[str, float]]] = None,
+    prob_dict_collapsed: Optional[Mapping[Tuple[str, ...], Mapping[str, float]]] = None,
     switch_penalty_weight: float = 0.0,
     use_state_caching: bool = True,
     merge_mismatched_boundaries: bool = True,
@@ -29,7 +30,7 @@ def process_trace_chunked(
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
-    
+
     Args:
         softmax_matrix: Softmax probability matrix (n_activities, n_timestamps)
         model: PetriNet model to use for conformance checking
@@ -38,12 +39,12 @@ def process_trace_chunked(
         eps: Minimum probability threshold - activities below this are filtered out
         inline_progress: Whether to print inline progress during processing
         progress_prefix: Prefix string for progress display
-        prob_dict: Optional conditional probability dictionary for switch penalties
+        prob_dict_uncollapsed: Optional UNCOLLAPSED conditional probability dictionary (for continuation)
+        prob_dict_collapsed: Optional COLLAPSED conditional probability dictionary (for transitions)
         switch_penalty_weight: Weight for penalizing label switches across chunks
         use_state_caching: Enable caching of intermediate states for speed
         merge_mismatched_boundaries: If True, merge adjacent chunks when boundary labels disagree
-        restrict_to_observed_moves: If True, allow only labeled model/sync moves observed in training (per prob_dict)
-    
+
     Returns:
         Tuple[List[str], List[float]]: (predicted_sequence, move_costs)
     """
@@ -54,7 +55,8 @@ def process_trace_chunked(
         eps=eps,
         inline_progress=inline_progress,
         progress_prefix=progress_prefix,
-        prob_dict=prob_dict,
+        prob_dict_uncollapsed=prob_dict_uncollapsed,
+        prob_dict_collapsed=prob_dict_collapsed,
         switch_penalty_weight=switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,

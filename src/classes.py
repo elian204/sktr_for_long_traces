@@ -1323,7 +1323,8 @@ class PetriNet:
         initial_marking: 'Marking',
         cost_fn: Callable[[float, str], float],
         eps: float = 1e-12,
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         initial_last_label: Optional[str] = None,
         state_cache: Optional[Dict] = None,
@@ -1351,10 +1352,10 @@ class PetriNet:
         idx2label = {i: str(i) for i in range(n_acts)}
 
         # Extract bigram map prev -> {next -> P(next|prev)} if provided (legacy mode)
-        # For extended mode (n_prev_labels > 1), we'll pass prob_dict directly
+        # For extended mode (n_prev_labels > 1), we'll pass prob_dict_uncollapsed and prob_dict_collapsed directly
         bigram_map: Dict[str, Dict[str, float]] = {}
-        if prob_dict is not None and conditioning_n_prev_labels == 1:
-            for prefix, next_map in prob_dict.items():
+        if prob_dict_uncollapsed is not None and conditioning_n_prev_labels == 1:
+            for prefix, next_map in prob_dict_uncollapsed.items():
                 if isinstance(prefix, tuple) and len(prefix) == 1:
                     bigram_map[prefix[0]] = dict(next_map)
 
@@ -1419,7 +1420,7 @@ class PetriNet:
 
             # Prepare per-timestamp probability vector (optionally conditioned)
             raw_vec = softmax_matrix[:, node.timestamp]
-            if conditioning_alpha is not None and (bigram_map or prob_dict):
+            if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
                 # Determine which mode to use based on conditioning_n_prev_labels
                 if conditioning_n_prev_labels == 1 and bigram_map:
                     # Legacy mode: single previous label with bigram_map
@@ -1432,13 +1433,15 @@ class PetriNet:
                         combine_fn=conditioning_combine_fn,
                         n_prev_labels=1,
                     )
-                elif conditioning_n_prev_labels > 1 and prob_dict is not None:
+                elif conditioning_n_prev_labels > 1 and prob_dict_uncollapsed is not None:
                     # Extended mode: multiple previous labels with interpolation
+                    # Uses TWO dictionaries: uncollapsed for continuation, collapsed for transitions
                     prob_vec = adjust_probs_with_sequence_context(
                         observed_probs=raw_vec,
                         class_labels=[idx2label[i] for i in range(n_acts)],
                         predicted_sequence=list(node.path_prefix),
-                        prob_dict=prob_dict,
+                        prob_dict_uncollapsed=prob_dict_uncollapsed,
+                        prob_dict_collapsed=prob_dict_collapsed,
                         alpha=conditioning_alpha,
                         combine_fn=conditioning_combine_fn,
                         n_prev_labels=conditioning_n_prev_labels,
@@ -1495,11 +1498,11 @@ class PetriNet:
                         continue
                     p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                     c = cost_fn(p, 'log')
-                    # Switch penalty from prob_dict using bigram p(x_n | x_{n-1})
+                    # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
-                    if switch_penalty_weight > 0.0 and node.last_label is not None and label != node.last_label and prob_dict is not None:
+                    if switch_penalty_weight > 0.0 and node.last_label is not None and label != node.last_label and prob_dict_uncollapsed is not None:
                         bigram_prefix = (node.last_label,)
-                        p_stay = float(prob_dict.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                        p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(node.last_label, 0.0))
                         p_stay = max(min(p_stay, 1.0), 0.0)
                         add_switch = switch_penalty_weight * p_stay
 
@@ -1550,12 +1553,12 @@ class PetriNet:
                 else:
                     # This is a directly enabled transition
                     new_mark = self._fire_transition(node.marking, t)
-                
-                # Switch penalty from prob_dict using bigram p(x_n | x_{n-1})
+
+                # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                 add_switch = 0.0
-                if switch_penalty_weight > 0.0 and node.last_label is not None and t.label != node.last_label and prob_dict is not None:
+                if switch_penalty_weight > 0.0 and node.last_label is not None and t.label != node.last_label and prob_dict_uncollapsed is not None:
                     bigram_prefix = (node.last_label,)
-                    p_stay = float(prob_dict.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                    p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(node.last_label, 0.0))
                     p_stay = max(min(p_stay, 1.0), 0.0)
                     add_switch = switch_penalty_weight * p_stay
 
@@ -1589,7 +1592,8 @@ class PetriNet:
         eps: float = 1e-12,
         inline_progress: bool = False,
         progress_prefix: str = "",
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
         merge_mismatched_boundaries: bool = True,
@@ -1688,7 +1692,8 @@ class PetriNet:
                     initial_marking=current_marking,
                     cost_fn=cost_fn,
                     eps=eps,
-                    prob_dict=prob_dict,
+                    prob_dict_uncollapsed=prob_dict_uncollapsed,
+                    prob_dict_collapsed=prob_dict_collapsed,
                     switch_penalty_weight=switch_penalty_weight,
                     initial_last_label=current_last_label,
                     state_cache=({} if use_state_caching else None),
@@ -1738,7 +1743,8 @@ class PetriNet:
                 initial_marking=result1['final_marking'],
                 cost_fn=cost_fn,
                 eps=eps,
-                prob_dict=prob_dict,
+                prob_dict_uncollapsed=prob_dict_uncollapsed,
+                prob_dict_collapsed=prob_dict_collapsed,
                 switch_penalty_weight=switch_penalty_weight,
                 initial_last_label=last_label_c1,
                 state_cache=({} if use_state_caching else None),
@@ -1763,7 +1769,8 @@ class PetriNet:
                     initial_marking=state_before_chunk1_marking,
                     cost_fn=cost_fn,
                     eps=eps,
-                    prob_dict=prob_dict,
+                    prob_dict_uncollapsed=prob_dict_uncollapsed,
+                    prob_dict_collapsed=prob_dict_collapsed,
                     switch_penalty_weight=switch_penalty_weight,
                     initial_last_label=state_before_chunk1_last_label,
                     state_cache=({} if use_state_caching else None),
@@ -1861,7 +1868,8 @@ class PetriNet:
         eps: float = 1e-12,
         inline_progress: bool = False,
         progress_prefix: str = "",
-        prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+        prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
         switch_penalty_weight: float = 0.0,
         use_state_caching: bool = True,
         merge_mismatched_boundaries: bool = True,
@@ -1873,22 +1881,22 @@ class PetriNet:
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
-        
+
         This function maintains the same interface as process_test_case_incremental but uses
         the more efficient chunked conformance checking approach instead of beam search.
-        
+
         Args:
             softmax_matrix: Softmax probability matrix (n_activities, n_timestamps)
             cost_fn: Cost function for moves
             chunk_size: Size of chunks to process iteratively
             eps: Minimum probability threshold - activities below this are filtered out
-            
+
         Returns:
             Tuple[List[str], List[float]]: (predicted_sequence, move_costs)
         """
         if self.init_mark is None:
             raise ValueError("Model must have a valid initial marking (init_mark)")
-        
+
         # Use chunked trace conformance
         result = self.conformance_chunked(
             softmax_matrix=softmax_matrix,
@@ -1898,7 +1906,8 @@ class PetriNet:
             eps=eps,
             inline_progress=inline_progress,
             progress_prefix=progress_prefix,
-            prob_dict=prob_dict,
+            prob_dict_uncollapsed=prob_dict_uncollapsed,
+            prob_dict_collapsed=prob_dict_collapsed,
             switch_penalty_weight=switch_penalty_weight,
             use_state_caching=use_state_caching,
             merge_mismatched_boundaries=merge_mismatched_boundaries,

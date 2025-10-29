@@ -48,7 +48,8 @@ def _process_single_test_case(
     model: Any,
     cost_fn: Callable,
     prob_threshold: float,
-    prob_dict: Dict,
+    prob_dict_uncollapsed: Dict,
+    prob_dict_collapsed: Dict,
     chunk_size: int,
     conformance_switch_penalty_weight: float,
     use_state_caching: bool,
@@ -80,7 +81,8 @@ def _process_single_test_case(
         chunk_size=chunk_size,
         eps=prob_threshold,
         inline_progress=False,  # Disable progress for parallel processing
-        prob_dict=prob_dict,
+        prob_dict_uncollapsed=prob_dict_uncollapsed,
+        prob_dict_collapsed=prob_dict_collapsed,
         switch_penalty_weight=conformance_switch_penalty_weight,
         use_state_caching=use_state_caching,
         merge_mismatched_boundaries=merge_mismatched_boundaries,
@@ -153,7 +155,7 @@ def incremental_softmax_recovery(
     compute_marking_transition_map: bool = True,
     verbose: bool = True,
     log_level: int = logging.INFO,
-) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]]]:
+) -> Tuple[pd.DataFrame, Dict[str, List[float]], Tuple[Dict[Tuple[str, ...], Dict[str, float]], Dict[Tuple[str, ...], Dict[str, float]]]]:
     """
     Recover activity sequences from softmax matrices using Petri net models (conformance only).
 
@@ -312,17 +314,30 @@ def incremental_softmax_recovery(
         marking_transition_map = None
 
     # 8. Conditional probabilities (build when needed for switch penalty or conditioning)
-    prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    # Build TWO dictionaries: uncollapsed (for continuation) and collapsed (for transitions)
+    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+
     if conformance_switch_penalty_weight > 0.0 or (conditioning_alpha is not None):
-        prob_dict = build_probability_dict(
+        # Build UNCOLLAPSED dictionary for continuation probabilities
+        prob_dict_uncollapsed = build_probability_dict(
             train_df,
             max_hist_len=max_hist_len,
-            use_collapsed=use_collapsed_runs
+            use_collapsed=False  # UNCOLLAPSED
         )
-        n_histories = len(prob_dict)
-        avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
-        collapse_mode = "collapsed (run-to-run)" if use_collapsed_runs else "raw (all transitions)"
-        logger.info(f"Built conditional probability dictionary ({collapse_mode}): {n_histories} histories, avg {avg_activities_per_history:.1f} activities per history.")
+        n_histories_uncollapsed = len(prob_dict_uncollapsed)
+        avg_activities_uncollapsed = np.mean([len(activities) for activities in prob_dict_uncollapsed.values()]) if prob_dict_uncollapsed else 0
+        logger.info(f"Built UNCOLLAPSED probability dictionary (for continuation): {n_histories_uncollapsed} histories, avg {avg_activities_uncollapsed:.1f} activities per history.")
+
+        # Build COLLAPSED dictionary for transition probabilities
+        prob_dict_collapsed = build_probability_dict(
+            train_df,
+            max_hist_len=max_hist_len,
+            use_collapsed=True  # COLLAPSED
+        )
+        n_histories_collapsed = len(prob_dict_collapsed)
+        avg_activities_collapsed = np.mean([len(activities) for activities in prob_dict_collapsed.values()]) if prob_dict_collapsed else 0
+        logger.info(f"Built COLLAPSED probability dictionary (for transitions): {n_histories_collapsed} histories, avg {avg_activities_collapsed:.1f} activities per history.")
     else:
         logger.info("Skipping probability dictionary build (not requested).")
 
@@ -402,7 +417,7 @@ def incremental_softmax_recovery(
         for case, softmax_matrix in zip(test_case_ids, test_softmax_matrices):
             args = (
                 case, softmax_matrix, test_df, model, cost_fn,
-                prob_threshold, prob_dict, effective_chunk_size,
+                prob_threshold, prob_dict_uncollapsed, prob_dict_collapsed, effective_chunk_size,
                 conformance_switch_penalty_weight, use_state_caching,
                 merge_mismatched_boundaries,
                 conditioning_alpha, conditioning_combine_fn,
@@ -448,7 +463,8 @@ def incremental_softmax_recovery(
                 eps=prob_threshold,
                 inline_progress=True,
                 progress_prefix=f"case {idx}/{len(test_case_ids)}",
-                prob_dict=prob_dict,
+                prob_dict_uncollapsed=prob_dict_uncollapsed,
+                prob_dict_collapsed=prob_dict_collapsed,
                 switch_penalty_weight=conformance_switch_penalty_weight,
                 use_state_caching=use_state_caching,
                 merge_mismatched_boundaries=merge_mismatched_boundaries,
@@ -496,7 +512,7 @@ def incremental_softmax_recovery(
         pass
     logger.info("Built results DataFrame and accuracy dictionary.")
     logger.info("Softmax trace recovery completed using conformance method.")
-    return results_df, accuracy_dict, prob_dict
+    return results_df, accuracy_dict, (prob_dict_uncollapsed, prob_dict_collapsed)
 
 
 def _compute_accuracy_records(
