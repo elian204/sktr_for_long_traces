@@ -284,11 +284,12 @@ def _create_configured_petrinet(
 def build_probability_dict(
     train_df: pd.DataFrame,
     max_hist_len: int = 3,
-    precision: int = 2
+    precision: int = 2,
+    use_collapsed: bool = True
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build a conditional probability dictionary from training traces.
-    
+
     Parameters
     ----------
     train_df : pd.DataFrame
@@ -297,16 +298,21 @@ def build_probability_dict(
         Maximum history length for n-grams
     precision : int, default=2
         Decimal precision for probabilities
-        
+    use_collapsed : bool, default=True
+        If True, collapse consecutive runs before computing n-gram statistics.
+        This matches the run-to-run transition logic used in conditional probability
+        adjustment. Recommended: True for multi-label conditioning.
+
     Returns
     -------
     Dict[Tuple[str, ...], Dict[str, float]]
         Dictionary mapping history tuples to activity probabilities
     """
     return _build_conditioned_prob_dict(
-        train_df, 
-        max_hist_len=max_hist_len, 
-        precision=precision
+        train_df,
+        max_hist_len=max_hist_len,
+        precision=precision,
+        use_collapsed=use_collapsed
     )
 
 
@@ -314,6 +320,7 @@ def _build_conditioned_prob_dict(
     df_train: pd.DataFrame,
     max_hist_len: int = 2,
     precision: int = 2,
+    use_collapsed: bool = True
 ) -> Dict[Tuple[str, ...], Dict[str, float]]:
     """
     Build conditional probabilities P(activity | history) for all histories of
@@ -327,10 +334,26 @@ def _build_conditioned_prob_dict(
         Maximum history length for n-grams.
     precision : int, default=2
         Decimal places for probabilities.
+    use_collapsed : bool, default=True
+        If True, collapse consecutive runs before computing n-gram statistics.
+        This ensures n-gram probabilities match the run-to-run transition logic
+        used in get_run_context_labels_extended().
 
     Returns
     -------
     Dict[history, Dict[next_activity, probability]]
+        Conditional probability dictionary mapping history tuples to next activity distributions.
+
+    Notes
+    -----
+    When use_collapsed=True:
+        Raw trace: ['A', 'A', 'B', 'B', 'B', 'C']
+        Collapsed: ['A', 'B', 'C']
+        N-grams computed from: A→B, B→C
+
+    When use_collapsed=False (legacy):
+        Raw trace: ['A', 'A', 'B', 'B', 'B', 'C']
+        N-grams computed from: A→A, A→B, B→B, B→B, B→C
     """
     # 1) Extract sequences per case
     activity_sequences = [
@@ -338,10 +361,14 @@ def _build_conditioned_prob_dict(
         for _, group in df_train.groupby('case:concept:name', sort=False)
     ]
 
-    # 2) Count (history → next_activity) exactly as original
+    # 2) Count (history → next_activity)
     history_counts: Dict[Tuple[str, ...], Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    # Choose extraction method based on use_collapsed
+    extraction_fn = _get_histories_up_to_length_k_collapsed if use_collapsed else _get_histories_up_to_length_k
+
     for seq in activity_sequences:
-        pairs = _get_histories_up_to_length_k(seq, max_hist_len)
+        pairs = extraction_fn(seq, max_hist_len)
         for history, activity in pairs:
             history_counts[history][activity] += 1
 
@@ -358,20 +385,48 @@ def _build_conditioned_prob_dict(
     return prob_dict
 
 
+def collapse_runs(sequence: List[str]) -> List[str]:
+    """
+    Collapse consecutive runs of the same activity into a single occurrence.
+
+    Example:
+        ['A', 'A', 'A', 'B', 'B', 'C', 'D', 'D'] → ['A', 'B', 'C', 'D']
+
+    Parameters
+    ----------
+    sequence : List[str]
+        Sequence of activity labels (possibly with runs)
+
+    Returns
+    -------
+    List[str]
+        Collapsed sequence with runs removed
+    """
+    if not sequence:
+        return []
+
+    collapsed = [sequence[0]]
+    for activity in sequence[1:]:
+        if activity != collapsed[-1]:
+            collapsed.append(activity)
+
+    return collapsed
+
+
 def _get_histories_up_to_length_k(
-    activities_seq_list: List[str], 
+    activities_seq_list: List[str],
     k: int
 ) -> List[Tuple[Tuple[str, ...], str]]:
     """
     Generate all possible (history, activity) pairs up to length k.
-    
+
     Parameters
     ----------
     activities_seq_list : List[str]
         Sequence of activity names
     k : int
         Maximum history length
-        
+
     Returns
     -------
     List[Tuple[Tuple[str, ...], str]]
@@ -379,19 +434,63 @@ def _get_histories_up_to_length_k(
     """
     if not activities_seq_list:
         return []
-    
+
     histories = []
-    
+
     # Include the first activity with empty history
     histories.append(((), activities_seq_list[0]))
-    
+
     # Generate histories for subsequent activities
     for i in range(1, len(activities_seq_list)):
         current_activity = activities_seq_list[i]
-        
+
         # Try different history lengths up to k
         for j in range(1, min(i + 1, k + 1)):
             history = tuple(activities_seq_list[i-j:i])
             histories.append((history, current_activity))
-    
+
     return histories
+
+
+def _get_histories_up_to_length_k_collapsed(
+    activities_seq_list: List[str],
+    k: int
+) -> List[Tuple[Tuple[str, ...], str]]:
+    """
+    Generate all possible (history, activity) pairs up to length k from a
+    run-collapsed version of the sequence.
+
+    This is useful for building n-gram statistics that match the run-to-run
+    transition logic used in conditional probability adjustment, where consecutive
+    repetitions of the same activity are treated as a single "run".
+
+    Example:
+        Raw sequence: ['A', 'A', 'B', 'B', 'B', 'C', 'D', 'D']
+        Collapsed:    ['A', 'B', 'C', 'D']
+        Histories:    [
+            ((), 'A'),
+            (('A',), 'B'),
+            (('A', 'B'), 'C'),
+            (('B',), 'C'),
+            (('A', 'B', 'C'), 'D'),
+            (('B', 'C'), 'D'),
+            (('C',), 'D'),
+        ]
+
+    Parameters
+    ----------
+    activities_seq_list : List[str]
+        Sequence of activity names (may contain consecutive runs)
+    k : int
+        Maximum history length
+
+    Returns
+    -------
+    List[Tuple[Tuple[str, ...], str]]
+        List of (history_tuple, next_activity) pairs from collapsed sequence
+    """
+    # First collapse runs
+    collapsed_seq = collapse_runs(activities_seq_list)
+
+    # Then apply standard history extraction
+    return _get_histories_up_to_length_k(collapsed_seq, k)

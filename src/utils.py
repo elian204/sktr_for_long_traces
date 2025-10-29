@@ -419,6 +419,137 @@ def get_run_context_labels(
     return current_label, last_different
 
 
+def get_run_context_labels_extended(
+    predicted_sequence: Sequence[str],
+    n_prev_labels: int = 1
+) -> Tuple[Optional[str], List[str]]:
+    """
+    Return the (current_run_label, list_of_previous_different_labels) from a predicted sequence.
+
+    - current_run_label: the label of the final contiguous run (i.e., last element).
+    - list_of_previous_different_labels: list of up to n_prev_labels most recent labels
+      that differ from the current run label AND from each other, ordered from most
+      recent to oldest. If fewer than n_prev_labels are available, returns what's available.
+
+    Example:
+        sequence = ['A', 'B', 'B', 'C', 'C', 'C', 'D', 'D']
+        n_prev_labels = 3
+        Returns: ('D', ['C', 'B', 'A'])
+
+    Parameters
+    ----------
+    predicted_sequence : Sequence[str]
+        Sequence of predicted labels.
+    n_prev_labels : int, default 1
+        Number of previous different labels to extract.
+
+    Returns
+    -------
+    Tuple[Optional[str], List[str]]
+        (current_run_label, list_of_previous_different_labels)
+    """
+    if not predicted_sequence:
+        return None, []
+
+    current_label = predicted_sequence[-1]
+    previous_different_labels: List[str] = []
+
+    # Walk backwards through the sequence, collecting labels different from current
+    # and different from each other
+    i = len(predicted_sequence) - 1
+    last_collected: Optional[str] = current_label
+
+    while i >= 0 and len(previous_different_labels) < n_prev_labels:
+        label = predicted_sequence[i]
+        if label != last_collected:
+            previous_different_labels.append(label)
+            last_collected = label
+        i -= 1
+
+    return current_label, previous_different_labels
+
+
+def interpolate_conditional_probs(
+    target_label: str,
+    context_history: List[str],
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
+    interpolation_weights: Optional[List[float]] = None,
+) -> float:
+    """
+    Compute interpolated conditional probability P(target_label | context_history)
+    using n-gram probabilities from prob_dict.
+
+    Uses linear interpolation across all available n-gram levels. If a specific
+    n-gram is not in prob_dict, it contributes 0 to the weighted sum (automatic
+    smoothing effect).
+
+    Example:
+        context_history = ['D', 'C', 'B']
+        target_label = 'E'
+        interpolation_weights = [0.5, 0.3, 0.2]
+
+        Computes:
+        P_interpolated = 0.5 * P(E|D) + 0.3 * P(E|D,C) + 0.2 * P(E|D,C,B)
+
+        If P(E|D,C,B) is not in prob_dict, that term contributes 0.
+
+    Parameters
+    ----------
+    target_label : str
+        The label to predict.
+    context_history : List[str]
+        Context labels ordered from most recent to oldest (e.g., ['D', 'C', 'B']).
+    prob_dict : Dict[Tuple[str, ...], Dict[str, float]]
+        N-gram probability dictionary mapping history tuples to next-label distributions.
+    interpolation_weights : Optional[List[float]]
+        Weights for each n-gram level [λ₁, λ₂, λ₃, ...].
+        λ₁ is for unigram, λ₂ for bigram, etc.
+        If None, uses equal weights.
+        Should sum to 1.0 for proper probability interpretation.
+
+    Returns
+    -------
+    float
+        Interpolated conditional probability. Returns 0.0 if no n-grams are available.
+    """
+    if not context_history:
+        return 0.0
+
+    n_levels = len(context_history)
+
+    # Default to equal weights if not specified
+    if interpolation_weights is None:
+        interpolation_weights = [1.0 / n_levels] * n_levels
+
+    # If we have more context levels than weights, pad weights with 0
+    # If we have fewer context levels than weights, truncate weights
+    if len(interpolation_weights) < n_levels:
+        # Pad with zeros
+        weights = list(interpolation_weights) + [0.0] * (n_levels - len(interpolation_weights))
+    else:
+        # Truncate to match context length
+        weights = interpolation_weights[:n_levels]
+
+    interpolated_prob = 0.0
+
+    # Iterate through n-gram levels: unigram, bigram, trigram, etc.
+    for i in range(n_levels):
+        # Build the history tuple for this n-gram level
+        # i=0: unigram (context_history[0],)
+        # i=1: bigram (context_history[0], context_history[1])
+        # i=2: trigram (context_history[0], context_history[1], context_history[2])
+        history_tuple = tuple(context_history[:i+1])
+
+        # Lookup the conditional probability
+        next_map = prob_dict.get(history_tuple, {})
+        cond_prob = next_map.get(target_label, 0.0)
+
+        # Add weighted contribution
+        interpolated_prob += weights[i] * cond_prob
+
+    return interpolated_prob
+
+
 def adjust_probs_with_conditioning_vector(
     observed_probs: np.ndarray,
     class_labels: Sequence[str],
@@ -501,29 +632,195 @@ def adjust_probs_with_conditioning_vector(
     return adjusted / total
 
 
+def adjust_probs_with_conditioning_vector_extended(
+    observed_probs: np.ndarray,
+    class_labels: Sequence[str],
+    *,
+    current_run_label: Optional[str],
+    previous_different_labels: List[str],
+    prob_dict: Dict[Tuple[str, ...], Dict[str, float]],
+    alpha: float = 0.5,
+    combine_fn: Optional[Callable[[float, float, float], float]] = None,
+    interpolation_weights: Optional[List[float]] = None,
+) -> np.ndarray:
+    """
+    Adjust a single timestep's probability vector using interpolated conditioned
+    probabilities based on multiple previous different labels, then normalize to sum to 1.
+
+    This is the extended version that supports N previous different labels with
+    interpolation smoothing.
+
+    Rules (using example current='D', previous_different=['C','B','A']):
+      - For any activity x != 'D': blend observed P(x) with interpolated P(x|'D','C','B').
+      - For activity 'D' itself: blend observed P('D') with interpolated P('D'|'C','B','A').
+        If there are no previous different labels, leave as observed.
+
+    Interpolation example for P(x|'D','C','B') with weights [0.5, 0.3, 0.2]:
+        P_interp = 0.5 * P(x|'D') + 0.3 * P(x|'D','C') + 0.2 * P(x|'D','C','B')
+
+    Parameters
+    ----------
+    observed_probs : np.ndarray
+        1D array of size C with observed probabilities (e.g., softmax at time t).
+    class_labels : Sequence[str]
+        Labels corresponding to indices of observed_probs.
+    current_run_label : Optional[str]
+        Label of the current run (last predicted label).
+    previous_different_labels : List[str]
+        List of previous different labels, ordered from most recent to oldest.
+    prob_dict : Dict[Tuple[str, ...], Dict[str, float]]
+        N-gram probability dictionary mapping history tuples to next-label distributions.
+    alpha : float, default 0.5
+        Blend weight: result = (1 - alpha)*conditioned + alpha*observed.
+    combine_fn : Optional[Callable]
+        Custom combiner (observed, conditioned, alpha) -> float. Defaults to linear.
+    interpolation_weights : Optional[List[float]]
+        Weights for interpolation [λ₁, λ₂, λ₃, ...]. If None, uses equal weights.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized adjusted probabilities (1D array of size C).
+    """
+    if combine_fn is None:
+        combine_fn = linear_prob_combiner
+
+    probs = np.asarray(observed_probs, dtype=float).copy()
+    if probs.ndim != 1 or len(probs) != len(class_labels):
+        raise ValueError("observed_probs must be 1D and match class_labels length")
+
+    # If we don't have a current run label or no conditioning dict, return observed (normalized)
+    if current_run_label is None or not prob_dict:
+        s = probs.sum()
+        return probs / s if s > 0 else probs
+
+    adjusted = np.zeros_like(probs)
+
+    for idx, label in enumerate(class_labels):
+        observed_p = probs[idx]
+
+        if label == current_run_label:
+            # For the current run label, use P(current|previous_different_labels)
+            if not previous_different_labels:
+                conditioned_p = observed_p
+            else:
+                # Build context from previous different labels
+                context_history = previous_different_labels
+                conditioned_p = interpolate_conditional_probs(
+                    target_label=label,
+                    context_history=context_history,
+                    prob_dict=prob_dict,
+                    interpolation_weights=interpolation_weights,
+                )
+                # If interpolation returns 0 (no n-grams available), use observed
+                if conditioned_p == 0.0:
+                    conditioned_p = observed_p
+        else:
+            # For any other label, use P(label|current, previous_different_labels)
+            # Build context: current + previous different labels
+            context_history = [current_run_label] + previous_different_labels
+            conditioned_p = interpolate_conditional_probs(
+                target_label=label,
+                context_history=context_history,
+                prob_dict=prob_dict,
+                interpolation_weights=interpolation_weights,
+            )
+            # If interpolation returns 0 (no n-grams available), use observed
+            if conditioned_p == 0.0:
+                conditioned_p = observed_p
+
+        adjusted[idx] = combine_fn(observed_p, conditioned_p, alpha)
+
+    total = float(adjusted.sum())
+    if total <= 0:
+        # Degenerate case: fallback to observed
+        s = probs.sum()
+        return probs / s if s > 0 else probs
+
+    return adjusted / total
+
+
 def adjust_probs_with_sequence_context(
     observed_probs: np.ndarray,
     class_labels: Sequence[str],
     predicted_sequence: Sequence[str],
     *,
-    cond_prob_bigram: Dict[str, Dict[str, float]],
+    cond_prob_bigram: Optional[Dict[str, Dict[str, float]]] = None,
+    prob_dict: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
     alpha: float = 0.5,
     combine_fn: Optional[Callable[[float, float, float], float]] = None,
+    n_prev_labels: int = 1,
+    interpolation_weights: Optional[List[float]] = None,
 ) -> np.ndarray:
     """
     Convenience wrapper: derives run context from the predicted sequence and
-    applies adjust_probs_with_conditioning_vector.
+    applies probability adjustment with conditioning.
+
+    Supports both legacy (single previous label) and extended (multiple previous labels)
+    conditioning modes:
+    - If n_prev_labels=1 and cond_prob_bigram is provided: uses legacy mode
+    - If n_prev_labels>1 or prob_dict is provided: uses extended mode with interpolation
+
+    Parameters
+    ----------
+    observed_probs : np.ndarray
+        1D array of observed probabilities at current timestep.
+    class_labels : Sequence[str]
+        Labels corresponding to indices of observed_probs.
+    predicted_sequence : Sequence[str]
+        Sequence of predicted labels so far.
+    cond_prob_bigram : Optional[Dict[str, Dict[str, float]]]
+        Legacy bigram map (for backward compatibility). Used when n_prev_labels=1.
+    prob_dict : Optional[Dict[Tuple[str, ...], Dict[str, float]]]
+        Full n-gram probability dictionary. Used for extended mode.
+    alpha : float, default 0.5
+        Blend weight: result = (1 - alpha)*conditioned + alpha*observed.
+    combine_fn : Optional[Callable]
+        Custom combiner function. Defaults to linear_prob_combiner.
+    n_prev_labels : int, default 1
+        Number of previous different labels to use for conditioning.
+        If 1, uses legacy single-label mode. If >1, uses extended interpolation mode.
+    interpolation_weights : Optional[List[float]]
+        Weights for interpolation [λ₁, λ₂, λ₃, ...]. If None, uses equal weights.
+        Only used in extended mode.
+
+    Returns
+    -------
+    np.ndarray
+        Normalized adjusted probabilities.
     """
-    current_label, last_diff = get_run_context_labels(predicted_sequence)
-    return adjust_probs_with_conditioning_vector(
-        observed_probs,
-        class_labels,
-        current_run_label=current_label,
-        last_different_label=last_diff,
-        cond_prob_bigram=cond_prob_bigram,
-        alpha=alpha,
-        combine_fn=combine_fn,
-    )
+    # Legacy mode: n_prev_labels=1 with cond_prob_bigram
+    if n_prev_labels == 1 and cond_prob_bigram is not None and prob_dict is None:
+        current_label, last_diff = get_run_context_labels(predicted_sequence)
+        return adjust_probs_with_conditioning_vector(
+            observed_probs,
+            class_labels,
+            current_run_label=current_label,
+            last_different_label=last_diff,
+            cond_prob_bigram=cond_prob_bigram,
+            alpha=alpha,
+            combine_fn=combine_fn,
+        )
+
+    # Extended mode: n_prev_labels>=1 with prob_dict
+    if prob_dict is not None:
+        current_label, previous_labels = get_run_context_labels_extended(
+            predicted_sequence, n_prev_labels=n_prev_labels
+        )
+        return adjust_probs_with_conditioning_vector_extended(
+            observed_probs,
+            class_labels,
+            current_run_label=current_label,
+            previous_different_labels=previous_labels,
+            prob_dict=prob_dict,
+            alpha=alpha,
+            combine_fn=combine_fn,
+            interpolation_weights=interpolation_weights,
+        )
+
+    # Fallback: no conditioning, return normalized observed
+    s = observed_probs.sum()
+    return observed_probs / s if s > 0 else observed_probs
 
 
 def prepare_df(

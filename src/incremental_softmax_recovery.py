@@ -55,6 +55,8 @@ def _process_single_test_case(
     merge_mismatched_boundaries: bool,
     conditioning_alpha: Optional[float],
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]],
+    conditioning_n_prev_labels: int,
+    conditioning_interpolation_weights: Optional[List[float]],
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -84,6 +86,8 @@ def _process_single_test_case(
         merge_mismatched_boundaries=merge_mismatched_boundaries,
         conditioning_alpha=conditioning_alpha,
         conditioning_combine_fn=conditioning_combine_fn,
+        conditioning_n_prev_labels=conditioning_n_prev_labels,
+        conditioning_interpolation_weights=conditioning_interpolation_weights,
     )
 
     # Compute accuracy
@@ -135,6 +139,9 @@ def incremental_softmax_recovery(
     conformance_switch_penalty_weight: float = 0.0,
     conditioning_alpha: Optional[float] = None,
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
+    conditioning_n_prev_labels: int = 1,
+    conditioning_interpolation_weights: Optional[List[float]] = None,
+    use_collapsed_runs: bool = True,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = True,
     max_chunk_size: int = 50,
@@ -307,10 +314,15 @@ def incremental_softmax_recovery(
     # 8. Conditional probabilities (build when needed for switch penalty or conditioning)
     prob_dict: Dict[Tuple[str, ...], Dict[str, float]] = {}
     if conformance_switch_penalty_weight > 0.0 or (conditioning_alpha is not None):
-        prob_dict = build_probability_dict(train_df, max_hist_len)
+        prob_dict = build_probability_dict(
+            train_df,
+            max_hist_len=max_hist_len,
+            use_collapsed=use_collapsed_runs
+        )
         n_histories = len(prob_dict)
         avg_activities_per_history = np.mean([len(activities) for activities in prob_dict.values()]) if prob_dict else 0
-        logger.info(f"Built conditional probability dictionary: {n_histories} histories, avg {avg_activities_per_history:.1f} activities per history.")
+        collapse_mode = "collapsed (run-to-run)" if use_collapsed_runs else "raw (all transitions)"
+        logger.info(f"Built conditional probability dictionary ({collapse_mode}): {n_histories} histories, avg {avg_activities_per_history:.1f} activities per history.")
     else:
         logger.info("Skipping probability dictionary build (not requested).")
 
@@ -394,6 +406,7 @@ def incremental_softmax_recovery(
                 conformance_switch_penalty_weight, use_state_caching,
                 merge_mismatched_boundaries,
                 conditioning_alpha, conditioning_combine_fn,
+                conditioning_n_prev_labels, conditioning_interpolation_weights,
             )
             parallel_args.append(args)
 
@@ -441,6 +454,8 @@ def incremental_softmax_recovery(
                 merge_mismatched_boundaries=merge_mismatched_boundaries,
                 conditioning_alpha=conditioning_alpha,
                 conditioning_combine_fn=conditioning_combine_fn,
+                conditioning_n_prev_labels=conditioning_n_prev_labels,
+                conditioning_interpolation_weights=conditioning_interpolation_weights,
             )
 
             # Extract ground truth sequence for accuracy computation

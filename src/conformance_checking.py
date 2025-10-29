@@ -24,6 +24,8 @@ def process_trace_chunked(
     merge_mismatched_boundaries: bool = True,
     conditioning_alpha: Optional[float] = None,
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
+    conditioning_n_prev_labels: int = 1,
+    conditioning_interpolation_weights: Optional[List[float]] = None,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -58,4 +60,6 @@ def process_trace_chunked(
         merge_mismatched_boundaries=merge_mismatched_boundaries,
         conditioning_alpha=conditioning_alpha,
         conditioning_combine_fn=conditioning_combine_fn,
+        conditioning_n_prev_labels=conditioning_n_prev_labels,
+        conditioning_interpolation_weights=conditioning_interpolation_weights,
     )

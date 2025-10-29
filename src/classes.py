@@ -1329,6 +1329,8 @@ class PetriNet:
         state_cache: Optional[Dict] = None,
         conditioning_alpha: Optional[float] = None,
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
+        conditioning_n_prev_labels: int = 1,
+        conditioning_interpolation_weights: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1348,9 +1350,10 @@ class PetriNet:
         label2idx = {str(i): i for i in range(n_acts)}
         idx2label = {i: str(i) for i in range(n_acts)}
 
-        # Extract bigram map prev -> {next -> P(next|prev)} if provided
+        # Extract bigram map prev -> {next -> P(next|prev)} if provided (legacy mode)
+        # For extended mode (n_prev_labels > 1), we'll pass prob_dict directly
         bigram_map: Dict[str, Dict[str, float]] = {}
-        if prob_dict is not None:
+        if prob_dict is not None and conditioning_n_prev_labels == 1:
             for prefix, next_map in prob_dict.items():
                 if isinstance(prefix, tuple) and len(prefix) == 1:
                     bigram_map[prefix[0]] = dict(next_map)
@@ -1416,15 +1419,33 @@ class PetriNet:
 
             # Prepare per-timestamp probability vector (optionally conditioned)
             raw_vec = softmax_matrix[:, node.timestamp]
-            if conditioning_alpha is not None and bigram_map:
-                prob_vec = adjust_probs_with_sequence_context(
-                    observed_probs=raw_vec,
-                    class_labels=[idx2label[i] for i in range(n_acts)],
-                    predicted_sequence=list(node.path_prefix),
-                    cond_prob_bigram=bigram_map,
-                    alpha=conditioning_alpha,
-                    combine_fn=conditioning_combine_fn,
-                )
+            if conditioning_alpha is not None and (bigram_map or prob_dict):
+                # Determine which mode to use based on conditioning_n_prev_labels
+                if conditioning_n_prev_labels == 1 and bigram_map:
+                    # Legacy mode: single previous label with bigram_map
+                    prob_vec = adjust_probs_with_sequence_context(
+                        observed_probs=raw_vec,
+                        class_labels=[idx2label[i] for i in range(n_acts)],
+                        predicted_sequence=list(node.path_prefix),
+                        cond_prob_bigram=bigram_map,
+                        alpha=conditioning_alpha,
+                        combine_fn=conditioning_combine_fn,
+                        n_prev_labels=1,
+                    )
+                elif conditioning_n_prev_labels > 1 and prob_dict is not None:
+                    # Extended mode: multiple previous labels with interpolation
+                    prob_vec = adjust_probs_with_sequence_context(
+                        observed_probs=raw_vec,
+                        class_labels=[idx2label[i] for i in range(n_acts)],
+                        predicted_sequence=list(node.path_prefix),
+                        prob_dict=prob_dict,
+                        alpha=conditioning_alpha,
+                        combine_fn=conditioning_combine_fn,
+                        n_prev_labels=conditioning_n_prev_labels,
+                        interpolation_weights=conditioning_interpolation_weights,
+                    )
+                else:
+                    prob_vec = raw_vec
             else:
                 prob_vec = raw_vec
 
