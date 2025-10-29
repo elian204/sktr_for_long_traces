@@ -1596,6 +1596,8 @@ class PetriNet:
         # removed: restrict_to_observed_moves
         conditioning_alpha: Optional[float] = None,
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
+        conditioning_n_prev_labels: int = 1,
+        conditioning_interpolation_weights: Optional[List[float]] = None,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1692,6 +1694,8 @@ class PetriNet:
                     state_cache=({} if use_state_caching else None),
                     conditioning_alpha=conditioning_alpha,
                     conditioning_combine_fn=conditioning_combine_fn,
+                    conditioning_n_prev_labels=conditioning_n_prev_labels,
+                    conditioning_interpolation_weights=conditioning_interpolation_weights,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
                 c1_steps = end_ts1 - start_ts
@@ -1740,6 +1744,8 @@ class PetriNet:
                 state_cache=({} if use_state_caching else None),
                 conditioning_alpha=conditioning_alpha,
                 conditioning_combine_fn=conditioning_combine_fn,
+                conditioning_n_prev_labels=conditioning_n_prev_labels,
+                conditioning_interpolation_weights=conditioning_interpolation_weights,
             )
             c2_elapsed = time.perf_counter() - c2_start
             c2_steps = end_ts2 - end_ts1
@@ -1763,6 +1769,8 @@ class PetriNet:
                     state_cache=({} if use_state_caching else None),
                     conditioning_alpha=conditioning_alpha,
                     conditioning_combine_fn=conditioning_combine_fn,
+                    conditioning_n_prev_labels=conditioning_n_prev_labels,
+                    conditioning_interpolation_weights=conditioning_interpolation_weights,
                 )
                 m_elapsed = time.perf_counter() - m_start
                 m_steps = end_ts2 - start_ts
@@ -1860,6 +1868,8 @@ class PetriNet:
         # removed: restrict_to_observed_moves
         conditioning_alpha: Optional[float] = None,
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
+        conditioning_n_prev_labels: int = 1,
+        conditioning_interpolation_weights: Optional[List[float]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1894,6 +1904,8 @@ class PetriNet:
             merge_mismatched_boundaries=merge_mismatched_boundaries,
             conditioning_alpha=conditioning_alpha,
             conditioning_combine_fn=conditioning_combine_fn,
+            conditioning_n_prev_labels=conditioning_n_prev_labels,
+            conditioning_interpolation_weights=conditioning_interpolation_weights,
             # no observed restriction
         )
         
