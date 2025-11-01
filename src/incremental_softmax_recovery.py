@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import concurrent.futures
 import multiprocessing
+import pickle
 from .utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from .data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from .petri_model import discover_petri_net, build_probability_dict
@@ -39,6 +40,61 @@ def setup_logging(level=logging.INFO):
             logging.StreamHandler()
         ]
     )
+
+
+def _split_test_traces(
+    test_case_ids: List[str],
+    test_softmax_matrices: List[np.ndarray],
+    test_df: pd.DataFrame,
+    n_chunks: int
+) -> List[Tuple[List[str], List[np.ndarray], pd.DataFrame]]:
+    """
+    Split test traces into chunks for parallel processing.
+    
+    Parameters
+    ----------
+    test_case_ids : List[str]
+        List of test case IDs
+    test_softmax_matrices : List[np.ndarray]
+        List of softmax matrices corresponding to test cases
+    test_df : pd.DataFrame
+        DataFrame containing test traces
+    n_chunks : int
+        Number of chunks to split into
+        
+    Returns
+    -------
+    List[Tuple[List[str], List[np.ndarray], pd.DataFrame]]
+        List of tuples, each containing (chunk_case_ids, chunk_softmax_matrices, chunk_test_df)
+    """
+    if n_chunks <= 0:
+        raise ValueError("n_chunks must be positive")
+    if len(test_case_ids) == 0:
+        return []
+    
+    # Cap n_chunks to number of test cases
+    n_chunks = min(n_chunks, len(test_case_ids))
+    
+    # Calculate chunk size (distribute as evenly as possible)
+    chunk_size = len(test_case_ids) // n_chunks
+    remainder = len(test_case_ids) % n_chunks
+    
+    chunks = []
+    start_idx = 0
+    
+    for i in range(n_chunks):
+        # Distribute remainder across first chunks
+        current_chunk_size = chunk_size + (1 if i < remainder else 0)
+        end_idx = start_idx + current_chunk_size
+        
+        chunk_case_ids = test_case_ids[start_idx:end_idx]
+        chunk_softmax_matrices = test_softmax_matrices[start_idx:end_idx]
+        chunk_test_df = test_df[test_df['case:concept:name'].isin(chunk_case_ids)].copy()
+        chunks.append((chunk_case_ids, chunk_softmax_matrices, chunk_test_df))
+        
+        start_idx = end_idx
+    
+    return chunks
 
 
 def _process_single_test_case(
@@ -107,6 +163,122 @@ def _process_single_test_case(
     return case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df
 
 
+def _process_test_chunk(
+    chunk_case_ids: List[str],
+    chunk_softmax_matrices: List[np.ndarray],
+    chunk_test_df: pd.DataFrame,
+    model_pickled: bytes,
+    cost_function: Union[str, Callable[[float], float]],
+    model_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    log_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    tau_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    round_precision: int,
+    prob_threshold: float,
+    prob_dict_uncollapsed: Dict,
+    prob_dict_collapsed: Dict,
+    chunk_size: int,
+    conformance_switch_penalty_weight: float,
+    use_state_caching: bool,
+    merge_mismatched_boundaries: bool,
+    conditioning_alpha: Optional[float],
+    conditioning_combine_fn: Optional[Callable[[float, float, float], float]],
+    conditioning_n_prev_labels: int,
+    conditioning_interpolation_weights: Optional[List[float]],
+) -> Tuple[List[dict], List[float], List[float]]:
+    """
+    Process a chunk of test cases using conformance checking. Used for dataset-level parallel processing.
+    
+    Parameters
+    ----------
+    chunk_case_ids : List[str]
+        List of case IDs in this chunk
+    chunk_softmax_matrices : List[np.ndarray]
+        List of softmax matrices for this chunk
+    chunk_test_df : pd.DataFrame
+        DataFrame containing test traces for this chunk
+    model_pickled : bytes
+        Pickled PetriNet model (will be unpickled)
+    cost_function : Union[str, Callable]
+        Cost function specification (will be used to recreate cost_fn)
+    model_move_cost : Optional[Union[float, str, Callable]]
+        Model move cost parameter
+    log_move_cost : Optional[Union[float, str, Callable]]
+        Log move cost parameter
+    tau_move_cost : Optional[Union[float, str, Callable]]
+        Tau move cost parameter
+    round_precision : int
+        Round precision for cost function
+    prob_threshold : float
+        Probability threshold
+    prob_dict_uncollapsed : Dict
+        Uncollapsed probability dictionary
+    prob_dict_collapsed : Dict
+        Collapsed probability dictionary
+    chunk_size : int
+        Chunk size for conformance checking
+    conformance_switch_penalty_weight : float
+        Switch penalty weight
+    use_state_caching : bool
+        Whether to use state caching
+    merge_mismatched_boundaries : bool
+        Whether to merge mismatched boundaries
+    conditioning_alpha : Optional[float]
+        Conditioning alpha parameter
+    conditioning_combine_fn : Optional[Callable]
+        Conditioning combine function
+    conditioning_n_prev_labels : int
+        Number of previous labels for conditioning
+    conditioning_interpolation_weights : Optional[List[float]]
+        Interpolation weights for conditioning
+        
+    Returns
+    -------
+    Tuple[List[dict], List[float], List[float]]
+        Tuple of (recovery_records, sktr_accs, argmax_accs) for this chunk
+    """
+    # Unpickle model
+    model = pickle.loads(model_pickled)
+    
+    # Recreate cost function (needed for pickling compatibility)
+    cost_fn = make_cost_function(
+        base=cost_function,
+        model_move=model_move_cost,
+        log_move=log_move_cost,
+        tau_move=tau_move_cost,
+        round_precision=round_precision
+    )
+    
+    # Process each case in the chunk
+    recovery_records = []
+    sktr_accs = []
+    argmax_accs = []
+    
+    for case_id, softmax_matrix in zip(chunk_case_ids, chunk_softmax_matrices):
+        _, _, _, sktr_acc, argmax_acc, records_df = _process_single_test_case(
+            case_id=case_id,
+            softmax_matrix=softmax_matrix,
+            test_df=chunk_test_df,
+            model=model,
+            cost_fn=cost_fn,
+            prob_threshold=prob_threshold,
+            prob_dict_uncollapsed=prob_dict_uncollapsed,
+            prob_dict_collapsed=prob_dict_collapsed,
+            chunk_size=chunk_size,
+            conformance_switch_penalty_weight=conformance_switch_penalty_weight,
+            use_state_caching=use_state_caching,
+            merge_mismatched_boundaries=merge_mismatched_boundaries,
+            conditioning_alpha=conditioning_alpha,
+            conditioning_combine_fn=conditioning_combine_fn,
+            conditioning_n_prev_labels=conditioning_n_prev_labels,
+            conditioning_interpolation_weights=conditioning_interpolation_weights,
+        )
+        recovery_records.extend(records_df.to_dict('records'))
+        sktr_accs.append(sktr_acc)
+        argmax_accs.append(argmax_acc)
+    
+    return recovery_records, sktr_accs, argmax_accs
+
+
 def incremental_softmax_recovery(
     df: pd.DataFrame,
     softmax_lst: List[np.ndarray],
@@ -149,6 +321,7 @@ def incremental_softmax_recovery(
     max_chunk_size: int = 50,
     use_state_caching: bool = True,
     parallel_processing: bool = False,
+    dataset_parallelization: bool = False,
     max_workers: Optional[int] = None,
     merge_mismatched_boundaries: bool = True,
     # removed: restrict_to_observed_moves
@@ -172,13 +345,34 @@ def incremental_softmax_recovery(
         If True, computes the marking-to-transition map for the Petri net model.
         This map is required for full conformance checking functionality with τ-transitions.
         Set to False to skip this computation (may cause errors if τ-transitions are needed).
+    parallel_processing : bool, default=False
+        If True, processes test traces in parallel (trace-level parallelization).
+        Each trace is processed independently by a separate worker. Results are collected
+        in submission order to preserve sequential ordering.
+    dataset_parallelization : bool, default=False
+        If True, splits the test dataset into chunks and processes chunks in parallel
+        (dataset-level parallelization). The same model and hyperparameters are used
+        across all workers. Results are combined to produce identical results to
+        sequential processing. Mutually exclusive with parallel_processing.
+        
+        When enabled with only 1 test case, falls back to sequential processing
+        (logged at INFO level).
 
     Notes
     -----
     Train and test case IDs are logged at INFO level for transparency and verification.
+    
+    Both parallelization strategies preserve result ordering identical to sequential
+    processing. When dataset_parallelization=True, the model is discovered once and
+    shared across workers via pickling. This is more efficient for large test sets
+    where each trace is relatively fast to process.
     """
     if verbose:
         setup_logging(log_level)
+    
+    # Validate parallelization options
+    if parallel_processing and dataset_parallelization:
+        raise ValueError("parallel_processing and dataset_parallelization cannot both be True. Choose one parallelization strategy.")
     
     logger.info("Starting incremental softmax recovery (conformance-only).")
 
@@ -384,7 +578,7 @@ def incremental_softmax_recovery(
 
     # Adaptive chunk sizing based on model complexity (for sequential processing)
     effective_chunk_size = chunk_size
-    if adaptive_chunk_sizing and not parallel_processing:
+    if adaptive_chunk_sizing and not parallel_processing and not dataset_parallelization:
         # Scale chunk size based on model complexity (places + transitions)
         model_complexity = len(model.places) + len(model.transitions)
         # Conservative heuristic: slightly smaller chunks for very complex models
@@ -404,7 +598,67 @@ def incremental_softmax_recovery(
         if effective_chunk_size != chunk_size:
             logger.debug(f"Using adaptive chunk size: {effective_chunk_size} (base: {chunk_size}, complexity: {model_complexity})")
 
-    if parallel_processing and len(test_case_ids) > 1:
+    if dataset_parallelization and len(test_case_ids) > 1:
+        # Dataset-level parallelization: split test dataset into chunks
+        logger.info(f"Processing {len(test_case_ids)} test cases using dataset-level parallelization")
+
+        # Determine number of workers
+        n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
+        logger.info(f"Using {n_workers} workers for dataset parallelization")
+
+        # Split test traces into chunks
+        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_df, n_workers)
+        logger.info(f"Split test dataset into {len(chunks)} chunks")
+
+        # Pickle model for sharing across workers
+        model_pickled = pickle.dumps(model)
+
+        # Prepare arguments for parallel processing
+        parallel_args = []
+        for chunk_case_ids, chunk_softmax_matrices, chunk_test_df in chunks:
+            args = (
+                chunk_case_ids,
+                chunk_softmax_matrices,
+                chunk_test_df,
+                model_pickled,
+                cost_function,
+                model_move_cost,
+                log_move_cost,
+                tau_move_cost,
+                round_precision,
+                prob_threshold,
+                prob_dict_uncollapsed,
+                prob_dict_collapsed,
+                effective_chunk_size,
+                conformance_switch_penalty_weight,
+                use_state_caching,
+                merge_mismatched_boundaries,
+                conditioning_alpha,
+                conditioning_combine_fn,
+                conditioning_n_prev_labels,
+                conditioning_interpolation_weights,
+            )
+            parallel_args.append(args)
+
+        # Process chunks in parallel, preserving order as if computed sequentially
+        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+            futures = [executor.submit(_process_test_chunk, *args) for args in parallel_args]
+
+            # Collect results in submission order to preserve sequential ordering
+            for idx, future in enumerate(futures, start=1):
+                try:
+                    chunk_records, chunk_sktr_accs, chunk_argmax_accs = future.result()
+                    recovery_records.extend(chunk_records)
+                    sktr_accs.extend(chunk_sktr_accs)
+                    argmax_accs.extend(chunk_argmax_accs)
+                    logger.debug(f"Processed chunk {idx}/{len(chunks)}: {len(chunk_records)} records, {len(chunk_sktr_accs)} accuracies")
+                except Exception as exc:
+                    logger.error(f"Dataset parallelization failed for chunk {idx}: {exc}")
+                    raise
+
+        logger.info(f"Completed dataset parallelization: {len(recovery_records)} total records, {len(sktr_accs)} total accuracies")
+
+    elif parallel_processing and len(test_case_ids) > 1:
         # Parallel processing
         logger.info(f"Processing {len(test_case_ids)} test cases in parallel")
 
@@ -425,11 +679,12 @@ def incremental_softmax_recovery(
             )
             parallel_args.append(args)
 
-        # Process in parallel
+        # Process in parallel, preserving order as if computed sequentially
         with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = [executor.submit(_process_single_test_case, *args) for args in parallel_args]
 
-            for idx, future in enumerate(concurrent.futures.as_completed(futures), start=1):
+            # Collect results in submission order to preserve sequential ordering
+            for idx, future in enumerate(futures, start=1):
                 try:
                     case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df = future.result()
                     recovery_records.extend(records_df.to_dict('records'))
@@ -440,6 +695,9 @@ def incremental_softmax_recovery(
                     logger.error(f"Parallel processing failed for case {idx}: {exc}")
 
     else:
+        if dataset_parallelization and len(test_case_ids) <= 1:
+            logger.info(f"Dataset parallelization skipped: only {len(test_case_ids)} test case(s), using sequential processing")
+
         # Sequential processing
         for idx, (case, softmax_matrix) in enumerate(
             zip(test_case_ids, test_softmax_matrices), start=1
