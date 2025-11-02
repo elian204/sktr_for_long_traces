@@ -283,7 +283,7 @@ def incremental_softmax_recovery(
     df: pd.DataFrame,
     softmax_lst: List[np.ndarray],
     n_train_traces: int = 10,
-    n_test_traces: int = 10,
+    n_test_traces: Optional[int] = 10,
     train_cases: Optional[List[Any]] = None,
     test_cases: Optional[List[Any]] = None,
     ensure_train_variant_diversity: bool = False,

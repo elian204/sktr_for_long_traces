@@ -338,7 +338,7 @@ def validate_sequential_case_ids(df: pd.DataFrame, softmax_lst: List[np.ndarray]
 def split_train_test(
     df: pd.DataFrame,
     n_train_traces: int,
-    n_test_traces: int,
+    n_test_traces: Optional[int],
     train_cases: Optional[List[Any]] = None,
     test_cases: Optional[List[Any]] = None,
     ensure_train_variant_diversity: bool = False,
@@ -355,8 +355,9 @@ def split_train_test(
         Event log with 'case:concept:name' column.
     n_train_traces : int
         Number of training traces to select (only used when train_cases is None).
-    n_test_traces : int
+    n_test_traces : Optional[int]
         Number of test traces to select (only used when test_cases is None).
+        If None, uses all available cases (including training cases if allow_train_cases_in_test=True).
     train_cases : Optional[List[Any]]
         Specific case IDs for training. If provided, ALL these cases are used
         and n_train_traces is ignored.
@@ -410,6 +411,11 @@ def split_train_test(
 
     if test_cases is not None:
         final_test_cases = test_cases
+    elif n_test_traces is None:
+        # Use all available cases for testing
+        # If allow_train_cases_in_test=True, remaining_cases already equals all_cases
+        # If allow_train_cases_in_test=False, remaining_cases excludes training cases
+        final_test_cases = remaining_cases
     elif ensure_test_variant_diversity:
         candidate_df = df if allow_train_cases_in_test else df.loc[df['case:concept:name'].isin(remaining_cases)]
         final_test_cases = _select_diverse_cases(candidate_df, n_test_traces, test_seed)
