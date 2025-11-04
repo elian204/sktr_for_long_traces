@@ -315,9 +315,8 @@ def incremental_softmax_recovery(
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
     conditioning_n_prev_labels: int = 1,
     conditioning_interpolation_weights: Optional[List[float]] = None,
-    use_collapsed_runs: bool = True,
     # Performance optimization parameters
-    adaptive_chunk_sizing: bool = True,
+    adaptive_chunk_sizing: bool = False,
     max_chunk_size: int = 50,
     use_state_caching: bool = True,
     parallel_processing: bool = False,
@@ -328,7 +327,7 @@ def incremental_softmax_recovery(
     compute_marking_transition_map: bool = True,
     verbose: bool = True,
     log_level: int = logging.INFO,
-) -> Tuple[pd.DataFrame, Dict[str, List[float]], Tuple[Dict[Tuple[str, ...], Dict[str, float]], Dict[Tuple[str, ...], Dict[str, float]]]]:
+) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]], Dict[Tuple[str, ...], Dict[str, float]]]:
     """
     Recover activity sequences from softmax matrices using Petri net models (conformance only).
 
@@ -592,8 +591,9 @@ def incremental_softmax_recovery(
             effective_chunk_size = chunk_size
         else:
             # Slightly increase for simple models (less overhead)
-            complexity_factor = min(model_complexity / 50, 1.5)  # Max 1.5x
-            effective_chunk_size = min(int(chunk_size * complexity_factor), max_chunk_size)
+            # The factor should be > 1 for complexity < 50
+            complexity_factor = min(1.5, 1 + (50 - model_complexity) / 50)
+            effective_chunk_size = min(max(1, int(chunk_size * complexity_factor)), max_chunk_size)
 
         if effective_chunk_size != chunk_size:
             logger.debug(f"Using adaptive chunk size: {effective_chunk_size} (base: {chunk_size}, complexity: {model_complexity})")
@@ -770,7 +770,7 @@ def incremental_softmax_recovery(
         pass
     logger.info("Built results DataFrame and accuracy dictionary.")
     logger.info("Softmax trace recovery completed using conformance method.")
-    return results_df, accuracy_dict, (prob_dict_uncollapsed, prob_dict_collapsed)
+    return results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed
 
 
 def _compute_accuracy_records(

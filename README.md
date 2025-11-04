@@ -38,7 +38,7 @@ df = pd.DataFrame({
 softmax_matrices = [matrix_0, matrix_1, matrix_2]  # One per case
 
 # Run incremental recovery (conformance-only)
-results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
     df=df,
     softmax_lst=softmax_matrices,
     n_train_traces=10,
@@ -74,7 +74,7 @@ The notebook includes:
 |-----------|-------------|---------|--------|
 | `prob_threshold` | Minimum probability to consider activity | 1e-12 | Applies during filtering |
 | `chunk_size` | Window size for conformance processing | 10 | Larger may be more accurate |
-| `conformance_switch_penalty_weight` | Weight on label-switch penalty | 0.0 | Uses `prob_dict` if > 0 |
+| `conformance_switch_penalty_weight` | Weight on label-switch penalty | 0.0 | Uses `prob_dict_uncollapsed` and `prob_dict_collapsed` if > 0 |
 | `max_hist_len` | History length for `prob_dict` | 3 | Used when switch penalty enabled |
 | `n_indices` / `n_per_run` | Sampling controls | None | Required based on sampling mode |
 | `save_model_path` | Path for Petri net visualization | `./results/discovered_petri_net` | Saves PDF and PNG |
@@ -82,23 +82,31 @@ The notebook includes:
 
 ## 📊 Output Format
 
-Returns a tuple `(results_df, accuracy_dict, prob_dict)` where `results_df` contains:
-- `case:concept:name`: Test case ID
-- `step`: Window-relative step (0..chunk_size-1 repeating)
-- `sktr_activity`: Conformance prediction
-- `argmax_activity`: Argmax baseline prediction
-- `ground_truth`: Actual activity
-- `all_probs`: Per-step filtered probabilities
-- `all_activities`: Activity labels for `all_probs`
-- `is_correct`: Boolean correctness
-- `cumulative_accuracy`: Running accuracy
-- `sktr_move_cost`: Per-move costs
+Returns a tuple `(results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed)` where:
+
+- `results_df`: DataFrame containing per-step recovery results with columns:
+  - `case:concept:name`: Test case ID
+  - `step`: Window-relative step (0..chunk_size-1 repeating)
+  - `sktr_activity`: Conformance prediction
+  - `argmax_activity`: Argmax baseline prediction
+  - `ground_truth`: Actual activity
+  - `all_probs`: Per-step filtered probabilities
+  - `all_activities`: Activity labels for `all_probs`
+  - `is_correct`: Boolean correctness
+  - `cumulative_accuracy`: Running accuracy
+  - `sktr_move_cost`: Per-move costs
+
+- `accuracy_dict`: Dictionary with keys `'sktr_accuracy'` and `'argmax_accuracy'`, each containing a list of trace-level accuracies
+
+- `prob_dict_uncollapsed`: Probability dictionary for continuation probabilities (used when staying within the same activity run). Maps history tuples to probability distributions over next activities, preserving activity runs as sequences of identical labels.
+
+- `prob_dict_collapsed`: Probability dictionary for transition probabilities (used when switching between different activities). Maps history tuples to probability distributions over next activities, collapsing consecutive identical activities into single runs.
 
 ## 🔧 Advanced Features
 
 **Temperature Calibration**:
 ```python
-results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     use_calibration=True,
     temp_bounds=(0.5, 5.0),
@@ -108,7 +116,7 @@ results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
 
 **Sequential Sampling**:
 ```python
-results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     sequential_sampling=True,
     n_per_run=2  # Sample 2 events from each activity run
