@@ -327,6 +327,11 @@ def incremental_softmax_recovery(
     compute_marking_transition_map: bool = True,
     verbose: bool = True,
     log_level: int = logging.INFO,
+    # Backwards compatibility: this flag used to control whether to build
+    # n-gram stats from run-collapsed traces. The current implementation
+    # always builds both uncollapsed and collapsed probability dictionaries,
+    # so this parameter is accepted but ignored.
+    use_collapsed_runs: bool = True,
 ) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]], Dict[Tuple[str, ...], Dict[str, float]]]:
     """
     Recover activity sequences from softmax matrices using Petri net models (conformance only).
