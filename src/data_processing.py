@@ -635,78 +635,72 @@ def write_collapsed_traces_to_file(
 
 def sample_and_write_collapsed_traces(
     df: pd.DataFrame,
-    trace_groups: pd.DataFrame,
-    n: int,
-    output_file_path: str,
+    n: int = 10,
+    output_file_path: str = 'sampled_traces.txt',
     case_column: str = 'case:concept:name',
     activity_column: str = 'concept:name',
-    random_seed: Optional[int] = None,
+    random_seed: int = 42,
+    ensure_train_variant_diversity: bool = False,
+    train_cases: Optional[List[Any]] = None,
     verbose: bool = True
 ) -> None:
     """
-    Sample n unique trace variants from trace_groups and write one trace from each variant to a file.
+    Sample training cases using the same logic as incremental_softmax_recovery and write collapsed traces to a file.
 
-    This function samples n different trace variants and then selects exactly one trace
-    from each sampled variant, resulting in exactly n traces in the output file.
+    This function selects cases using the exact same logic as the training split in
+    incremental_softmax_recovery. Given the same parameters (df, n, random_seed,
+    ensure_train_variant_diversity, train_cases), it will select the same cases.
 
     Parameters:
     -----------
     df : pd.DataFrame
         Original dataframe containing the event log data
-    trace_groups : pd.DataFrame
-        DataFrame from group_cases_by_trace() with 'case_list' column
-    n : int
-        Number of unique trace variants to sample (will result in n traces)
-    output_file_path : str
+    n : int, default 10
+        Number of training cases to select (equivalent to n_train_traces in incremental_softmax_recovery)
+    output_file_path : str, default 'sampled_traces.txt'
         Path where to write the collapsed traces
     case_column : str, default 'case:concept:name'
         Name of the case identifier column in df
     activity_column : str, default 'concept:name'
         Name of the activity column in df
-    random_seed : int, optional
-        Random seed for reproducible sampling
+    random_seed : int, default 42
+        Random seed for reproducible sampling. Internally derives a train seed using
+        _get_derived_seed(random_seed, "train") to match incremental_softmax_recovery behavior.
+    ensure_train_variant_diversity : bool, default False
+        If True, select cases from different trace variants (ensures diversity).
+        Equivalent to ensure_train_variant_diversity in incremental_softmax_recovery.
+    train_cases : List[Any], optional
+        Specific case IDs to use. If provided, these cases are used directly and
+        n, ensure_train_variant_diversity are ignored. Equivalent to train_cases in
+        incremental_softmax_recovery.
     verbose : bool, default True
         Whether to print the sampled trace IDs
 
-    Raises:
-    -------
-    ValueError
-        If n is greater than the number of available trace variants
-
     Example:
     --------
-    >>> trace_groups = group_cases_by_trace(df)
-    >>> sample_and_write_collapsed_traces(df, trace_groups, 5, 'sampled_traces.txt')
-    # Results in exactly 5 traces, one from each of 5 different variants
-    # Prints: "Sampled 5 trace IDs: ['case1', 'case2', 'case3', 'case4', 'case5']"
+    >>> sample_and_write_collapsed_traces(df, n=10, random_seed=42, ensure_train_variant_diversity=True)
+    # Selects the same 10 training cases as incremental_softmax_recovery would
+    # Prints: "Sampled 10 trace IDs: ['12', '32', '18', ...]"
     """
-    if 'case_list' not in trace_groups.columns:
-        raise ValueError("trace_groups must have a 'case_list' column (result from group_cases_by_trace)")
-
-    if n > len(trace_groups):
-        raise ValueError(f"Cannot sample {n} variants from {len(trace_groups)} available variants")
-
-    # Set random seed for reproducibility
-    if random_seed is not None:
-        np.random.seed(random_seed)
-        random.seed(random_seed)
-
-    # Sample n variants from trace_groups
-    sampled_variants = trace_groups.sample(n=n, random_state=random_seed if random_seed is not None else None)
-
-    # Select exactly one case ID from each sampled variant
-    sampled_case_ids = []
-    for case_list in sampled_variants['case_list']:
-        if case_list:  # Ensure the variant has at least one case
-            # Randomly select one case from this variant
-            selected_case = random.choice(case_list)
-            sampled_case_ids.append(selected_case)
+    # Get all unique cases
+    all_cases = df[case_column].drop_duplicates().tolist()
+    
+    # Generate derived seed for train selection (matches incremental_softmax_recovery)
+    train_seed = _get_derived_seed(random_seed, "train")
+    
+    # Determine selected cases using the same logic as split_train_test
+    if train_cases is not None:
+        sampled_case_ids = train_cases
+    elif ensure_train_variant_diversity:
+        sampled_case_ids = _select_diverse_cases(df, n, train_seed)
+    else:
+        sampled_case_ids = _select_random_cases(all_cases, n, train_seed)
 
     # Print sampled trace IDs if verbose is True
     if verbose:
         print(f"Sampled {len(sampled_case_ids)} trace IDs: {sampled_case_ids}")
 
-    # Filter original dataframe to only include sampled cases (one from each variant)
+    # Filter original dataframe to only include sampled cases
     filtered_df = df[df[case_column].isin(sampled_case_ids)].copy()
 
     # Write collapsed traces to file

@@ -11,6 +11,8 @@ Main modules:
 - evaluation: Evaluation metrics
 - utils: Helper functions
 - trace_export: Trace export utilities
+- posthoc_analysis: Post-hoc helpers for analysis
+- posthoc_visualization: Display utilities for post-hoc results
 """
 
 __version__ = "1.0.0"
