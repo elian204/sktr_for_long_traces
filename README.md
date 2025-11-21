@@ -38,7 +38,7 @@ df = pd.DataFrame({
 softmax_matrices = [matrix_0, matrix_1, matrix_2]  # One per case
 
 # Run incremental recovery (conformance-only)
-results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df,
     softmax_lst=softmax_matrices,
     n_train_traces=10,
@@ -82,7 +82,7 @@ The notebook includes:
 
 ## 📊 Output Format
 
-Returns a tuple `(results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed)` where:
+Returns a tuple `(results_df, accuracy_dict, prob_dict)` where:
 
 - `results_df`: DataFrame containing per-step recovery results with columns:
   - `case:concept:name`: Test case ID
@@ -98,15 +98,15 @@ Returns a tuple `(results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_co
 
 - `accuracy_dict`: Dictionary with keys `'sktr_accuracy'` and `'argmax_accuracy'`, each containing a list of trace-level accuracies
 
-- `prob_dict_uncollapsed`: Probability dictionary for continuation probabilities (used when staying within the same activity run). Maps history tuples to probability distributions over next activities, preserving activity runs as sequences of identical labels.
-
-- `prob_dict_collapsed`: Probability dictionary for transition probabilities (used when switching between different activities). Maps history tuples to probability distributions over next activities, collapsing consecutive identical activities into single runs.
+- `prob_dict`: A tuple `(prob_dict_uncollapsed, prob_dict_collapsed)` containing:
+  - `prob_dict_uncollapsed`: Probability dictionary for continuation probabilities (used when staying within the same activity run). Maps history tuples to probability distributions over next activities, preserving activity runs as sequences of identical labels.
+  - `prob_dict_collapsed`: Probability dictionary for transition probabilities (used when switching between different activities). Maps history tuples to probability distributions over next activities, collapsing consecutive identical activities into single runs.
 
 ## 🔧 Advanced Features
 
 **Temperature Calibration**:
 ```python
-results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     use_calibration=True,
     temp_bounds=(0.5, 5.0),
@@ -116,7 +116,7 @@ results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremen
 
 **Sequential Sampling**:
 ```python
-results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed = incremental_softmax_recovery(
+results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
     df=df, softmax_lst=softmax_list,
     sequential_sampling=True,
     n_per_run=2  # Sample 2 events from each activity run

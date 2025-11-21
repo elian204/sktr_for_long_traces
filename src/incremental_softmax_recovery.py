@@ -775,7 +775,7 @@ def incremental_softmax_recovery(
         pass
     logger.info("Built results DataFrame and accuracy dictionary.")
     logger.info("Softmax trace recovery completed using conformance method.")
-    return results_df, accuracy_dict, prob_dict_uncollapsed, prob_dict_collapsed
+    return results_df, accuracy_dict, (prob_dict_uncollapsed, prob_dict_collapsed)
 
 
 def _compute_accuracy_records(
