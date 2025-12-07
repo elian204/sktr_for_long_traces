@@ -122,13 +122,17 @@ cython_debug/
 Thumbs.db
 
 # Data files (common for ML projects)
-*.csv
-*.json
-*.pkl
-*.pickle
+# *.csv  # Allowing CSV files for results
+# *.json
+# *.pkl
+# *.pickle  # Allowing pickle files for datasets (tracked via LFS)
 *.h5
 *.hdf5
 *.npz
+
+# Allow datasets and results directories
+!datasets/
+!results/
 
 # Model files
 *.model

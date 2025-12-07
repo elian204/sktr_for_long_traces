@@ -1,0 +1,43 @@
+{
+  "dataset": "50salads",
+  "hyperparameters": {
+    "allow_train_cases_in_test": true,
+    "dataset": "50salads",
+    "ensure_train_variant_diversity": true,
+    "n_train_values": [
+      10,
+      9,
+      8,
+      7,
+      6,
+      5,
+      4,
+      3,
+      2,
+      1
+    ],
+    "parallel_n_jobs": 1,
+    "parallel_verbose": 10,
+    "qsize": 20,
+    "random_seed": 101,
+    "sample_stride": 100,
+    "str_len": 25,
+    "sweep_values": [
+      10,
+      9,
+      8,
+      7,
+      6,
+      5,
+      4,
+      3,
+      2,
+      1
+    ],
+    "topK_K": 3,
+    "use_topK": false
+  },
+  "run_tag": "20251203",
+  "topK_K": 3,
+  "use_topK": false
+}
