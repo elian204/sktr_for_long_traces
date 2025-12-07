@@ -57,6 +57,48 @@ def _auto_background(label_names: Optional[Sequence[str]]) -> Optional[str]:
             return label_names[lower.index(cand)]
     return None
 
+
+def _infer_background_value(
+    background: Optional[Any],
+    label_names: Optional[Sequence[Any]],
+    sample_values: Optional[Iterable[Any]] = None,
+) -> Optional[Any]:
+    """
+    Resolve which label should be treated as background.
+
+    Priority:
+      1) Explicit `background` argument (if provided).
+      2) Semantic match in `label_names` or `sample_values`
+         for common background tokens: background/bg/sil/silence.
+      3) Fallback: if labels look numeric and contain 0, treat 0 as background
+         (common convention in TAS datasets, including GTEA).
+    Returns the value from the supplied sequences to preserve type (str/int).
+    """
+    if background is not None:
+        return background
+
+    def _find(seq: Iterable[Any]) -> Optional[Any]:
+        for v in seq:
+            lv = str(v).lower()
+            if lv in ("background", "bg", "sil", "silence"):
+                return v
+        for v in seq:
+            if str(v) == "0":
+                return v
+        return None
+
+    if label_names:
+        found = _find(label_names)
+        if found is not None:
+            return found
+
+    if sample_values is not None:
+        found = _find(sample_values)
+        if found is not None:
+            return found
+
+    return None
+
 # --- public API ---------------------------------------------------------------
 def frame_accuracy(y_true: Iterable[Any], y_pred: Iterable[Any]) -> float:
     gt = np.asarray(list(y_true), dtype=object)
@@ -112,14 +154,17 @@ def tas_metrics(
     background: Optional[Any] = None,
     label_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
-    if background is None:
-        background = _auto_background(label_names)
+    resolved_background = _infer_background_value(
+        background,
+        label_names,
+        sample_values=list(y_true) + list(y_pred),
+    )
     return {
         "acc":   frame_accuracy(y_true, y_pred),
-        "edit":  edit_score(y_true, y_pred, background, label_names),
-        "f1@10": segmental_f1(y_true, y_pred, 0.10, background, label_names),
-        "f1@25": segmental_f1(y_true, y_pred, 0.25, background, label_names),
-        "f1@50": segmental_f1(y_true, y_pred, 0.50, background, label_names),
+        "edit":  edit_score(y_true, y_pred, resolved_background, label_names),
+        "f1@10": segmental_f1(y_true, y_pred, 0.10, resolved_background, label_names),
+        "f1@25": segmental_f1(y_true, y_pred, 0.25, resolved_background, label_names),
+        "f1@50": segmental_f1(y_true, y_pred, 0.50, resolved_background, label_names),
     }
 
 def compute_tas_metrics_macro(
@@ -128,7 +173,7 @@ def compute_tas_metrics_macro(
     *,
     gt_col: str = "ground_truth",
     case_col: str = "case:concept:name",
-    background: Optional[Any] = 0,
+    background: Optional[Any] = None,
     label_names: Optional[Sequence[str]] = None,
     return_per_video: bool = False,
 ) -> Union[Dict[str, float], Tuple[Dict[str, float], pd.DataFrame]]:
@@ -179,6 +224,17 @@ def compute_tas_metrics_macro(
     if missing:
         raise ValueError(f"Missing required column(s): {sorted(missing)}")
 
+    # Build label names if not provided (use original value types)
+    if label_names is None:
+        combined_vals = pd.concat([df[gt_col], df[pred_col]]).unique().tolist()
+        label_names = combined_vals
+
+    resolved_background = _infer_background_value(
+        background,
+        label_names,
+        sample_values=pd.concat([df[gt_col], df[pred_col]]).tolist(),
+    )
+
     # --- per-video metrics (for macro Edit/F1) ---
     rows = []
     for vid, g in df.groupby(case_col, sort=False):
@@ -186,7 +242,12 @@ def compute_tas_metrics_macro(
         y_pred = g[pred_col].tolist()
         if not y_true:  # skip empty sequences just in case
             continue
-        m = tas_metrics(y_true, y_pred, background=background, label_names=label_names)
+        m = tas_metrics(
+            y_true,
+            y_pred,
+            background=resolved_background,
+            label_names=label_names,
+        )
         rows.append({"video": vid, "n_frames": len(g), **m})
     per_video_df = pd.DataFrame(rows)
 
@@ -209,7 +270,7 @@ def compute_tas_metrics_macro(
 def compute_tas_metrics_from_sequences(
     gt_sequences: List[List[str]],
     pred_sequences: List[List[str]],
-    background: Optional[Any] = 0,
+    background: Optional[Any] = None,
     label_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, float]:
     """
@@ -254,6 +315,18 @@ def compute_tas_metrics_from_sequences(
             f"Pred has {len(pred_sequences)}"
         )
 
+    if label_names is None:
+        label_universe = set()
+        for seq in gt_sequences + pred_sequences:
+            label_universe.update(seq)
+        label_names = list(label_universe)
+
+    resolved_background = _infer_background_value(
+        background,
+        label_names,
+        sample_values=[lbl for seq in (gt_sequences + pred_sequences) for lbl in seq],
+    )
+
     # Compute per-sequence metrics
     per_sequence_metrics = []
     all_gt_frames = []
@@ -267,7 +340,12 @@ def compute_tas_metrics_from_sequences(
             )
 
         # Get metrics for this sequence
-        seq_metrics = tas_metrics(gt_seq, pred_seq, background=background, label_names=label_names)
+        seq_metrics = tas_metrics(
+            gt_seq,
+            pred_seq,
+            background=resolved_background,
+            label_names=label_names,
+        )
         per_sequence_metrics.append(seq_metrics)
 
         # Collect all frames for micro accuracy
@@ -297,7 +375,7 @@ def compute_sktr_vs_argmax_metrics(
     argmax_pred_col: str = "argmax_activity",
     kari_pred_col: Optional[str] = "kari_activity",
     gt_col: str = "ground_truth",
-    background: Optional[Any] = 0,
+    background: Optional[Any] = None,
     label_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
@@ -438,7 +516,7 @@ def print_tas_metrics_from_csv(
     argmax_pred_col: str = "argmax_activity",
     kari_pred_col: Optional[str] = "kari_activity",
     gt_col: str = "ground_truth",
-    background: Optional[Any] = 0,
+    background: Optional[Any] = None,
     label_names: Optional[Sequence[str]] = None,
     precision: int = 2,
     return_tables: bool = False,

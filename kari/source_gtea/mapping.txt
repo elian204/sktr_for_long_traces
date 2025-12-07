@@ -1,0 +1,11 @@
+0 background
+1 close
+2 pour
+3 open
+4 spread
+5 scoop
+6 take
+7 fold
+8 shake
+9 put
+10 stir

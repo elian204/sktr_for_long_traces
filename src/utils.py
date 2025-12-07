@@ -2084,7 +2084,12 @@ def compute_group_accuracies_from_results(results_df: pd.DataFrame, group1_cases
     return results
 
 
-def compute_evaluation_metrics(results_df: pd.DataFrame, *, background: Optional[Any] = '0') -> Dict[str, Dict[str, float]]:
+def compute_evaluation_metrics(
+    results_df: pd.DataFrame,
+    *,
+    background: Optional[Any] = None,
+    label_names: Optional[Sequence[Any]] = None,
+) -> Dict[str, Dict[str, float]]:
     """
     Compute comprehensive TAS evaluation metrics for SKTR and argmax predictions.
 
@@ -2160,6 +2165,11 @@ def compute_evaluation_metrics(results_df: pd.DataFrame, *, background: Optional
         if df[col].dtype != 'object':
             df[col] = df[col].astype(str)
 
+    if label_names is None:
+        label_names = pd.concat(
+            [df['ground_truth'], df['sktr_activity'], df['argmax_activity']]
+        ).unique().tolist()
+
     print(f"Computing evaluation metrics for {df['case:concept:name'].nunique()} cases...")
 
     # Compute metrics for SKTR
@@ -2169,7 +2179,8 @@ def compute_evaluation_metrics(results_df: pd.DataFrame, *, background: Optional
         pred_col='sktr_activity',
         gt_col='ground_truth',
         case_col='case:concept:name',
-        background=background
+        background=background,
+        label_names=label_names,
     )
 
     # Compute metrics for argmax
@@ -2179,7 +2190,8 @@ def compute_evaluation_metrics(results_df: pd.DataFrame, *, background: Optional
         pred_col='argmax_activity',
         gt_col='ground_truth',
         case_col='case:concept:name',
-        background=background
+        background=background,
+        label_names=label_names,
     )
 
     # Organize results
