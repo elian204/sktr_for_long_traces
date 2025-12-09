@@ -5,20 +5,18 @@ This module provides the fundamental data structures and algorithms for:
 - Petri net representation (places, transitions, arcs, markings)
 - Reachability graph construction and exploration
 - Synchronous product construction for alignment-based conformance checking
-- A* and Dijkstra-based optimal alignment computation with probabilistic weights
+- Chunked conformance checking for softmax trace recovery
 - Support for partial conformance checking and trace recovery
 
 Main Classes:
     Place, Transition, Arc: Basic Petri net components
     Marking: Token distribution representation
-    PetriNet: Main Petri net class with reachability analysis
-    SyncProduct: Specialized class for conformance checking alignments
+    PetriNet: Main Petri net class with reachability analysis and conformance checking
     Graph, Node, Edge: Graph representation structures
     SearchNode: Search state for alignment algorithms
 
-The module supports both classical and probabilistic conformance checking
-approaches, including conditional probability-based cost functions and
-n-gram smoothing for improved alignment quality.
+The module supports probabilistic conformance checking with conditional
+probability-based cost functions and n-gram smoothing for improved alignment quality.
 """
 
 import numpy as np
@@ -26,15 +24,56 @@ import copy
 import logging
 import time
 import sys
-from collections import deque, Counter
-from heapq import heappush, heappop
-from typing import Callable, Dict, List, Optional, Set, Tuple, Any, Union
-from collections import defaultdict
+from collections import deque, Counter, defaultdict
+from typing import Callable, Dict, List, Optional, Tuple, Any, Union
 import heapq
 from .utils import adjust_probs_with_sequence_context
 
 # Configure logger
 logger = logging.getLogger(__name__)
+
+
+def _extend_path_prefix_bounded(
+    current_prefix: Tuple[str, ...],
+    new_label: str,
+    max_distinct_labels: int
+) -> Tuple[str, ...]:
+    """
+    Extend path_prefix with a new label, keeping only enough history for conditioning.
+
+    This stores a "collapsed" representation - consecutive runs of the same label
+    are represented by a single entry. We keep at most max_distinct_labels entries
+    to bound memory usage while preserving correctness for conditioning lookups.
+
+    The get_run_context_labels_extended function needs to:
+    1. Identify the current run label (last element)
+    2. Find up to n_prev_labels previous DIFFERENT labels
+
+    By storing collapsed runs, we preserve this information with bounded memory.
+
+    Example with max_distinct_labels=4:
+        ('A', 'B', 'C') + 'C' -> ('A', 'B', 'C')  # same label, no change
+        ('A', 'B', 'C') + 'D' -> ('A', 'B', 'C', 'D')  # new label, append
+        ('A', 'B', 'C', 'D') + 'E' -> ('B', 'C', 'D', 'E')  # new label, drop oldest
+    """
+    # Intern the label to ensure identical strings share memory across all nodes
+    new_label = sys.intern(new_label)
+
+    if not current_prefix:
+        return (new_label,)
+
+    # If new label matches the last label in prefix, no change needed (still same run)
+    if current_prefix[-1] == new_label:
+        return current_prefix
+
+    # New distinct label - append it
+    new_prefix = current_prefix + (new_label,)
+
+    # If we exceed the limit, drop the oldest entry
+    if len(new_prefix) > max_distinct_labels:
+        new_prefix = new_prefix[1:]  # Drop first (oldest) element
+
+    return new_prefix
 
 
 class Place:
@@ -135,6 +174,7 @@ class Arc:
     
     
 class Marking:
+    __slots__ = ('places',)
     def __init__(self, places=None):
         # Convert `places` to a tuple if it's not None, otherwise initialize an empty tuple
         if places is None:
@@ -194,6 +234,18 @@ class Graph:
 
 
 class SearchNode:
+    __slots__ = (
+        'marking',
+        'cost',
+        'ancestor',
+        'move_type',
+        'move_label',
+        'move_cost',
+        'timestamp',
+        'last_label',
+        'path_prefix'
+    )
+
     def __init__(
         self,
         marking: 'Marking',
@@ -659,10 +711,7 @@ class PetriNet:
                 trans.move_type = 'model'
                 
         
-    def conformance_checking(self, trace_model, hist_prob_dict=None, lamda=0.5):
-        sync_prod = self.construct_synchronous_product(trace_model, self.cost_function)      
-        return sync_prod.dijkstra_no_rg_construct(hist_prob_dict, lamda=lamda)
-    
+
 
     def _fire_transition_original(
         self,
@@ -833,35 +882,6 @@ class PetriNet:
                 if tokens > 0}
     
       
-    def compute_conditioned_weight(self, path_prefix, transition, prob_dict, max_length, lamda=0.5):
-        if not prob_dict or not path_prefix or transition.label is None:
-            return transition.weight
-    
-        transition_weight = transition.weight
-        transition_label = transition.label
-        path_prefix_tuple = tuple(path_prefix)
-    
-        def adjusted_weight(prefix):
-            if transition_label in prob_dict[prefix]:
-                return (1 - lamda) * (1 - prob_dict[prefix][transition_label]) + lamda * transition_weight
-            return (1 - lamda) + lamda * transition_weight
-    
-        if path_prefix_tuple in prob_dict:
-            return adjusted_weight(path_prefix_tuple)
-    
-        longest_prefix = self.find_longest_prefix(path_prefix_tuple, prob_dict, max_length)
-        if longest_prefix:
-            return adjusted_weight(longest_prefix)
-    
-        return 1  # Default cost for a non-sync move
-    
-    def find_longest_prefix(self, path_prefix, prob_dict, max_length):
-        for i in range(min(len(path_prefix), max_length), 0, -1):
-            sub_prefix = path_prefix[-i:]
-            if sub_prefix in prob_dict:
-                return sub_prefix
-        return None
-
     def _compute_reachable_transitions_via_tau(
         self,
         marking_places: Tuple[int, ...],
@@ -1041,281 +1061,8 @@ class PetriNet:
         return self.get_tau_reachable_transitions(self.final_mark, max_tau_depth)
     
 
-    # [removed] validation helpers (_compute_tau_closure_naive, validate_marking_transition_map, explain_marking_transitions)
-
-
-    def dijkstra_no_rg_construct(
-        self,
-        prob_dict: Optional[Dict[Any, float]] = None,
-        lambda_: float = 0.5,
-        partial_conformance: bool = False,
-        return_net_final_marking: bool = False,
-        n_unique_final_markings: int = 1,
-        overlap_size: int = 0,
-        trace_activities_multiset: Optional[Dict[Any, int]] = None,
-        use_heuristic_distance: bool = False,
-        trace_recovery: bool = False,
-        max_hist_len: Optional[int] = None,
-    ) -> Tuple[Any, int]:
-        """
-        Perform Dijkstra-based search over synchronous product without constructing
-        a replay graph.
-        
-        Expands minimal-distance nodes until `n_unique_final_markings` are found.
-        
-        Assumes helper methods return nodes with:
-            - .marking.places: Tuple[...] as the state key
-            - .dist: float as the path cost
-        
-        Returns
-        -------
-        Tuple[Any, int]
-            Processed final node information and count of nodes opened during search.
-        """
-        # Initialize data structures
-        open_heap: List[Any] = []
-        best_distances: Dict[Tuple[Any, ...], float] = {}
-        visited_markings: Set[Tuple[Any, ...]] = set()
-        final_nodes: List[Any] = []
-        final_markings_unique: Set[Tuple[Any, ...]] = set()
-        nodes_opened: int = 0
-        
-        # Start search from initial node
-        start = self._initialize_dijkstra_node(
-            trace_activities_multiset, use_heuristic_distance
-        )
-        heappush(open_heap, start)
-        
-        while open_heap:
-            current = heappop(open_heap)
-            key = current.marking.places
-            
-            # Skip already processed markings
-            if key in visited_markings:
-                continue
-                
-            # Check if current node is a valid final state
-            if self._is_dijkstra_final_node(
-                current, partial_conformance, n_unique_final_markings, final_markings_unique
-            ):
-                final_nodes.append(current)
-                if len(final_nodes) >= n_unique_final_markings:
-                    break
-                continue
-            
-            # Expand current node
-            nodes_opened += 1
-            for transition in self._find_available_transitions(key):
-                successor = self._create_dijkstra_successor_node(
-                    current, transition, prob_dict, lambda_, max_hist_len, use_heuristic_distance
-                )
-                successor_key = successor.marking.places
-                
-                # Add successor if it improves known distance
-                if self._should_add_dijkstra_node(successor, best_distances):
-                    best_distances[successor_key] = successor.dist
-                    heappush(open_heap, successor)
-            
-            visited_markings.add(key)
-        
-        # Process and return results
-        result = self._process_dijkstra_final_node(
-            final_nodes,
-            partial_conformance,
-            overlap_size,
-            trace_recovery,
-            return_net_final_marking,
-        )
-        return result, nodes_opened
-
-
-    def _initialize_dijkstra_node(self, trace_activities_multiset, use_heuristic_distance):
-            """
-            Initialize a new node for Dijkstra's algorithm.
-            
-            Args:
-                trace_activities_multiset: Multiset of trace activities
-                use_heuristic_distance: Boolean flag to determine if heuristic should be used
-                
-            Returns:
-                A new search node initialized with the initial marking and calculated heuristic
-            """
-            # Calculate initial heuristic if enabled, otherwise use 0
-            init_heuristic = (self.estimate_alignment_heuristic(self.init_mark, trace_activities_multiset) 
-                            if use_heuristic_distance else 0)
-            
-            # Ensure trace_activities_multiset is a set if None
-            trace_activities_multiset = trace_activities_multiset or set()
-            
-            # Create and return new search node
-            return SearchNode(
-                marking=self.init_mark,
-                dist=0,
-                trace_activities_multiset=trace_activities_multiset.copy(),
-                heuristic_distance=init_heuristic,
-                total_model_moves=0
-            )
-
-    def _is_dijkstra_final_node(self, node, partial_conformance):
-        """
-        Determines whether the given node is a final node according to the Dijkstra criteria.
-        
-        In partial conformance mode, it checks whether the tail portion of the node's marking
-        (with length equal to the trace model's places) matches the trace model's final marking.
-        If so, it extracts the model's marking from the node and records it.
-        
-        In full conformance mode, it checks whether the entire marking of the node matches the final marking.
-        
-        Args:
-            node: The node to evaluate, which has a 'marking' attribute.
-            partial_conformance (bool): Flag indicating whether partial conformance is used.
-        
-        Returns:
-            bool: True if the node qualifies as a final node; otherwise, False.
-        """
-        if partial_conformance:
-            # Define the length of the trace model's marking segment.
-            trace_places_count = len(self.trace_model.places)
-            # Extract the tail portion from the node's marking.
-            node_tail_marking = node.marking.places[-trace_places_count:]
-            # Compare with the trace model's final marking.
-            if node_tail_marking == self.trace_model.final_mark.places:
-                # Extract the model portion from the node's marking.
-                model_marking = node.marking.places[:len(self.net.places)]
-                return True
-        else:
-            # For full conformance, compare the entire marking.
-            if node.marking.places == self.final_mark.places:
-                return True
-        return False
-    
-
-    def _create_dijkstra_successor_node(
-        self,
-        current_node: SearchNode,
-        transition: Transition,
-        prob_dict: Dict[Any, float],
-        lamda: float,
-        max_hist_len: int,
-        use_heuristic_distance: bool,
-        nodes_opened: int
-    ) -> SearchNode:
-        """
-        Fire a transition in the synchronous product and build the corresponding
-        Dijkstra search node.
-
-        - Updates the marking by firing the transition.
-        - Computes the conditioned transition weight.
-        - Extends the path prefix if the transition has a label.
-        - Computes heuristic distance and remaining activities.
-        - Increments model/trace move counts based on the transition type.
-        """
-        # 1. Fire the transition and compute its cost
-        new_marking = self._fire_transition(current_node.marking, transition)
-        conditioned_weight = self.compute_conditioned_weight(
-            current_node.path_prefix,
-            transition,
-            prob_dict,
-            max_length=max_hist_len,
-            lamda=lamda,
-        )
-
-        # 2. Build the new path prefix (only add label when present)
-        new_prefix = (
-            current_node.path_prefix + [transition.label]
-            if transition.label is not None
-            else current_node.path_prefix
-        )
-
-        # 3. Heuristic estimate and leftover trace activities
-        heuristic_dist, leftover_multiset = self._compute_dijkstra_heuristic(
-            current_node,
-            transition,
-            new_marking,
-            use_heuristic_distance,
-        )
-
-        # 4. Update move counters
-        is_model_move = transition.move_type in {"model", "sync"}
-        is_trace_move = transition.move_type in {"trace", "sync"}
-        new_model_moves = current_node.total_model_moves + int(is_model_move)
-        new_trace_moves = current_node.total_trace_moves + int(is_trace_move)
-
-        # 5. Construct and return the new search node
-        return SearchNode(
-            new_marking,
-            dist=current_node.dist + conditioned_weight,
-            ancestor=current_node,
-            move_type=transition.move_type,
-            move_label=transition.label,
-            move_cost=conditioned_weight,
-            timestamp=current_node.timestamp + 1
-        )
-    
-    
-    def _should_add_dijkstra_node(
-        self,
-        new_node: SearchNode,
-        marking_distance: Dict[Any, float]
-    ) -> bool:
-        """
-        Decide whether a newly generated Dijkstra node should be added to the
-        open set. Returns True if:
-        - We haven't seen this marking before, or
-        - We've found a strictly shorter path to this marking.
-        """
-        places = new_node.marking.places
-        previous_dist = marking_distance.get(places)
-        return previous_dist is None or new_node.dist < previous_dist
-
-    
-    def _process_dijkstra_final_node(self, final_node):
-        """
-        Processes the final node obtained from the Dijkstra search to build the alignment path,
-        calculate the total cost, and extract the final marking and node path.
-    
-        The function performs the following steps:
-          1. Validates that the final node is not None.
-          2. Builds the alignment path and computes the total distance using `_build_dijkstra_path`.
-          3. Extracts the net's final marking (only considering places corresponding to the net).
-          4. Constructs the complete node path from the initial node to the final node.
-          5. Retrieves the count of nodes opened during the search.
-    
-        Args:
-            final_node: The final node from the Dijkstra search. Must not be None.
-    
-        Returns:
-            A tuple containing:
-              - alignment: A list of Transition objects representing the alignment path.
-              - total_distance: A float representing the total cost/distance of the path.
-              - net_final_marking: A Marking object for the net's final marking (using only the net's places).
-              - node_path: A list of node objects representing the complete path from the initial node to the final node.
-              - nodes_opened: An integer count of nodes opened during the search.
-    
-        Raises:
-            ValueError: If the provided final_node is None.
-        """
-        if final_node is None:
-            raise ValueError("Final search node during Dijkstra search is None.")
-    
-        # Build the alignment path and compute the total distance.
-        alignment, total_distance = self._build_dijkstra_path(final_node)
-    
-        # Extract the net's final marking (only include places corresponding to the net).
-        net_final_marking = Marking(final_node.marking.places[:len(self.net.places)])
-    
-        # Reconstruct the complete node path from initial to final.
-        node_path = []
-        current = final_node
-        while current:
-            node_path.append(current)
-            current = current.ancestor
-        node_path.reverse()  # Now the path is from the initial node to the final node.
-    
-        nodes_opened = final_node.nodes_opened
-    
-        return alignment, total_distance, net_final_marking, nodes_opened
-    
+    # [removed] Dijkstra-based conformance checking helpers (dijkstra_no_rg_construct, etc.)
+    # These were broken and unused. Use partial_trace_conformance / conformance_chunked instead.
 
     def partial_trace_conformance(
         self,
@@ -1348,8 +1095,14 @@ class PetriNet:
         - 'final_marking': Marking
         """
         n_acts, n_ts = softmax_matrix.shape
-        label2idx = {str(i): i for i in range(n_acts)}
-        idx2label = {i: str(i) for i in range(n_acts)}
+        # Use sys.intern for label strings to ensure identical labels share memory
+        label2idx = {sys.intern(str(i)): i for i in range(n_acts)}
+        idx2label = {i: sys.intern(str(i)) for i in range(n_acts)}
+
+        # Memory optimization: bound path_prefix to only store what's needed for conditioning.
+        # We need n_prev_labels previous DIFFERENT labels plus the current label.
+        # Add +1 buffer for safety in edge cases.
+        max_prefix_distinct_labels = conditioning_n_prev_labels + 2
 
         # Extract bigram map prev -> {next -> P(next|prev)} if provided (legacy mode)
         # For extended mode (n_prev_labels > 1), we'll pass prob_dict_uncollapsed and prob_dict_collapsed directly
@@ -1406,6 +1159,7 @@ class PetriNet:
             # Update unlabeled best after acceptance
             if cost < best_unlabeled[unlabeled_key]:
                 best_unlabeled[unlabeled_key] = cost
+
 
             # Goal reached: consumed all timestamps
             if node.timestamp == n_ts:
@@ -1520,7 +1274,9 @@ class PetriNet:
                                 move_cost=c + add_switch,
                                 timestamp=node.timestamp + 1,
                                 last_label=label,
-                                path_prefix=(node.path_prefix + (label,)),
+                                path_prefix=_extend_path_prefix_bounded(
+                                    node.path_prefix, label, max_prefix_distinct_labels
+                                ),
                             )
                         ))
 
@@ -1576,7 +1332,9 @@ class PetriNet:
                             move_cost=c + tau_cost_total + add_switch,
                             timestamp=node.timestamp + 1,
                             last_label=t.label,
-                            path_prefix=(node.path_prefix + (t.label,)),
+                            path_prefix=_extend_path_prefix_bounded(
+                                node.path_prefix, t.label, max_prefix_distinct_labels
+                            ),
                         )
                     ))
 

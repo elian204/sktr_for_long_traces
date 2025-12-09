@@ -23,6 +23,90 @@ from .conformance_checking import process_trace_chunked
 logger = logging.getLogger(__name__)
 import sys
 
+# --------------------------
+# Worker state (trace-level)
+# --------------------------
+_WORKER_MODEL = None
+_WORKER_COST_FN = None
+_WORKER_PROB_UNCOLLAPSED = None
+_WORKER_PROB_COLLAPSED = None
+_WORKER_SETTINGS: Dict[str, Any] = {}
+
+
+def _init_trace_worker(
+    model_pickled: bytes,
+    cost_fn_params: Tuple[Any, Any, Any, Any, int],
+    prob_dict_uncollapsed: Dict,
+    prob_dict_collapsed: Dict,
+    worker_settings: Dict[str, Any],
+):
+    """Initializer for trace-level multiprocessing workers."""
+    global _WORKER_MODEL, _WORKER_COST_FN, _WORKER_PROB_UNCOLLAPSED, _WORKER_PROB_COLLAPSED, _WORKER_SETTINGS
+
+    cost_function, model_move_cost, log_move_cost, tau_move_cost, round_precision = cost_fn_params
+    _WORKER_MODEL = pickle.loads(model_pickled)
+    _WORKER_COST_FN = make_cost_function(
+        base=cost_function,
+        model_move=model_move_cost,
+        log_move=log_move_cost,
+        tau_move=tau_move_cost,
+        round_precision=round_precision,
+    )
+    _WORKER_PROB_UNCOLLAPSED = prob_dict_uncollapsed
+    _WORKER_PROB_COLLAPSED = prob_dict_collapsed
+    _WORKER_SETTINGS = worker_settings
+
+
+def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, pd.DataFrame]) -> Tuple[str, List[dict], float, float]:
+    """
+    Worker wrapper: processes a single test case using globals set in _init_trace_worker.
+    Returns the case_id, list of record dicts, sktr_acc, argmax_acc.
+    """
+    global _WORKER_MODEL, _WORKER_COST_FN, _WORKER_PROB_UNCOLLAPSED, _WORKER_PROB_COLLAPSED, _WORKER_SETTINGS
+
+    case_id, softmax_matrix, ground_truth_trace = task_args
+
+    # Extract ground truth sequence
+    ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+
+    # Argmax predictions
+    argmax_indices = np.argmax(softmax_matrix, axis=0)
+    argmax_preds = [str(idx) for idx in argmax_indices]
+
+    # Conformance prediction
+    sktr_preds, sktr_move_costs = process_trace_chunked(
+        softmax_matrix=softmax_matrix,
+        model=_WORKER_MODEL,
+        cost_fn=_WORKER_COST_FN,
+        chunk_size=_WORKER_SETTINGS['chunk_size'],
+        eps=_WORKER_SETTINGS['prob_threshold'],
+        inline_progress=False,
+        prob_dict_uncollapsed=_WORKER_PROB_UNCOLLAPSED,
+        prob_dict_collapsed=_WORKER_PROB_COLLAPSED,
+        switch_penalty_weight=_WORKER_SETTINGS['conformance_switch_penalty_weight'],
+        use_state_caching=_WORKER_SETTINGS['use_state_caching'],
+        merge_mismatched_boundaries=_WORKER_SETTINGS['merge_mismatched_boundaries'],
+        conditioning_alpha=_WORKER_SETTINGS['conditioning_alpha'],
+        conditioning_combine_fn=_WORKER_SETTINGS['conditioning_combine_fn'],
+        conditioning_n_prev_labels=_WORKER_SETTINGS['conditioning_n_prev_labels'],
+        conditioning_interpolation_weights=_WORKER_SETTINGS['conditioning_interpolation_weights'],
+    )
+
+    # Compute accuracy
+    records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
+        case_id=case_id,
+        sktr_preds=sktr_preds,
+        argmax_preds=argmax_preds,
+        ground_truth_sequence=ground_truth_sequence,
+        softmax_matrix=softmax_matrix,
+        activity_prob_threshold=_WORKER_SETTINGS['prob_threshold'],
+        sktr_move_costs=sktr_move_costs,
+        chunk_size=_WORKER_SETTINGS['chunk_size'],
+    )
+
+    records = records_df.to_dict('records')
+    return case_id, records, sktr_acc, argmax_acc
+
 
 def setup_logging(level=logging.INFO):
     """
@@ -100,9 +184,13 @@ def _split_test_traces(
 def _process_single_test_case(
     case_id: str,
     softmax_matrix: np.ndarray,
-    test_df: pd.DataFrame,
-    model: Any,
-    cost_fn: Callable,
+    ground_truth_sequence: List[str],
+    model_pickled: bytes,
+    cost_function: Union[str, Callable[[float], float]],
+    model_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    log_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    tau_move_cost: Optional[Union[float, str, Callable[[float], float]]],
+    round_precision: int,
     prob_threshold: float,
     prob_dict_uncollapsed: Dict,
     prob_dict_collapsed: Dict,
@@ -121,9 +209,15 @@ def _process_single_test_case(
     Returns:
         Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy, records_df)
     """
-    # Extract ground truth sequence for accuracy computation
-    ground_truth_trace = test_df[test_df['case:concept:name'] == case_id].copy().reset_index(drop=True)
-    ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+    # Unpickle model and recreate cost function (needed for multiprocessing compatibility)
+    model = pickle.loads(model_pickled)
+    cost_fn = make_cost_function(
+        base=cost_function,
+        model_move=model_move_cost,
+        log_move=log_move_cost,
+        tau_move=tau_move_cost,
+        round_precision=round_precision
+    )
 
     # Compute argmax predictions
     argmax_indices = np.argmax(softmax_matrix, axis=0)
@@ -664,42 +758,56 @@ def incremental_softmax_recovery(
         logger.info(f"Completed dataset parallelization: {len(recovery_records)} total records, {len(sktr_accs)} total accuracies")
 
     elif parallel_processing and len(test_case_ids) > 1:
-        # Parallel processing
-        logger.info(f"Processing {len(test_case_ids)} test cases in parallel")
+        # Trace-level parallel processing (memory-safe variant)
+        logger.info(f"Processing {len(test_case_ids)} test cases in parallel (trace-level)")
 
         # Determine number of workers
         n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
-        logger.info(f"Using {n_workers} parallel workers")
+        logger.info(f"Using {n_workers} trace-level workers (spawn, maxtasksperchild=5)")
 
-        # Prepare arguments for parallel processing
-        parallel_args = []
-        for case, softmax_matrix in zip(test_case_ids, test_softmax_matrices):
-            args = (
-                case, softmax_matrix, test_df, model, cost_fn,
-                prob_threshold, prob_dict_uncollapsed, prob_dict_collapsed, effective_chunk_size,
-                conformance_switch_penalty_weight, use_state_caching,
-                merge_mismatched_boundaries,
-                conditioning_alpha, conditioning_combine_fn,
-                conditioning_n_prev_labels, conditioning_interpolation_weights,
-            )
-            parallel_args.append(args)
+        # Precompute ground truth traces per case to avoid sending full test_df to workers
+        ground_truth_traces = [
+            test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
+            for case in test_case_ids
+        ]
 
-        # Process in parallel, preserving order as if computed sequentially
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = [executor.submit(_process_single_test_case, *args) for args in parallel_args]
+        # Prepare shared objects for workers
+        model_pickled = pickle.dumps(model)
+        cost_fn_params = (cost_function, model_move_cost, log_move_cost, tau_move_cost, round_precision)
+        worker_settings = {
+            'chunk_size': effective_chunk_size,
+            'prob_threshold': prob_threshold,
+            'conformance_switch_penalty_weight': conformance_switch_penalty_weight,
+            'use_state_caching': use_state_caching,
+            'merge_mismatched_boundaries': merge_mismatched_boundaries,
+            'conditioning_alpha': conditioning_alpha,
+            'conditioning_combine_fn': conditioning_combine_fn,
+            'conditioning_n_prev_labels': conditioning_n_prev_labels,
+            'conditioning_interpolation_weights': conditioning_interpolation_weights,
+        }
 
-            # Collect results in submission order to preserve sequential ordering
-            for idx, future in enumerate(futures, start=1):
-                try:
-                    case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df = future.result()
-                    recovery_records.extend(records_df.to_dict('records'))
-                    sktr_accs.append(sktr_acc)
-                    argmax_accs.append(argmax_acc)
-                    logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
-                except Exception as exc:
-                    logger.error(f"Parallel processing failed for case {idx}: {exc}")
+        tasks = (
+            (case, softmax_matrix, gt_trace)
+            for case, softmax_matrix, gt_trace in zip(test_case_ids, test_softmax_matrices, ground_truth_traces)
+        )
 
-    else:
+        ctx = multiprocessing.get_context("spawn")
+        with ctx.Pool(
+            processes=n_workers,
+            initializer=_init_trace_worker,
+            initargs=(model_pickled, cost_fn_params, prob_dict_uncollapsed, prob_dict_collapsed, worker_settings),
+            maxtasksperchild=5,
+        ) as pool:
+            for idx, (case_id, records, sktr_acc, argmax_acc) in enumerate(pool.imap_unordered(_process_single_test_case_worker, tasks, chunksize=1), start=1):
+                recovery_records.extend(records)
+                sktr_accs.append(sktr_acc)
+                argmax_accs.append(argmax_acc)
+                logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [parallel conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, records={len(records)}")
+
+        logger.info(f"Completed trace-level parallelization: {len(recovery_records)} records, {len(sktr_accs)} accuracies")
+
+    # Sequential processing (also handles disabled parallel case)
+    if not (dataset_parallelization and len(test_case_ids) > 1) and not (parallel_processing and len(test_case_ids) > 1):
         if dataset_parallelization and len(test_case_ids) <= 1:
             logger.info(f"Dataset parallelization skipped: only {len(test_case_ids)} test case(s), using sequential processing")
 
