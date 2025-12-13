@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat:*)",
+      "Bash(cd:*)",
+      "Bash(grep:*)",
+      "Bash(python -m json.tool:*)",
+      "Bash(python3:*)",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nOptimize memory usage for parallel conformance checking\n\n- Add __slots__ to Marking and SearchNode classes (~50% memory reduction per object)\n- Implement bounded path_prefix with collapsed run representation\n- Add string interning for labels to share memory across nodes\n- Remove ~300 lines of broken/unused Dijkstra helper code\n- Refactor worker initialization for trace-level multiprocessing\n- Reduce MAX_WORKERS to 5 for n=9 experiments to prevent OOM\n\nThese changes preserve algorithmic correctness while significantly reducing\nmemory usage for large state spaces (n=9 training traces).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git push:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nUpdate 50salads Petri net visualization\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git commit -m \"$(cat <<''EOF''\nOptimize memory usage for tau-reachability caching\n\n- Replace full tau-map precomputation with on-demand per-marking caching\n- Add LRU-ish eviction with pinned initial marking to prevent OOM\n- Use hash-based trace signatures instead of tuple keys for variant selection\n- Precompute ground truth sequences once to avoid repeated DataFrame copies\n- Fix dataset parallelization bug (was passing wrong data to workers)\n- Add precompute_marking_transition_map parameter for user control\n- Fix precompute clobbering bug when max_tau_depth wasn''t recorded\n- Update GTEA experiment results\n\nThese changes significantly reduce peak memory usage for complex Petri nets\n(e.g., n_train_traces=9 with 75 places/105 transitions).\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>\nEOF\n)\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

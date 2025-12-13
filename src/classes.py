@@ -321,6 +321,9 @@ class PetriNet:
         self._marking_transition_map = None
         self._marking_transition_map_max_tau = None
         self._allow_lazy_map_build = True  # Control whether lazy loading is allowed
+        # Bound the size of the on-demand marking→tau-reachable cache.
+        # When exceeded, we evict older entries and recompute as needed.
+        self._marking_transition_map_cache_max_size = 20000
 
     @property
     def marking_transition_map(self):
@@ -630,25 +633,45 @@ class PetriNet:
         if self._use_cache and mark_tuple in self._enabled_cache:
             return self._enabled_cache[mark_tuple]
         
-        # Use lazy loading for marking transition map only if allowed
-        if self._allow_lazy_map_build:
-            transition_map = self.get_or_build_marking_transition_map(max_tau_depth)
-        else:
-            transition_map = self._marking_transition_map
-        
+        # Use lazy caching for marking transition map only if allowed. Unlike the previous
+        # "lazy" behavior (which built the *entire* map), this caches per-marking entries
+        # on demand to avoid OOM on complex models.
+        transition_map = (
+            self.get_or_build_marking_transition_map(max_tau_depth)
+            if self._allow_lazy_map_build
+            else self._marking_transition_map
+        )
+
         if transition_map is not None:
             entry = transition_map.get(mark_tuple)
-            if entry and "available_transitions" in entry:
-                # Return the list of non-silent transitions reachable via tau-moves
-                result = list(entry["available_transitions"].keys())
-            else:
-                logger.warning(
-                    f"Marking {mark_tuple} not found in marking_transition_map. "
-                    "Falling back to direct enabled transitions."
-                )
-                result = self._find_directly_enabled_transitions(mark_tuple)
+            if entry and "available_transitions" in entry and self._allow_lazy_map_build:
+                # Refresh entry to behave like an LRU cache under dict insertion ordering.
+                transition_map.pop(mark_tuple, None)
+                transition_map[mark_tuple] = entry
+
+            if not entry or "available_transitions" not in entry:
+                # Compute tau-reachable visible transitions for this marking and cache.
+                try:
+                    tau_reachable = self._compute_reachable_transitions_via_tau(mark_tuple, max_tau_depth)
+                except Exception:
+                    tau_reachable = {}
+                entry = {"available_transitions": tau_reachable}
+                if self._allow_lazy_map_build:
+                    transition_map[mark_tuple] = entry
+                    if len(transition_map) > self._marking_transition_map_cache_max_size:
+                        pinned = self.init_mark.places if self.init_mark is not None else None
+                        while len(transition_map) > self._marking_transition_map_cache_max_size:
+                            oldest_key = next(iter(transition_map))
+                            if pinned is not None and oldest_key == pinned:
+                                # Keep the initial marking hot.
+                                transition_map[pinned] = transition_map.pop(pinned)
+                                continue
+                            transition_map.pop(oldest_key, None)
+
+            # Return the list of non-silent transitions reachable via tau-moves
+            result = list(entry["available_transitions"].keys())
         else:
-            # Fallback to original behavior if map is not present
+            # No transition map available: fall back to direct enabled transitions.
             result = self._find_directly_enabled_transitions(mark_tuple)
         
         # Cache result if enabled
@@ -958,11 +981,27 @@ class PetriNet:
 
 
     def get_or_build_marking_transition_map(self, max_tau_depth: int = 100) -> Dict[Tuple[int, ...], Dict]:
-        """Get existing marking transition map or build it with lazy loading."""
-        if (self._marking_transition_map is None or
-            self._marking_transition_map_max_tau != max_tau_depth):
-            logger.info(f"Building marking transition map (lazy loading) with max_tau_depth={max_tau_depth}")
-            self._marking_transition_map = self.build_marking_transition_map(max_tau_depth)
+        """
+        Get an existing marking-transition cache or initialize an empty on-demand cache.
+
+        Note: This intentionally does NOT build the full reachability map. Full-map
+        precomputation can be extremely memory-heavy for complex discovered models.
+        Use `build_marking_transition_map()` explicitly if you truly need the complete map.
+        """
+        if self._marking_transition_map is None:
+            self._marking_transition_map = {}
+            self._marking_transition_map_max_tau = max_tau_depth
+            return self._marking_transition_map
+
+        # If we have an existing map but no recorded depth, assume it's valid for the
+        # requested depth (this is the case for eagerly precomputed maps).
+        if self._marking_transition_map_max_tau is None:
+            self._marking_transition_map_max_tau = max_tau_depth
+            return self._marking_transition_map
+
+        if self._marking_transition_map_max_tau != max_tau_depth:
+            # Depth changed; invalidate any cached entries to preserve correctness.
+            self._marking_transition_map = {}
             self._marking_transition_map_max_tau = max_tau_depth
         return self._marking_transition_map
 
@@ -1024,6 +1063,7 @@ class PetriNet:
                 result[current_marking] = {"available_transitions": {}}
 
         self.marking_transition_map = result
+        self._marking_transition_map_max_tau = max_tau_depth
         logger.info(f"Built marking transition map with {len(result)} markings")
         return result
 
@@ -1042,13 +1082,25 @@ class PetriNet:
             raise TypeError("Marking must be a Marking object, tuple, or None")
         
         # Check cache first
-        if hasattr(self, "marking_transition_map") and self.marking_transition_map:
-            entry = self.marking_transition_map.get(marking_tuple)
+        if getattr(self, "_marking_transition_map", None) and self._marking_transition_map_max_tau == max_tau_depth:
+            entry = self._marking_transition_map.get(marking_tuple)
             if entry and "available_transitions" in entry:
                 return entry["available_transitions"]
-        
-        # Compute if not cached
-        return self._compute_reachable_transitions_via_tau(marking_tuple, max_tau_depth)
+
+        # Compute and optionally cache
+        reachable = self._compute_reachable_transitions_via_tau(marking_tuple, max_tau_depth)
+        if self._allow_lazy_map_build:
+            transition_map = self.get_or_build_marking_transition_map(max_tau_depth)
+            transition_map[marking_tuple] = {"available_transitions": reachable}
+            if len(transition_map) > self._marking_transition_map_cache_max_size:
+                pinned = self.init_mark.places if self.init_mark is not None else None
+                while len(transition_map) > self._marking_transition_map_cache_max_size:
+                    oldest_key = next(iter(transition_map))
+                    if pinned is not None and oldest_key == pinned:
+                        transition_map[pinned] = transition_map.pop(pinned)
+                        continue
+                    transition_map.pop(oldest_key, None)
+        return reachable
     
     def get_tau_reachable_transitions_initial(self, max_tau_depth=100):
         """Get tau-reachable transitions for the initial marking."""
@@ -1687,7 +1739,4 @@ class PetriNet:
                 move_costs.append(move_cost)
         
         return predicted_sequence, move_costs
-
-
-
 

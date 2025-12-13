@@ -451,15 +451,27 @@ def _select_diverse_cases(
     """
     rng = random.Random(seed)
     
-    # Group cases by their trace variant (sequence of activities)
-    trace_variants = {}
-    for case_id in df['case:concept:name'].unique():
-        case_trace = df[df['case:concept:name'] == case_id]['concept:name'].tolist()
-        trace_signature = tuple(case_trace)
-        
-        if trace_signature not in trace_variants:
-            trace_variants[trace_signature] = []
-        trace_variants[trace_signature].append(case_id)
+    def _trace_signature(case_df: pd.DataFrame) -> bytes:
+        """
+        Compute a stable signature for a case's full activity sequence without
+        materializing (and storing) the entire sequence as a large tuple.
+
+        This preserves the semantics of "variant = exact full sequence" while
+        dramatically reducing peak memory usage for long traces.
+        """
+        hasher = hashlib.blake2b(digest_size=16)
+        for activity in case_df['concept:name']:
+            # Activity labels are expected to be strings; str() keeps behavior robust.
+            hasher.update(str(activity).encode('utf-8', errors='surrogatepass'))
+            hasher.update(b'\x1f')  # separator
+        return hasher.digest()
+
+    # Group cases by their trace variant (exact sequence of activities).
+    # Use groupby to avoid repeated filtering and avoid storing huge tuple keys.
+    trace_variants: dict[bytes, list[Any]] = {}
+    for case_id, case_df in df.groupby('case:concept:name', sort=False):
+        sig = _trace_signature(case_df)
+        trace_variants.setdefault(sig, []).append(case_id)
     
     selected_cases = []
     available_variants = list(trace_variants.keys())

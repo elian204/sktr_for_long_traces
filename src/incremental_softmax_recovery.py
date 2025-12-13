@@ -57,17 +57,14 @@ def _init_trace_worker(
     _WORKER_SETTINGS = worker_settings
 
 
-def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, pd.DataFrame]) -> Tuple[str, List[dict], float, float]:
+def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]]) -> Tuple[str, List[dict], float, float]:
     """
     Worker wrapper: processes a single test case using globals set in _init_trace_worker.
     Returns the case_id, list of record dicts, sktr_acc, argmax_acc.
     """
     global _WORKER_MODEL, _WORKER_COST_FN, _WORKER_PROB_UNCOLLAPSED, _WORKER_PROB_COLLAPSED, _WORKER_SETTINGS
 
-    case_id, softmax_matrix, ground_truth_trace = task_args
-
-    # Extract ground truth sequence
-    ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+    case_id, softmax_matrix, ground_truth_sequence = task_args
 
     # Argmax predictions
     argmax_indices = np.argmax(softmax_matrix, axis=0)
@@ -129,9 +126,9 @@ def setup_logging(level=logging.INFO):
 def _split_test_traces(
     test_case_ids: List[str],
     test_softmax_matrices: List[np.ndarray],
-    test_df: pd.DataFrame,
+    test_ground_truth_sequences: List[List[str]],
     n_chunks: int
-) -> List[Tuple[List[str], List[np.ndarray], pd.DataFrame]]:
+) -> List[Tuple[List[str], List[np.ndarray], List[List[str]]]]:
     """
     Split test traces into chunks for parallel processing.
     
@@ -141,20 +138,25 @@ def _split_test_traces(
         List of test case IDs
     test_softmax_matrices : List[np.ndarray]
         List of softmax matrices corresponding to test cases
-    test_df : pd.DataFrame
-        DataFrame containing test traces
+    test_ground_truth_sequences : List[List[str]]
+        Ground truth sequences (aligned with test_case_ids)
     n_chunks : int
         Number of chunks to split into
         
     Returns
     -------
-    List[Tuple[List[str], List[np.ndarray], pd.DataFrame]]
-        List of tuples, each containing (chunk_case_ids, chunk_softmax_matrices, chunk_test_df)
+    List[Tuple[List[str], List[np.ndarray], List[List[str]]]]
+        List of tuples, each containing (chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences)
     """
     if n_chunks <= 0:
         raise ValueError("n_chunks must be positive")
     if len(test_case_ids) == 0:
         return []
+    if len(test_ground_truth_sequences) != len(test_case_ids):
+        raise ValueError(
+            "test_ground_truth_sequences must be aligned with test_case_ids "
+            f"(got {len(test_ground_truth_sequences)} sequences for {len(test_case_ids)} cases)"
+        )
     
     # Cap n_chunks to number of test cases
     n_chunks = min(n_chunks, len(test_case_ids))
@@ -173,8 +175,8 @@ def _split_test_traces(
         
         chunk_case_ids = test_case_ids[start_idx:end_idx]
         chunk_softmax_matrices = test_softmax_matrices[start_idx:end_idx]
-        chunk_test_df = test_df[test_df['case:concept:name'].isin(chunk_case_ids)].copy()
-        chunks.append((chunk_case_ids, chunk_softmax_matrices, chunk_test_df))
+        chunk_ground_truth_sequences = test_ground_truth_sequences[start_idx:end_idx]
+        chunks.append((chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences))
         
         start_idx = end_idx
     
@@ -260,7 +262,7 @@ def _process_single_test_case(
 def _process_test_chunk(
     chunk_case_ids: List[str],
     chunk_softmax_matrices: List[np.ndarray],
-    chunk_test_df: pd.DataFrame,
+    chunk_ground_truth_sequences: List[List[str]],
     model_pickled: bytes,
     cost_function: Union[str, Callable[[float], float]],
     model_move_cost: Optional[Union[float, str, Callable[[float], float]]],
@@ -288,8 +290,8 @@ def _process_test_chunk(
         List of case IDs in this chunk
     chunk_softmax_matrices : List[np.ndarray]
         List of softmax matrices for this chunk
-    chunk_test_df : pd.DataFrame
-        DataFrame containing test traces for this chunk
+    chunk_ground_truth_sequences : List[List[str]]
+        Ground truth sequences for this chunk (aligned with chunk_case_ids)
     model_pickled : bytes
         Pickled PetriNet model (will be unpickled)
     cost_function : Union[str, Callable]
@@ -347,24 +349,42 @@ def _process_test_chunk(
     sktr_accs = []
     argmax_accs = []
     
-    for case_id, softmax_matrix in zip(chunk_case_ids, chunk_softmax_matrices):
-        _, _, _, sktr_acc, argmax_acc, records_df = _process_single_test_case(
-            case_id=case_id,
+    for case_id, softmax_matrix, ground_truth_sequence in zip(
+        chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences
+    ):
+        # Argmax predictions
+        argmax_indices = np.argmax(softmax_matrix, axis=0)
+        argmax_preds = [str(idx) for idx in argmax_indices]
+
+        # Conformance prediction
+        sktr_preds, sktr_move_costs = process_trace_chunked(
             softmax_matrix=softmax_matrix,
-            test_df=chunk_test_df,
             model=model,
             cost_fn=cost_fn,
-            prob_threshold=prob_threshold,
+            chunk_size=chunk_size,
+            eps=prob_threshold,
+            inline_progress=False,
             prob_dict_uncollapsed=prob_dict_uncollapsed,
             prob_dict_collapsed=prob_dict_collapsed,
-            chunk_size=chunk_size,
-            conformance_switch_penalty_weight=conformance_switch_penalty_weight,
+            switch_penalty_weight=conformance_switch_penalty_weight,
             use_state_caching=use_state_caching,
             merge_mismatched_boundaries=merge_mismatched_boundaries,
             conditioning_alpha=conditioning_alpha,
             conditioning_combine_fn=conditioning_combine_fn,
             conditioning_n_prev_labels=conditioning_n_prev_labels,
             conditioning_interpolation_weights=conditioning_interpolation_weights,
+        )
+
+        # Compute accuracy
+        records_df, sktr_acc, argmax_acc = _compute_accuracy_records(
+            case_id=case_id,
+            sktr_preds=sktr_preds,
+            argmax_preds=argmax_preds,
+            ground_truth_sequence=ground_truth_sequence,
+            softmax_matrix=softmax_matrix,
+            activity_prob_threshold=prob_threshold,
+            sktr_move_costs=sktr_move_costs,
+            chunk_size=chunk_size,
         )
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
@@ -419,6 +439,7 @@ def incremental_softmax_recovery(
     merge_mismatched_boundaries: bool = True,
     # removed: restrict_to_observed_moves
     compute_marking_transition_map: bool = True,
+    precompute_marking_transition_map: bool = False,
     verbose: bool = True,
     log_level: int = logging.INFO,
     # Backwards compatibility: this flag used to control whether to build
@@ -440,9 +461,12 @@ def incremental_softmax_recovery(
         the test set will be identical to the training set. Train and test case IDs
         are explicitly logged for transparency.
     compute_marking_transition_map : bool, default=True
-        If True, computes the marking-to-transition map for the Petri net model.
-        This map is required for full conformance checking functionality with τ-transitions.
-        Set to False to skip this computation (may cause errors if τ-transitions are needed).
+        If True, enables τ-reachability support for conformance checking.
+        When `precompute_marking_transition_map=True`, a full marking-to-transition
+        map is built eagerly (can be very memory-heavy for complex models).
+        Otherwise, τ-reachability is cached on demand per marking.
+    precompute_marking_transition_map : bool, default=False
+        If True, eagerly build the complete marking-to-transition map.
     parallel_processing : bool, default=False
         If True, processes test traces in parallel (trace-level parallelization).
         Each trace is processed independently by a separate worker. Results are collected
@@ -594,13 +618,26 @@ def incremental_softmax_recovery(
     n_transitions = len(model.transitions)
     logger.info(f"Discovered Petri net model: {n_places} places, {n_transitions} transitions.")
     
-    # Compute marking-to-transition map (reachable markings and their tau-reachable transitions)
+    # τ-reachability support (macro transitions). Prefer on-demand caching to reduce peak memory.
     if compute_marking_transition_map:
-        logger.info("Computing marking-to-transition map (tau-reachability) for discovered Petri net...")
-        marking_transition_map = model.build_marking_transition_map()
-        logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
+        if precompute_marking_transition_map:
+            logger.info("Computing full marking-to-transition map (tau-reachability) for discovered Petri net...")
+            marking_transition_map = model.build_marking_transition_map()
+            logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
+            # Use the precomputed map directly; don't mutate it during search.
+            model._allow_lazy_map_build = False
+        else:
+            logger.info("Initializing on-demand marking-to-transition cache (tau-reachability).")
+            model._allow_lazy_map_build = True
+            try:
+                model.get_or_build_marking_transition_map(max_tau_depth=100)
+                init_reachable = model.get_tau_reachable_transitions_initial(max_tau_depth=100)
+                logger.debug(f"Cached tau-reachability for initial marking: {len(init_reachable)} visible transitions")
+            except Exception as exc:
+                logger.warning(f"Failed to warm-start tau-reachability cache: {exc}")
+            marking_transition_map = model.marking_transition_map
     else:
-        logger.info("Skipping marking-to-transition map computation (compute_marking_transition_map=False).")
+        logger.info("Skipping tau-reachability support (compute_marking_transition_map=False).")
         logger.info("Disabling lazy map building - will use direct enabled transitions fallback.")
         model._allow_lazy_map_build = False
         marking_transition_map = None
@@ -668,6 +705,12 @@ def incremental_softmax_recovery(
     # 10. Extract test case IDs for processing
     test_case_ids = test_df['case:concept:name'].drop_duplicates().tolist()
     logger.info(f"Extracted {len(test_case_ids)} test case IDs for processing.")
+
+    # Precompute ground truth sequences once (avoids repeated DataFrame filtering/copies)
+    test_ground_truth_by_case: Dict[str, List[str]] = (
+        test_df.groupby('case:concept:name', sort=False)['concept:name'].apply(list).to_dict()
+    )
+    test_ground_truth_sequences: List[List[str]] = [test_ground_truth_by_case[case] for case in test_case_ids]
     
     # 11. Incremental recovery with optional parallel processing
     recovery_records: List[dict] = []
@@ -706,7 +749,7 @@ def incremental_softmax_recovery(
         logger.info(f"Using {n_workers} workers for dataset parallelization")
 
         # Split test traces into chunks
-        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_df, n_workers)
+        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_ground_truth_sequences, n_workers)
         logger.info(f"Split test dataset into {len(chunks)} chunks")
 
         # Pickle model for sharing across workers
@@ -714,11 +757,11 @@ def incremental_softmax_recovery(
 
         # Prepare arguments for parallel processing
         parallel_args = []
-        for chunk_case_ids, chunk_softmax_matrices, chunk_test_df in chunks:
+        for chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences in chunks:
             args = (
                 chunk_case_ids,
                 chunk_softmax_matrices,
-                chunk_test_df,
+                chunk_ground_truth_sequences,
                 model_pickled,
                 cost_function,
                 model_move_cost,
@@ -765,11 +808,8 @@ def incremental_softmax_recovery(
         n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
         logger.info(f"Using {n_workers} trace-level workers (spawn, maxtasksperchild=5)")
 
-        # Precompute ground truth traces per case to avoid sending full test_df to workers
-        ground_truth_traces = [
-            test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
-            for case in test_case_ids
-        ]
+        # Precompute ground truth sequences per case to avoid sending full test_df to workers
+        ground_truth_sequences = test_ground_truth_sequences
 
         # Prepare shared objects for workers
         model_pickled = pickle.dumps(model)
@@ -787,8 +827,8 @@ def incremental_softmax_recovery(
         }
 
         tasks = (
-            (case, softmax_matrix, gt_trace)
-            for case, softmax_matrix, gt_trace in zip(test_case_ids, test_softmax_matrices, ground_truth_traces)
+            (case, softmax_matrix, gt_seq)
+            for case, softmax_matrix, gt_seq in zip(test_case_ids, test_softmax_matrices, ground_truth_sequences)
         )
 
         ctx = multiprocessing.get_context("spawn")
@@ -846,8 +886,7 @@ def incremental_softmax_recovery(
             )
 
             # Extract ground truth sequence for accuracy computation
-            ground_truth_trace = test_df[test_df['case:concept:name'] == case].copy().reset_index(drop=True)
-            ground_truth_sequence = ground_truth_trace['concept:name'].tolist()
+            ground_truth_sequence = test_ground_truth_by_case[case]
 
             # Compute argmax predictions
             argmax_indices = np.argmax(softmax_matrix, axis=0)

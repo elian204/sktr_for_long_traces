@@ -79,6 +79,8 @@ The notebook includes:
 | `n_indices` / `n_per_run` | Sampling controls | None | Required based on sampling mode |
 | `save_model_path` | Path for Petri net visualization | `./results/discovered_petri_net` | Saves PDF and PNG |
 | `save_model` | Whether to save Petri net visualization | `True` | Set to `False` to skip saving |
+| `compute_marking_transition_map` | Enable τ-reachability support | `True` | Uses on-demand per-marking caching by default |
+| `precompute_marking_transition_map` | Eagerly build full τ map | `False` | Can be very memory-heavy on complex models |
 
 ## 📊 Output Format
 
