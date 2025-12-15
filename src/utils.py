@@ -10,6 +10,7 @@ import os
 import io
 import pickle
 import logging
+import random
 from pathlib import Path
 
 from typing import (
@@ -1212,6 +1213,123 @@ def normalize_sequences_for_evaluation(gt_sequences: List[List[str]], pred_seque
         normalized_pred_sequences.append(pred_seq_str)
 
     return gt_sequences, normalized_pred_sequences
+
+
+def get_variant_info(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Analyze trace variants. Returns DataFrame sorted by frequency (variant_id 0 = most frequent).
+    
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Event log DataFrame with 'case:concept:name' and 'concept:name' columns.
+    
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns:
+        - variant_id: Integer ID (0 = most frequent variant)
+        - trace_signature: Tuple representing the activity sequence
+        - case_ids: List of case IDs belonging to this variant
+        - frequency: Number of cases with this variant
+        - trace_length: Length of the trace sequence
+    """
+    trace_variants = {}
+    for case_id in df['case:concept:name'].unique():
+        trace = tuple(df[df['case:concept:name'] == case_id]['concept:name'].tolist())
+        if trace not in trace_variants:
+            trace_variants[trace] = {'case_ids': [], 'length': len(trace)}
+        trace_variants[trace]['case_ids'].append(case_id)
+    
+    data = [{'variant_id': i, 'trace_signature': sig, 'case_ids': info['case_ids'],
+             'frequency': len(info['case_ids']), 'trace_length': info['length']}
+            for i, (sig, info) in enumerate(trace_variants.items())]
+    
+    variant_df = pd.DataFrame(data).sort_values('frequency', ascending=False).reset_index(drop=True)
+    variant_df['variant_id'] = range(len(variant_df))
+    return variant_df
+
+
+def select_variants(variant_df: pd.DataFrame, n: int, method: str = 'frequency', seed: int = 42) -> List[int]:
+    """
+    Select n variants by frequency or randomly.
+    
+    Parameters
+    ----------
+    variant_df : pd.DataFrame
+        DataFrame from get_variant_info().
+    n : int
+        Number of variants to select.
+    method : str, default 'frequency'
+        Selection method: 'frequency' (top N by frequency) or 'random'.
+    seed : int, default 42
+        Random seed for reproducible selection.
+    
+    Returns
+    -------
+    List[int]
+        List of variant IDs.
+    """
+    n = min(n, len(variant_df))
+    if method == 'frequency':
+        return variant_df['variant_id'].head(n).tolist()
+    else:  # random
+        return random.Random(seed).sample(variant_df['variant_id'].tolist(), n)
+
+
+def get_cases_for_variants(variant_df: pd.DataFrame, variant_ids: List[int], seed: int = 42) -> List[str]:
+    """
+    Get all case IDs for the specified variants.
+    
+    Parameters
+    ----------
+    variant_df : pd.DataFrame
+        DataFrame from get_variant_info().
+    variant_ids : List[int]
+        List of variant IDs to get cases for.
+    seed : int, default 42
+        Random seed (currently unused, kept for API consistency).
+    
+    Returns
+    -------
+    List[str]
+        List of all case IDs belonging to the specified variants.
+    """
+    cases = []
+    for vid in variant_ids:
+        row = variant_df[variant_df['variant_id'] == vid]
+        if not row.empty:
+            cases.extend(row.iloc[0]['case_ids'])
+    return cases
+
+
+def get_variants_for_cases(variant_df: pd.DataFrame, case_ids: List[Union[str, int]]) -> List[int]:
+    """
+    Get unique variant IDs for the specified case IDs.
+    
+    Parameters
+    ----------
+    variant_df : pd.DataFrame
+        DataFrame from get_variant_info().
+    case_ids : List[Union[str, int]]
+        List of case IDs to find variants for.
+    
+    Returns
+    -------
+    List[int]
+        Sorted list of unique variant IDs that contain the specified cases.
+    """
+    # Convert case_ids to strings for comparison (case IDs in variant_df are stored as strings)
+    case_ids_str = [str(cid) for cid in case_ids]
+    variant_ids = set()
+    
+    for _, row in variant_df.iterrows():
+        # Check if any of the requested case IDs are in this variant's case_ids
+        variant_case_ids = [str(cid) for cid in row['case_ids']]
+        if any(cid in variant_case_ids for cid in case_ids_str):
+            variant_ids.add(row['variant_id'])
+    
+    return sorted(list(variant_ids))
 
 
 def compute_activity_run_counts(
