@@ -1134,13 +1134,18 @@ class PetriNet:
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
-        
+
+        Memory-optimized version:
+        - Uses dist-on-push pattern (update distance when relaxing, skip stale on pop)
+        - Uses came_from dict for path reconstruction instead of ancestor chain
+        - Periodically compacts heap to remove stale entries
+
         Args:
             softmax_matrix: Probability matrix (n_activities, n_timestamps)
             initial_marking: Starting marking
             cost_fn: Cost function for moves
             eps: Minimum probability threshold - activities below this are filtered out
-        
+
         Returns a dict with:
         - 'alignment': List[(move_type, move_label, move_cost)]
         - 'total_cost': float
@@ -1164,18 +1169,6 @@ class PetriNet:
                 if isinstance(prefix, tuple) and len(prefix) == 1:
                     bigram_map[prefix[0]] = dict(next_map)
 
-        # Min-heap of (cost, node)
-        open_set: List[Tuple[float, SearchNode]] = []
-        # Carry over last emitted label if provided (to pay switch penalty at window start)
-        start = SearchNode(
-            marking=initial_marking,
-            cost=0.0,
-            timestamp=0,
-            last_label=initial_last_label,
-            path_prefix=tuple(),
-        )
-        heapq.heappush(open_set, (0.0, start))
-
         # If switch penalties are active, the future cost depends on last_label.
         # Extend the state with last_label to preserve optimality under pruning.
         use_last_label_in_state: bool = switch_penalty_weight > 0.0
@@ -1183,49 +1176,94 @@ class PetriNet:
         def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str]):
             return (places, ts, last_label) if use_last_label_in_state else (places, ts)
 
-        # Best-known cost per state key - use provided cache or create new
-        best: Dict[Any, float] = state_cache if state_cache is not None else defaultdict(lambda: float('inf'))
+        # Start state key
+        start_key = make_key(initial_marking.places, 0, initial_last_label)
+
+        # dist: best-known cost per state key - updated on PUSH (relaxation)
+        # This is the key optimization: update dist when we find a better path,
+        # not when we pop. This prevents pushing many duplicates for the same state.
+        dist: Dict[Any, float] = state_cache if state_cache is not None else {}
+        dist[start_key] = 0.0
+
+        # came_from: for path reconstruction - stores (parent_key, move_type, move_label, move_cost)
+        # This eliminates the ancestor chain that prevented garbage collection.
+        came_from: Dict[Any, Tuple[Any, str, str, float]] = {}
+
+        # Store marking and path_prefix for each key (needed for expansion)
+        state_data: Dict[Any, Tuple['Marking', Tuple[str, ...]]] = {}
+        state_data[start_key] = (initial_marking, tuple())
+
         # Additional dominance pruning across last_label for the same (places, timestamp):
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
         # before the next timestamp advance. If a node is already worse than the current best
         # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
         best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
+        best_unlabeled[(initial_marking.places, 0)] = 0.0
 
-        # removed observed-move restriction helper
+        # Min-heap of (cost, counter, key) - counter for tie-breaking to avoid comparing keys
+        counter = 0
+        open_set: List[Tuple[float, int, Any]] = []
+        heapq.heappush(open_set, (0.0, counter, start_key))
+        counter += 1
+
+        # For periodic heap compaction
+        COMPACT_THRESHOLD = 100000
+        iterations_since_compact = 0
 
         while open_set:
-            cost, node = heapq.heappop(open_set)
-            unlabeled_key = (node.marking.places, node.timestamp)
+            cost, _, key = heapq.heappop(open_set)
+
+            # Skip stale entries: if we've already found a better path to this state
+            if cost > dist.get(key, float('inf')):
+                continue
+
+            # Get state data
+            if key not in state_data:
+                continue
+            marking, path_prefix = state_data[key]
+
+            # Extract key components
+            if use_last_label_in_state:
+                places, timestamp, last_label = key
+            else:
+                places, timestamp = key
+                last_label = None
+
+            unlabeled_key = (places, timestamp)
+
             # Dominance prune across different last_label variants
             if switch_penalty_weight > 0.0:
                 current_best_unlabeled = best_unlabeled[unlabeled_key]
-                # Max possible advantage from a favorable last_label on the very next step
                 max_advantage = switch_penalty_weight
                 if cost > current_best_unlabeled + max_advantage + 1e-12:
                     continue
 
-            key = make_key(node.marking.places, node.timestamp, node.last_label)
-            if cost > best.get(key, float('inf')):
-                continue
-            best[key] = cost
             # Update unlabeled best after acceptance
             if cost < best_unlabeled[unlabeled_key]:
                 best_unlabeled[unlabeled_key] = cost
 
-
             # Goal reached: consumed all timestamps
-            if node.timestamp == n_ts:
+            if timestamp == n_ts:
+                # Reconstruct path from came_from
+                alignment = []
+                current_key = key
+                while current_key in came_from:
+                    parent_key, move_type, move_label, move_cost = came_from[current_key]
+                    alignment.append((move_type, move_label, move_cost))
+                    current_key = parent_key
+                alignment.reverse()
+
                 result = {
-                    'alignment': node.reconstruct_path(),
-                    'total_cost': node.cost,
-                    'final_marking': node.marking
+                    'alignment': alignment,
+                    'total_cost': cost,
+                    'final_marking': marking
                 }
                 return result
 
-            enabled = self._find_available_transitions(node.marking.places)
+            enabled = self._find_available_transitions(places)
 
             # Prepare per-timestamp probability vector (optionally conditioned)
-            raw_vec = softmax_matrix[:, node.timestamp]
+            raw_vec = softmax_matrix[:, timestamp]
             if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
                 # Determine which mode to use based on conditioning_n_prev_labels
                 if conditioning_n_prev_labels == 1 and bigram_map:
@@ -1233,7 +1271,7 @@ class PetriNet:
                     prob_vec = adjust_probs_with_sequence_context(
                         observed_probs=raw_vec,
                         class_labels=[idx2label[i] for i in range(n_acts)],
-                        predicted_sequence=list(node.path_prefix),
+                        predicted_sequence=list(path_prefix),
                         cond_prob_bigram=bigram_map,
                         alpha=conditioning_alpha,
                         combine_fn=conditioning_combine_fn,
@@ -1245,7 +1283,7 @@ class PetriNet:
                     prob_vec = adjust_probs_with_sequence_context(
                         observed_probs=raw_vec,
                         class_labels=[idx2label[i] for i in range(n_acts)],
-                        predicted_sequence=list(node.path_prefix),
+                        predicted_sequence=list(path_prefix),
                         prob_dict_uncollapsed=prob_dict_uncollapsed,
                         prob_dict_collapsed=prob_dict_collapsed,
                         alpha=conditioning_alpha,
@@ -1265,38 +1303,31 @@ class PetriNet:
                 if (
                     hasattr(self, "marking_transition_map")
                     and self.marking_transition_map is not None
-                    and node.marking.places in self.marking_transition_map
-                    and t in self.marking_transition_map[node.marking.places]["available_transitions"]
+                    and places in self.marking_transition_map
+                    and t in self.marking_transition_map[places]["available_transitions"]
                 ):
                     # This transition requires τ-path firing; include τ costs
-                    tau_path = self.marking_transition_map[node.marking.places]["available_transitions"][t]
+                    tau_path = self.marking_transition_map[places]["available_transitions"][t]
                     tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                    new_mark = self._fire_macro_transition(node.marking, t)
+                    new_mark = self._fire_macro_transition(marking, t)
                 else:
                     # This is a directly enabled transition
-                    new_mark = self._fire_transition(node.marking, t)
+                    new_mark = self._fire_transition(marking, t)
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + tau_cost_total + c
-                new_key = make_key(new_mark.places, node.timestamp, node.last_label)
-                if new_cost < best.get(new_key, float('inf')):
-                    heapq.heappush(open_set, (
-                        new_cost,
-                        SearchNode(
-                            marking=new_mark,
-                            cost=new_cost,
-                            ancestor=node,
-                            move_type=move_type,
-                            move_label=t.label or 'τ',
-                            move_cost=c + tau_cost_total,
-                            timestamp=node.timestamp,
-                            last_label=node.last_label,
-                            path_prefix=node.path_prefix,
-                        )
-                    ))
+                new_key = make_key(new_mark.places, timestamp, last_label)
+
+                # Dist-on-push: only push if this is a better path
+                if new_cost < dist.get(new_key, float('inf')):
+                    dist[new_key] = new_cost
+                    came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
+                    state_data[new_key] = (new_mark, path_prefix)
+                    heapq.heappush(open_set, (new_cost, counter, new_key))
+                    counter += 1
 
             # 2) Log moves (advance timestamp without firing any transition)
-            if node.timestamp < n_ts:
+            if timestamp < n_ts:
                 for label, idx in label2idx.items():
                     p_adj = float(prob_vec[idx])
                     # Filter out activities below threshold after adjustment
@@ -1306,31 +1337,23 @@ class PetriNet:
                     c = cost_fn(p, 'log')
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
-                    if switch_penalty_weight > 0.0 and node.last_label is not None and label != node.last_label and prob_dict_uncollapsed is not None:
-                        bigram_prefix = (node.last_label,)
-                        p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                    if switch_penalty_weight > 0.0 and last_label is not None and label != last_label and prob_dict_uncollapsed is not None:
+                        bigram_prefix = (last_label,)
+                        p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
                         p_stay = max(min(p_stay, 1.0), 0.0)
                         add_switch = switch_penalty_weight * p_stay
 
                     new_cost = cost + c + add_switch
-                    new_key = make_key(node.marking.places, node.timestamp + 1, label)
-                    if new_cost < best.get(new_key, float('inf')):
-                        heapq.heappush(open_set, (
-                            new_cost,
-                            SearchNode(
-                                marking=node.marking,
-                                cost=new_cost,
-                                ancestor=node,
-                                move_type='log',
-                                move_label=label,
-                                move_cost=c + add_switch,
-                                timestamp=node.timestamp + 1,
-                                last_label=label,
-                                path_prefix=_extend_path_prefix_bounded(
-                                    node.path_prefix, label, max_prefix_distinct_labels
-                                ),
-                            )
-                        ))
+                    new_key = make_key(places, timestamp + 1, label)
+                    new_path_prefix = _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
+
+                    # Dist-on-push: only push if this is a better path
+                    if new_cost < dist.get(new_key, float('inf')):
+                        dist[new_key] = new_cost
+                        came_from[new_key] = (key, 'log', label, c + add_switch)
+                        state_data[new_key] = (marking, new_path_prefix)
+                        heapq.heappush(open_set, (new_cost, counter, new_key))
+                        counter += 1
 
             # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
             for t in enabled:
@@ -1346,49 +1369,49 @@ class PetriNet:
                 c = cost_fn(p, 'sync')
 
                 tau_cost_total = 0.0
-                
+
                 # Use macro transition if this transition comes from marking_transition_map
                 if (
                     hasattr(self, "marking_transition_map")
                     and self.marking_transition_map is not None
-                    and node.marking.places in self.marking_transition_map
-                    and t in self.marking_transition_map[node.marking.places]["available_transitions"]
+                    and places in self.marking_transition_map
+                    and t in self.marking_transition_map[places]["available_transitions"]
                 ):
                     # This transition requires τ-path firing; include τ costs
-                    tau_path = self.marking_transition_map[node.marking.places]["available_transitions"][t]
+                    tau_path = self.marking_transition_map[places]["available_transitions"][t]
                     tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                    new_mark = self._fire_macro_transition(node.marking, t)
+                    new_mark = self._fire_macro_transition(marking, t)
                 else:
                     # This is a directly enabled transition
-                    new_mark = self._fire_transition(node.marking, t)
+                    new_mark = self._fire_transition(marking, t)
 
                 # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                 add_switch = 0.0
-                if switch_penalty_weight > 0.0 and node.last_label is not None and t.label != node.last_label and prob_dict_uncollapsed is not None:
-                    bigram_prefix = (node.last_label,)
-                    p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(node.last_label, 0.0))
+                if switch_penalty_weight > 0.0 and last_label is not None and t.label != last_label and prob_dict_uncollapsed is not None:
+                    bigram_prefix = (last_label,)
+                    p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
                     p_stay = max(min(p_stay, 1.0), 0.0)
                     add_switch = switch_penalty_weight * p_stay
 
                 new_cost = cost + tau_cost_total + c + add_switch
-                new_key = make_key(new_mark.places, node.timestamp + 1, t.label)
-                if new_cost < best.get(new_key, float('inf')):
-                    heapq.heappush(open_set, (
-                        new_cost,
-                        SearchNode(
-                            marking=new_mark,
-                            cost=new_cost,
-                            ancestor=node,
-                            move_type='sync',
-                            move_label=t.label,
-                            move_cost=c + tau_cost_total + add_switch,
-                            timestamp=node.timestamp + 1,
-                            last_label=t.label,
-                            path_prefix=_extend_path_prefix_bounded(
-                                node.path_prefix, t.label, max_prefix_distinct_labels
-                            ),
-                        )
-                    ))
+                new_key = make_key(new_mark.places, timestamp + 1, t.label)
+                new_path_prefix = _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
+
+                # Dist-on-push: only push if this is a better path
+                if new_cost < dist.get(new_key, float('inf')):
+                    dist[new_key] = new_cost
+                    came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
+                    state_data[new_key] = (new_mark, new_path_prefix)
+                    heapq.heappush(open_set, (new_cost, counter, new_key))
+                    counter += 1
+
+            # Periodic heap compaction: remove stale entries
+            iterations_since_compact += 1
+            if iterations_since_compact >= COMPACT_THRESHOLD and len(open_set) > COMPACT_THRESHOLD:
+                # Filter out stale entries (where heap cost != dist[key])
+                open_set = [(c, cnt, k) for c, cnt, k in open_set if dist.get(k, float('inf')) == c]
+                heapq.heapify(open_set)
+                iterations_since_compact = 0
 
         raise ValueError("No conforming path found for the partial trace.")
 
@@ -1739,4 +1762,3 @@ class PetriNet:
                 move_costs.append(move_cost)
         
         return predicted_sequence, move_costs
-
