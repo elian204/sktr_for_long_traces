@@ -27,6 +27,13 @@ def process_trace_chunked(
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
     conditioning_n_prev_labels: int = 1,
     conditioning_interpolation_weights: Optional[List[float]] = None,
+    conditioning_state_mode: str = "exact",
+    conditioning_top_m: int = 3,
+    candidate_top_p: Optional[float] = None,
+    candidate_top_k: Optional[int] = None,
+    candidate_min_k: int = 1,
+    candidate_source: str = "auto",
+    candidate_apply_to_sync: bool = True,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -64,4 +71,11 @@ def process_trace_chunked(
         conditioning_combine_fn=conditioning_combine_fn,
         conditioning_n_prev_labels=conditioning_n_prev_labels,
         conditioning_interpolation_weights=conditioning_interpolation_weights,
+        conditioning_state_mode=conditioning_state_mode,
+        conditioning_top_m=conditioning_top_m,
+        candidate_top_p=candidate_top_p,
+        candidate_top_k=candidate_top_k,
+        candidate_min_k=candidate_min_k,
+        candidate_source=candidate_source,
+        candidate_apply_to_sync=candidate_apply_to_sync,
     )

@@ -1131,6 +1131,18 @@ class PetriNet:
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
         conditioning_n_prev_labels: int = 1,
         conditioning_interpolation_weights: Optional[List[float]] = None,
+        # Conditioning history handling:
+        # - "exact": include path_prefix in the state key (can be slow/large)
+        # - "topm": like exact, but keep only top-M histories per (places, ts, last_label)
+        # - "merged": equivalent to topm with M=1
+        conditioning_state_mode: str = "exact",
+        conditioning_top_m: int = 3,
+        # Candidate pruning (approximation): bound branching factor for log/sync moves.
+        candidate_top_p: Optional[float] = None,
+        candidate_top_k: Optional[int] = None,
+        candidate_min_k: int = 1,
+        candidate_source: str = "auto",  # "auto" | "observed" | "conditioned"
+        candidate_apply_to_sync: bool = True,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1173,11 +1185,34 @@ class PetriNet:
         # Extend the state with last_label to preserve optimality under pruning.
         use_last_label_in_state: bool = switch_penalty_weight > 0.0
 
-        def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str]):
-            return (places, ts, last_label) if use_last_label_in_state else (places, ts)
+        mode = (conditioning_state_mode or "exact").lower()
+        if mode not in ("exact", "topm", "merged"):
+            raise ValueError("conditioning_state_mode must be one of: exact, topm, merged")
+
+        # If conditioning is active, future costs depend on path_prefix (history).
+        # Include it in the key for correctness, unless conditioning is disabled entirely.
+        use_conditioning_context: bool = conditioning_alpha is not None and conditioning_n_prev_labels >= 1 and mode in ("exact", "topm", "merged")
+
+        # Top-M cap on number of histories per merged base state.
+        # Applies only when conditioning context is part of the key.
+        top_m: Optional[int] = None
+        if use_conditioning_context:
+            if mode == "merged":
+                top_m = 1
+            elif mode == "topm":
+                if conditioning_top_m < 1:
+                    raise ValueError("conditioning_top_m must be >= 1")
+                top_m = int(conditioning_top_m)
+
+        def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str], context: Tuple[str, ...]):
+            if use_conditioning_context:
+                # Include full context for conditioning correctness
+                return (places, ts, last_label, context) if use_last_label_in_state else (places, ts, context)
+            else:
+                return (places, ts, last_label) if use_last_label_in_state else (places, ts)
 
         # Start state key
-        start_key = make_key(initial_marking.places, 0, initial_last_label)
+        start_key = make_key(initial_marking.places, 0, initial_last_label, tuple())
 
         # dist: best-known cost per state key - updated on PUSH (relaxation)
         # This is the key optimization: update dist when we find a better path,
@@ -1189,9 +1224,16 @@ class PetriNet:
         # This eliminates the ancestor chain that prevented garbage collection.
         came_from: Dict[Any, Tuple[Any, str, str, float]] = {}
 
-        # Store marking and path_prefix for each key (needed for expansion)
-        state_data: Dict[Any, Tuple['Marking', Tuple[str, ...]]] = {}
-        state_data[start_key] = (initial_marking, tuple())
+        # Store marking for each key (needed for expansion). When conditioning is enabled,
+        # path_prefix is part of the key, so we avoid duplicating it here.
+        marking_by_key: Dict[Any, 'Marking'] = {start_key: initial_marking}
+
+        # For top-M / merged modes: keep only the best M history variants per merged base state.
+        # We store the full keys (which include context) and their current best costs.
+        kept_by_base: Dict[Any, Dict[Any, float]] = defaultdict(dict)
+        if top_m is not None:
+            base_start = (initial_marking.places, 0, initial_last_label) if use_last_label_in_state else (initial_marking.places, 0)
+            kept_by_base[base_start][start_key] = 0.0
 
         # Additional dominance pruning across last_label for the same (places, timestamp):
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
@@ -1210,6 +1252,74 @@ class PetriNet:
         COMPACT_THRESHOLD = 100000
         iterations_since_compact = 0
 
+        def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
+            """
+            Return sorted indices of candidate labels to expand (top-p within top-k),
+            or None to indicate "no candidate pruning".
+            """
+            if candidate_top_p is None and candidate_top_k is None:
+                return None
+            if candidate_min_k < 1:
+                raise ValueError("candidate_min_k must be >= 1")
+
+            p = np.asarray(probabilities, dtype=float)
+            n = int(p.shape[0])
+            if n == 0:
+                return None
+
+            k_cap = n if candidate_top_k is None else int(candidate_top_k)
+            if k_cap <= 0:
+                raise ValueError("candidate_top_k must be positive when set")
+            k_cap = min(max(k_cap, candidate_min_k), n)
+
+            # Select top-k indices efficiently
+            topk_idx = np.argpartition(-p, k_cap - 1)[:k_cap]
+            topk_idx = topk_idx[np.argsort(-p[topk_idx])]
+
+            if candidate_top_p is None or float(candidate_top_p) >= 1.0:
+                return topk_idx
+
+            top_p = float(candidate_top_p)
+            if top_p <= 0.0 or top_p > 1.0:
+                raise ValueError("candidate_top_p must be in (0, 1]")
+
+            cum = np.cumsum(p[topk_idx])
+            m = int(np.searchsorted(cum, top_p, side="left") + 1)
+            m = max(m, candidate_min_k)
+            m = min(m, topk_idx.size)
+            return topk_idx[:m]
+
+        def _apply_top_m(base_key: Any, state_key: Any, new_cost: float) -> bool:
+            """
+            Return True if this (base_key, state_key) variant is allowed under the top-M cap.
+            May evict a worse variant from the same base_key to make room.
+            """
+            if top_m is None:
+                return True
+
+            variants = kept_by_base[base_key]
+            existing = variants.get(state_key)
+            if existing is not None:
+                if new_cost < existing - 1e-12:
+                    variants[state_key] = new_cost
+                return True
+
+            if len(variants) < top_m:
+                variants[state_key] = new_cost
+                return True
+
+            # Evict the current worst variant for this base state if this one is better.
+            worst_key, worst_cost = max(variants.items(), key=lambda kv: kv[1])
+            if new_cost < worst_cost - 1e-12:
+                del variants[worst_key]
+                # Remove heavy per-state data to free memory; leave came_from for reconstruction
+                dist.pop(worst_key, None)
+                marking_by_key.pop(worst_key, None)
+                variants[state_key] = new_cost
+                return True
+
+            return False
+
         while open_set:
             cost, _, key = heapq.heappop(open_set)
 
@@ -1217,18 +1327,26 @@ class PetriNet:
             if cost > dist.get(key, float('inf')):
                 continue
 
-            # Get state data
-            if key not in state_data:
+            marking = marking_by_key.get(key)
+            if marking is None:
                 continue
-            marking, path_prefix = state_data[key]
 
-            # Extract key components
-            if use_last_label_in_state:
-                places, timestamp, last_label = key
+            # Extract key components (key structure depends on flags)
+            if use_conditioning_context:
+                if use_last_label_in_state:
+                    places, timestamp, last_label, path_prefix = key
+                else:
+                    places, timestamp, path_prefix = key
+                    last_label = None
             else:
-                places, timestamp = key
-                last_label = None
+                if use_last_label_in_state:
+                    places, timestamp, last_label = key
+                else:
+                    places, timestamp = key
+                    last_label = None
+                path_prefix = tuple()
 
+            base_key = (places, timestamp, last_label) if use_last_label_in_state else (places, timestamp)
             unlabeled_key = (places, timestamp)
 
             # Dominance prune across different last_label variants
@@ -1296,6 +1414,18 @@ class PetriNet:
             else:
                 prob_vec = raw_vec
 
+            # Candidate pruning: pick a bounded label set for log (and optionally sync) moves.
+            # Note: if conditioning is active and candidate_source is "conditioned"/"auto",
+            # this selection can differ across paths (because prob_vec depends on history).
+            source = (candidate_source or "auto").lower()
+            if source not in ("auto", "observed", "conditioned"):
+                raise ValueError("candidate_source must be one of: auto, observed, conditioned")
+            if source == "observed" or (source == "auto" and conditioning_alpha is None):
+                cand_idx = _select_candidate_indices(raw_vec)
+            else:
+                cand_idx = _select_candidate_indices(prob_vec)
+            cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
+
             # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
             for t in enabled:
                 tau_cost_total = 0.0
@@ -1316,23 +1446,32 @@ class PetriNet:
                 move_type = 'tau' if t.label is None else 'model'
                 c = cost_fn(0.0, move_type)
                 new_cost = cost + tau_cost_total + c
-                new_key = make_key(new_mark.places, timestamp, last_label)
+                new_key = make_key(new_mark.places, timestamp, last_label, path_prefix)
+                new_base_key = (new_mark.places, timestamp, last_label) if use_last_label_in_state else (new_mark.places, timestamp)
 
                 # Dist-on-push: only push if this is a better path
                 if new_cost < dist.get(new_key, float('inf')):
+                    if not _apply_top_m(new_base_key, new_key, new_cost):
+                        continue
                     dist[new_key] = new_cost
                     came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
-                    state_data[new_key] = (new_mark, path_prefix)
+                    marking_by_key[new_key] = new_mark
                     heapq.heappush(open_set, (new_cost, counter, new_key))
                     counter += 1
 
             # 2) Log moves (advance timestamp without firing any transition)
             if timestamp < n_ts:
-                for label, idx in label2idx.items():
+                if cand_idx is None:
+                    iter_indices = range(n_acts)
+                else:
+                    iter_indices = cand_idx
+
+                for idx in iter_indices:
                     p_adj = float(prob_vec[idx])
                     # Filter out activities below threshold after adjustment
                     if p_adj < eps:
                         continue
+                    label = idx2label[int(idx)]
                     p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                     c = cost_fn(p, 'log')
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
@@ -1344,14 +1483,21 @@ class PetriNet:
                         add_switch = switch_penalty_weight * p_stay
 
                     new_cost = cost + c + add_switch
-                    new_key = make_key(places, timestamp + 1, label)
-                    new_path_prefix = _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
+                    new_path_prefix = (
+                        _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
+                        if use_conditioning_context
+                        else tuple()
+                    )
+                    new_key = make_key(places, timestamp + 1, label, new_path_prefix)
+                    new_base_key = (places, timestamp + 1, label) if use_last_label_in_state else (places, timestamp + 1)
 
                     # Dist-on-push: only push if this is a better path
                     if new_cost < dist.get(new_key, float('inf')):
+                        if not _apply_top_m(new_base_key, new_key, new_cost):
+                            continue
                         dist[new_key] = new_cost
                         came_from[new_key] = (key, 'log', label, c + add_switch)
-                        state_data[new_key] = (marking, new_path_prefix)
+                        marking_by_key[new_key] = marking
                         heapq.heappush(open_set, (new_cost, counter, new_key))
                         counter += 1
 
@@ -1360,6 +1506,8 @@ class PetriNet:
                 if t.label is None or t.label not in label2idx:
                     continue
                 idx = label2idx[t.label]
+                if cand_idx_set is not None and int(idx) not in cand_idx_set:
+                    continue
                 p_adj = float(prob_vec[idx])
                 # Filter out activities below threshold after adjustment
                 if p_adj < eps:
@@ -1394,14 +1542,21 @@ class PetriNet:
                     add_switch = switch_penalty_weight * p_stay
 
                 new_cost = cost + tau_cost_total + c + add_switch
-                new_key = make_key(new_mark.places, timestamp + 1, t.label)
-                new_path_prefix = _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
+                new_path_prefix = (
+                    _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
+                    if use_conditioning_context
+                    else tuple()
+                )
+                new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix)
+                new_base_key = (new_mark.places, timestamp + 1, t.label) if use_last_label_in_state else (new_mark.places, timestamp + 1)
 
                 # Dist-on-push: only push if this is a better path
                 if new_cost < dist.get(new_key, float('inf')):
+                    if not _apply_top_m(new_base_key, new_key, new_cost):
+                        continue
                     dist[new_key] = new_cost
                     came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
-                    state_data[new_key] = (new_mark, new_path_prefix)
+                    marking_by_key[new_key] = new_mark
                     heapq.heappush(open_set, (new_cost, counter, new_key))
                     counter += 1
 
@@ -1435,6 +1590,13 @@ class PetriNet:
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
         conditioning_n_prev_labels: int = 1,
         conditioning_interpolation_weights: Optional[List[float]] = None,
+        conditioning_state_mode: str = "exact",
+        conditioning_top_m: int = 3,
+        candidate_top_p: Optional[float] = None,
+        candidate_top_k: Optional[int] = None,
+        candidate_min_k: int = 1,
+        candidate_source: str = "auto",
+        candidate_apply_to_sync: bool = True,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1534,6 +1696,13 @@ class PetriNet:
                     conditioning_combine_fn=conditioning_combine_fn,
                     conditioning_n_prev_labels=conditioning_n_prev_labels,
                     conditioning_interpolation_weights=conditioning_interpolation_weights,
+                    conditioning_state_mode=conditioning_state_mode,
+                    conditioning_top_m=conditioning_top_m,
+                    candidate_top_p=candidate_top_p,
+                    candidate_top_k=candidate_top_k,
+                    candidate_min_k=candidate_min_k,
+                    candidate_source=candidate_source,
+                    candidate_apply_to_sync=candidate_apply_to_sync,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
                 c1_steps = end_ts1 - start_ts
@@ -1585,6 +1754,13 @@ class PetriNet:
                 conditioning_combine_fn=conditioning_combine_fn,
                 conditioning_n_prev_labels=conditioning_n_prev_labels,
                 conditioning_interpolation_weights=conditioning_interpolation_weights,
+                conditioning_state_mode=conditioning_state_mode,
+                conditioning_top_m=conditioning_top_m,
+                candidate_top_p=candidate_top_p,
+                candidate_top_k=candidate_top_k,
+                candidate_min_k=candidate_min_k,
+                candidate_source=candidate_source,
+                candidate_apply_to_sync=candidate_apply_to_sync,
             )
             c2_elapsed = time.perf_counter() - c2_start
             c2_steps = end_ts2 - end_ts1
@@ -1611,6 +1787,13 @@ class PetriNet:
                     conditioning_combine_fn=conditioning_combine_fn,
                     conditioning_n_prev_labels=conditioning_n_prev_labels,
                     conditioning_interpolation_weights=conditioning_interpolation_weights,
+                    conditioning_state_mode=conditioning_state_mode,
+                    conditioning_top_m=conditioning_top_m,
+                    candidate_top_p=candidate_top_p,
+                    candidate_top_k=candidate_top_k,
+                    candidate_min_k=candidate_min_k,
+                    candidate_source=candidate_source,
+                    candidate_apply_to_sync=candidate_apply_to_sync,
                 )
                 m_elapsed = time.perf_counter() - m_start
                 m_steps = end_ts2 - start_ts
@@ -1711,6 +1894,13 @@ class PetriNet:
         conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
         conditioning_n_prev_labels: int = 1,
         conditioning_interpolation_weights: Optional[List[float]] = None,
+        conditioning_state_mode: str = "exact",
+        conditioning_top_m: int = 3,
+        candidate_top_p: Optional[float] = None,
+        candidate_top_k: Optional[int] = None,
+        candidate_min_k: int = 1,
+        candidate_source: str = "auto",
+        candidate_apply_to_sync: bool = True,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1748,6 +1938,13 @@ class PetriNet:
             conditioning_combine_fn=conditioning_combine_fn,
             conditioning_n_prev_labels=conditioning_n_prev_labels,
             conditioning_interpolation_weights=conditioning_interpolation_weights,
+            conditioning_state_mode=conditioning_state_mode,
+            conditioning_top_m=conditioning_top_m,
+            candidate_top_p=candidate_top_p,
+            candidate_top_k=candidate_top_k,
+            candidate_min_k=candidate_min_k,
+            candidate_source=candidate_source,
+            candidate_apply_to_sync=candidate_apply_to_sync,
             # no observed restriction
         )
         

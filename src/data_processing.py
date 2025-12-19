@@ -447,26 +447,26 @@ def _select_diverse_cases(
 ) -> List[str]:
     """
     Select cases from different trace variants to ensure diversity.
-    Each variant represents a unique sequence of activities.
+    Each variant represents a unique run-collapsed sequence of activities.
     """
     rng = random.Random(seed)
     
     def _trace_signature(case_df: pd.DataFrame) -> bytes:
         """
-        Compute a stable signature for a case's full activity sequence without
-        materializing (and storing) the entire sequence as a large tuple.
-
-        This preserves the semantics of "variant = exact full sequence" while
-        dramatically reducing peak memory usage for long traces.
+        Compute a stable signature for a case's run-collapsed activity sequence
+        without materializing the entire sequence as a large tuple.
         """
         hasher = hashlib.blake2b(digest_size=16)
+        prev = object()
         for activity in case_df['concept:name']:
             # Activity labels are expected to be strings; str() keeps behavior robust.
-            hasher.update(str(activity).encode('utf-8', errors='surrogatepass'))
-            hasher.update(b'\x1f')  # separator
+            if activity != prev:
+                hasher.update(str(activity).encode('utf-8', errors='surrogatepass'))
+                hasher.update(b'\x1f')  # separator
+                prev = activity
         return hasher.digest()
 
-    # Group cases by their trace variant (exact sequence of activities).
+    # Group cases by their trace variant (run-collapsed sequence of activities).
     # Use groupby to avoid repeated filtering and avoid storing huge tuple keys.
     trace_variants: dict[bytes, list[Any]] = {}
     for case_id, case_df in df.groupby('case:concept:name', sort=False):

@@ -87,6 +87,13 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         conditioning_combine_fn=_WORKER_SETTINGS['conditioning_combine_fn'],
         conditioning_n_prev_labels=_WORKER_SETTINGS['conditioning_n_prev_labels'],
         conditioning_interpolation_weights=_WORKER_SETTINGS['conditioning_interpolation_weights'],
+        conditioning_state_mode=_WORKER_SETTINGS.get('conditioning_state_mode', "exact"),
+        conditioning_top_m=_WORKER_SETTINGS.get('conditioning_top_m', 3),
+        candidate_top_p=_WORKER_SETTINGS.get('candidate_top_p'),
+        candidate_top_k=_WORKER_SETTINGS.get('candidate_top_k'),
+        candidate_min_k=_WORKER_SETTINGS.get('candidate_min_k', 1),
+        candidate_source=_WORKER_SETTINGS.get('candidate_source', "auto"),
+        candidate_apply_to_sync=_WORKER_SETTINGS.get('candidate_apply_to_sync', True),
     )
 
     # Compute accuracy
@@ -204,6 +211,13 @@ def _process_single_test_case(
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]],
     conditioning_n_prev_labels: int,
     conditioning_interpolation_weights: Optional[List[float]],
+    conditioning_state_mode: str,
+    conditioning_top_m: int,
+    candidate_top_p: Optional[float],
+    candidate_top_k: Optional[int],
+    candidate_min_k: int,
+    candidate_source: str,
+    candidate_apply_to_sync: bool,
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -242,6 +256,13 @@ def _process_single_test_case(
         conditioning_combine_fn=conditioning_combine_fn,
         conditioning_n_prev_labels=conditioning_n_prev_labels,
         conditioning_interpolation_weights=conditioning_interpolation_weights,
+        conditioning_state_mode=conditioning_state_mode,
+        conditioning_top_m=conditioning_top_m,
+        candidate_top_p=candidate_top_p,
+        candidate_top_k=candidate_top_k,
+        candidate_min_k=candidate_min_k,
+        candidate_source=candidate_source,
+        candidate_apply_to_sync=candidate_apply_to_sync,
     )
 
     # Compute accuracy
@@ -280,6 +301,13 @@ def _process_test_chunk(
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]],
     conditioning_n_prev_labels: int,
     conditioning_interpolation_weights: Optional[List[float]],
+    conditioning_state_mode: str,
+    conditioning_top_m: int,
+    candidate_top_p: Optional[float],
+    candidate_top_k: Optional[int],
+    candidate_min_k: int,
+    candidate_source: str,
+    candidate_apply_to_sync: bool,
 ) -> Tuple[List[dict], List[float], List[float]]:
     """
     Process a chunk of test cases using conformance checking. Used for dataset-level parallel processing.
@@ -373,6 +401,13 @@ def _process_test_chunk(
             conditioning_combine_fn=conditioning_combine_fn,
             conditioning_n_prev_labels=conditioning_n_prev_labels,
             conditioning_interpolation_weights=conditioning_interpolation_weights,
+            conditioning_state_mode=conditioning_state_mode,
+            conditioning_top_m=conditioning_top_m,
+            candidate_top_p=candidate_top_p,
+            candidate_top_k=candidate_top_k,
+            candidate_min_k=candidate_min_k,
+            candidate_source=candidate_source,
+            candidate_apply_to_sync=candidate_apply_to_sync,
         )
 
         # Compute accuracy
@@ -429,6 +464,13 @@ def incremental_softmax_recovery(
     conditioning_combine_fn: Optional[Callable[[float, float, float], float]] = None,
     conditioning_n_prev_labels: int = 1,
     conditioning_interpolation_weights: Optional[List[float]] = None,
+    conditioning_state_mode: str = "exact",
+    conditioning_top_m: int = 3,
+    candidate_top_p: Optional[float] = None,
+    candidate_top_k: Optional[int] = None,
+    candidate_min_k: int = 1,
+    candidate_source: str = "auto",
+    candidate_apply_to_sync: bool = True,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = False,
     max_chunk_size: int = 50,
@@ -779,6 +821,13 @@ def incremental_softmax_recovery(
                 conditioning_combine_fn,
                 conditioning_n_prev_labels,
                 conditioning_interpolation_weights,
+                conditioning_state_mode,
+                conditioning_top_m,
+                candidate_top_p,
+                candidate_top_k,
+                candidate_min_k,
+                candidate_source,
+                candidate_apply_to_sync,
             )
             parallel_args.append(args)
 
@@ -824,6 +873,13 @@ def incremental_softmax_recovery(
             'conditioning_combine_fn': conditioning_combine_fn,
             'conditioning_n_prev_labels': conditioning_n_prev_labels,
             'conditioning_interpolation_weights': conditioning_interpolation_weights,
+            'conditioning_state_mode': conditioning_state_mode,
+            'conditioning_top_m': conditioning_top_m,
+            'candidate_top_p': candidate_top_p,
+            'candidate_top_k': candidate_top_k,
+            'candidate_min_k': candidate_min_k,
+            'candidate_source': candidate_source,
+            'candidate_apply_to_sync': candidate_apply_to_sync,
         }
 
         tasks = (
@@ -883,6 +939,13 @@ def incremental_softmax_recovery(
                 conditioning_combine_fn=conditioning_combine_fn,
                 conditioning_n_prev_labels=conditioning_n_prev_labels,
                 conditioning_interpolation_weights=conditioning_interpolation_weights,
+                conditioning_state_mode=conditioning_state_mode,
+                conditioning_top_m=conditioning_top_m,
+                candidate_top_p=candidate_top_p,
+                candidate_top_k=candidate_top_k,
+                candidate_min_k=candidate_min_k,
+                candidate_source=candidate_source,
+                candidate_apply_to_sync=candidate_apply_to_sync,
             )
 
             # Extract ground truth sequence for accuracy computation

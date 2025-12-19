@@ -993,8 +993,146 @@ def prepare_df(
     df, mapping_dict = map_to_string_numbers(df)
 
     return (df, softmax_list, mapping_dict) if return_mapping else (df, softmax_list)
-   
-    
+
+
+def prepare_df_from_model(
+    dataset_name: str,
+    model_source: str = 'asformer',
+    base_path: Optional[Union[str, Path]] = None,
+    return_mapping: bool = False,
+) -> Union[
+    Tuple[pd.DataFrame, List[np.ndarray]],
+    Tuple[pd.DataFrame, List[np.ndarray], Dict[str, str]]
+]:
+    """
+    Load dataset from model-specific softmax outputs (ASFormer or MS-TCN2).
+
+    This function loads softmax predictions from individual .npy files generated
+    by ASFormer or MS-TCN2 models, along with ground truth labels.
+
+    Parameters
+    ----------
+    dataset_name : str
+        One of: '50salads', 'gtea', 'breakfast'.
+    model_source : str
+        Model source: 'asformer' or 'mstcn2'.
+    base_path : str or Path, optional
+        Base directory containing the model results. If None, uses default paths
+        relative to user's home directory:
+        - ~/ASFormer/results/{dataset}/softmax/
+        - ~/MS-TCN2/results/{dataset}/softmax/
+    return_mapping : bool, optional
+        If True, returns the activity mapping dict as the third element.
+
+    Returns
+    -------
+    (df, softmax_list) or (df, softmax_list, mapping_dict)
+        df: DataFrame with 'case:concept:name' and 'concept:name' columns
+        softmax_list: List of numpy arrays, each with shape (n_classes, n_frames)
+        mapping_dict: Activity class mapping (if return_mapping=True)
+    """
+    # Validate inputs
+    valid_datasets = {'50salads', 'gtea', 'breakfast'}
+    if dataset_name not in valid_datasets:
+        raise ValueError(f"dataset_name must be one of {valid_datasets}")
+
+    valid_sources = {'asformer', 'mstcn2'}
+    model_source = model_source.lower()
+    if model_source not in valid_sources:
+        raise ValueError(f"model_source must be one of {valid_sources}")
+
+    # Resolve base path
+    if base_path is None:
+        home = Path.home()
+        if model_source == 'asformer':
+            base_path = home / 'ASFormer'
+        else:
+            base_path = home / 'MS-TCN2'
+    else:
+        base_path = Path(base_path)
+
+    # Build path to softmax directory
+    softmax_dir = base_path / 'results' / dataset_name / 'softmax'
+    if not softmax_dir.exists():
+        raise FileNotFoundError(f"Softmax directory not found: {softmax_dir}")
+
+    # Required files
+    gt_path = softmax_dir / 'ground_truth.csv'
+    mapping_path = softmax_dir / 'mapping.txt'
+
+    if not gt_path.exists():
+        raise FileNotFoundError(f"Ground truth file not found: {gt_path}")
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"Mapping file not found: {mapping_path}")
+
+    # Load ground truth
+    gt_df = pd.read_csv(gt_path)
+
+    # Load mapping
+    mapping_dict = {}
+    with open(mapping_path, 'r') as f:
+        for line in f:
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                idx, label = parts
+                mapping_dict[idx] = label
+
+    # Get unique case IDs from ground truth
+    case_ids = gt_df['case:concept:name'].unique()
+
+    # Load softmax arrays
+    softmax_list = []
+    target_list = []
+
+    for case_id in sorted(case_ids):
+        npy_path = softmax_dir / f'{case_id}.npy'
+        if not npy_path.exists():
+            raise FileNotFoundError(f"Softmax file not found: {npy_path}")
+
+        # Load softmax array (shape: n_classes, n_frames)
+        arr = np.load(npy_path)
+        softmax_list.append(arr)
+
+        # Get ground truth for this case
+        case_gt = gt_df[gt_df['case:concept:name'] == case_id]['concept:name'].values
+        target_list.append(case_gt)
+
+    # Build DataFrame
+    lengths = [len(trace) for trace in target_list]
+    total_events = sum(lengths)
+
+    if total_events == 0:
+        df = pd.DataFrame({
+            'case:concept:name': pd.Series([], dtype=str),
+            'concept:name': pd.Series([], dtype='int64'),
+        })
+    else:
+        case_ids_repeated = np.repeat(
+            np.array(sorted(case_ids)).astype(str),
+            lengths
+        )
+        concept_values = np.concatenate([
+            np.asarray(trace, dtype=int)
+            for trace in target_list
+            if len(trace) > 0
+        ])
+        df = pd.DataFrame({
+            "case:concept:name": case_ids_repeated,
+            "concept:name": concept_values,
+        })
+
+    # Apply mapping to string numbers
+    df, _ = map_to_string_numbers(df)
+
+    logger.info(
+        f"Loaded {dataset_name} from {model_source}: "
+        f"{len(softmax_list)} cases, {total_events} events, "
+        f"{len(mapping_dict)} classes"
+    )
+
+    return (df, softmax_list, mapping_dict) if return_mapping else (df, softmax_list)
+
+
 def map_to_string_numbers(
     df: pd.DataFrame,
     map_strings_to_integer_strings: bool = False
@@ -1215,31 +1353,46 @@ def normalize_sequences_for_evaluation(gt_sequences: List[List[str]], pred_seque
     return gt_sequences, normalized_pred_sequences
 
 
-def get_variant_info(df: pd.DataFrame) -> pd.DataFrame:
+def get_variant_info(df: pd.DataFrame, use_collapsed: bool = True) -> pd.DataFrame:
     """
     Analyze trace variants. Returns DataFrame sorted by frequency (variant_id 0 = most frequent).
-    
+
     Parameters
     ----------
     df : pd.DataFrame
         Event log DataFrame with 'case:concept:name' and 'concept:name' columns.
-    
+    use_collapsed : bool, default True
+        If True, collapse consecutive runs before computing variant signatures.
+
     Returns
     -------
     pd.DataFrame
         DataFrame with columns:
         - variant_id: Integer ID (0 = most frequent variant)
-        - trace_signature: Tuple representing the activity sequence
+        - trace_signature: Tuple representing the activity sequence (collapsed if use_collapsed=True)
         - case_ids: List of case IDs belonging to this variant
         - frequency: Number of cases with this variant
         - trace_length: Length of the trace sequence
     """
+    def _collapse_runs(seq: List[Any]) -> Tuple[Any, ...]:
+        collapsed: List[Any] = []
+        prev = object()
+        for item in seq:
+            if item != prev:
+                collapsed.append(item)
+                prev = item
+        return tuple(collapsed)
+
     trace_variants = {}
     for case_id in df['case:concept:name'].unique():
-        trace = tuple(df[df['case:concept:name'] == case_id]['concept:name'].tolist())
-        if trace not in trace_variants:
-            trace_variants[trace] = {'case_ids': [], 'length': len(trace)}
-        trace_variants[trace]['case_ids'].append(case_id)
+        trace = df[df['case:concept:name'] == case_id]['concept:name'].tolist()
+        trace_signature = _collapse_runs(trace) if use_collapsed else tuple(trace)
+        if trace_signature not in trace_variants:
+            trace_variants[trace_signature] = {
+                'case_ids': [],
+                'length': len(trace_signature)
+            }
+        trace_variants[trace_signature]['case_ids'].append(case_id)
     
     data = [{'variant_id': i, 'trace_signature': sig, 'case_ids': info['case_ids'],
              'frequency': len(info['case_ids']), 'trace_length': info['length']}
@@ -1306,14 +1459,14 @@ def get_cases_for_variants(variant_df: pd.DataFrame, variant_ids: List[int], see
 def get_variants_for_cases(variant_df: pd.DataFrame, case_ids: List[Union[str, int]]) -> List[int]:
     """
     Get unique variant IDs for the specified case IDs.
-    
+
     Parameters
     ----------
     variant_df : pd.DataFrame
         DataFrame from get_variant_info().
     case_ids : List[Union[str, int]]
         List of case IDs to find variants for.
-    
+
     Returns
     -------
     List[int]
@@ -1322,14 +1475,96 @@ def get_variants_for_cases(variant_df: pd.DataFrame, case_ids: List[Union[str, i
     # Convert case_ids to strings for comparison (case IDs in variant_df are stored as strings)
     case_ids_str = [str(cid) for cid in case_ids]
     variant_ids = set()
-    
+
     for _, row in variant_df.iterrows():
         # Check if any of the requested case IDs are in this variant's case_ids
         variant_case_ids = [str(cid) for cid in row['case_ids']]
         if any(cid in variant_case_ids for cid in case_ids_str):
             variant_ids.add(row['variant_id'])
-    
+
     return sorted(list(variant_ids))
+
+
+def select_variants_for_experiment(
+    variant_df: pd.DataFrame,
+    n_variants: int,
+    selection_mode: str = "random",
+    seed: int = 42
+) -> Tuple[List[str], List[str], List[int]]:
+    """
+    Select variants for experiment and return train/test case splits.
+
+    For datasets with multiple traces per variant (e.g., Breakfast), this function:
+    - Selects N unique variants
+    - Returns ONE representative trace per variant for model training
+    - Returns ALL traces for those variants for testing/prediction
+
+    Parameters
+    ----------
+    variant_df : pd.DataFrame
+        DataFrame from get_variant_info() with columns:
+        - variant_id: Integer ID
+        - case_ids: List of case IDs for this variant
+        - frequency: Number of cases with this variant
+    n_variants : int
+        Number of variants to select.
+    selection_mode : str, default="random"
+        How to select variants:
+        - "frequency": Select most frequent variants first (variant_id 0, 1, 2, ...)
+        - "random": Randomly select variants
+    seed : int, default=42
+        Random seed for reproducible selection (used when selection_mode="random").
+
+    Returns
+    -------
+    Tuple[List[str], List[str], List[int]]
+        - train_cases: One representative case per variant (for model building)
+        - test_cases: All cases for selected variants (for prediction)
+        - selected_variant_ids: List of selected variant IDs
+
+    Examples
+    --------
+    >>> variant_df = get_variant_info(df)
+    >>> train_cases, test_cases, variant_ids = select_variants_for_experiment(
+    ...     variant_df, n_variants=10, selection_mode="frequency"
+    ... )
+    >>> # train_cases has 10 traces (one per variant)
+    >>> # test_cases has all traces for those 10 variants
+    """
+    import random
+
+    n_available = len(variant_df)
+    if n_variants > n_available:
+        raise ValueError(
+            f"Requested {n_variants} variants but only {n_available} available"
+        )
+
+    # Select variant IDs based on mode
+    if selection_mode == "frequency":
+        # variant_df is already sorted by frequency (variant_id 0 = most frequent)
+        selected_variant_ids = list(range(n_variants))
+    elif selection_mode == "random":
+        all_variant_ids = variant_df['variant_id'].tolist()
+        rng = random.Random(seed)
+        selected_variant_ids = sorted(rng.sample(all_variant_ids, n_variants))
+    else:
+        raise ValueError(f"Unknown selection_mode: {selection_mode}. Use 'frequency' or 'random'.")
+
+    # Get train cases: ONE representative per variant (first case in each variant's list)
+    train_cases = []
+    # Get test cases: ALL cases for selected variants
+    test_cases = []
+
+    for vid in selected_variant_ids:
+        row = variant_df[variant_df['variant_id'] == vid]
+        if not row.empty:
+            case_ids = row.iloc[0]['case_ids']
+            # First case is the representative for training
+            train_cases.append(str(case_ids[0]))
+            # All cases go to test
+            test_cases.extend([str(cid) for cid in case_ids])
+
+    return train_cases, test_cases, selected_variant_ids
 
 
 def compute_activity_run_counts(
