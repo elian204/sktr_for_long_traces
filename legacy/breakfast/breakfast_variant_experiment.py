@@ -167,7 +167,8 @@ def check_existing_result(results_dir, dataset_name, prefix, alpha, strategy):
             sktr_pred_col='sktr_activity',
             argmax_pred_col='argmax_activity',
             gt_col='ground_truth',
-            background=0
+            background=None,
+            dataset_name="breakfast",
         )
         return metrics
     except Exception as e:
@@ -222,7 +223,8 @@ def run_single_experiment(train_cases, test_cases, alpha, strategy, weights,
         sktr_pred_col='sktr_activity',
         argmax_pred_col='argmax_activity',
         gt_col='ground_truth',
-        background=0
+        background=None,
+        dataset_name="breakfast",
     )
 
     return {

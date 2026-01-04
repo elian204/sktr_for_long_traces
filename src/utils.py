@@ -2441,6 +2441,8 @@ def compute_evaluation_metrics(
     results_df: pd.DataFrame,
     *,
     background: Optional[Any] = None,
+    dataset_name: Optional[str] = None,
+    mapping_path: Optional[Union[str, Path]] = None,
     label_names: Optional[Sequence[Any]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
@@ -2459,6 +2461,14 @@ def compute_evaluation_metrics(
         - 'sktr_activity': SKTR predicted activities
         - 'argmax_activity': argmax predicted activities
         - 'ground_truth': ground truth activities
+    background : Any, optional
+        Background label for ASFormer metrics. Use None or "auto" for auto-resolution.
+    dataset_name : str, optional
+        Dataset name used for mapping-based background auto-resolution.
+    mapping_path : str or Path, optional
+        Explicit mapping.txt path for background auto-resolution.
+    label_names : Sequence[Any], optional
+        Optional label names for background auto-resolution.
 
     Returns
     -------
@@ -2489,20 +2499,22 @@ def compute_evaluation_metrics(
 
     Notes
     -----
-    - Uses compute_tas_metrics_macro from evaluation.py
-    - Follows standard TAS evaluation protocol with macro averaging for Edit/F1
+    - Uses compute_tas_metrics_asformer from evaluation.py (ASFormer/MS-TCN2 compatible)
+    - F1 scores use MICRO-averaging (aggregate TP/FP/FN across all videos first)
+    - Edit score is macro-averaged (mean across videos) as in ASFormer
     - Micro accuracy is computed globally over all frames
     - Activities are automatically converted to string format if needed
+    - `dataset_name`/`mapping_path` enable ASFormer background auto-resolution
     - Returns separate metrics for SKTR and argmax approaches
     """
     try:
-        from .evaluation import compute_tas_metrics_macro
+        from .evaluation import compute_tas_metrics_asformer
     except ImportError:
         # If running as standalone script, try direct import
         try:
-            from evaluation import compute_tas_metrics_macro
+            from evaluation import compute_tas_metrics_asformer
         except ImportError:
-            raise ImportError("Cannot import compute_tas_metrics_macro from evaluation.py")
+            raise ImportError("Cannot import compute_tas_metrics_asformer from evaluation.py")
 
     # Validate required columns
     required_cols = {'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth'}
@@ -2525,27 +2537,37 @@ def compute_evaluation_metrics(
 
     print(f"Computing evaluation metrics for {df['case:concept:name'].nunique()} cases...")
 
-    # Compute metrics for SKTR
+    # Compute metrics for SKTR (using ASFormer-compatible method)
     print("Computing SKTR metrics...")
-    sktr_metrics = compute_tas_metrics_macro(
+    sktr_metrics = compute_tas_metrics_asformer(
         df=df,
         pred_col='sktr_activity',
         gt_col='ground_truth',
         case_col='case:concept:name',
         background=background,
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
         label_names=label_names,
     )
+    # Normalize key: ASFormer uses 'acc', we use 'acc_micro' for backwards compatibility
+    if 'acc' in sktr_metrics and 'acc_micro' not in sktr_metrics:
+        sktr_metrics['acc_micro'] = sktr_metrics['acc']
 
-    # Compute metrics for argmax
+    # Compute metrics for argmax (using ASFormer-compatible method)
     print("Computing argmax metrics...")
-    argmax_metrics = compute_tas_metrics_macro(
+    argmax_metrics = compute_tas_metrics_asformer(
         df=df,
         pred_col='argmax_activity',
         gt_col='ground_truth',
         case_col='case:concept:name',
         background=background,
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
         label_names=label_names,
     )
+    # Normalize key: ASFormer uses 'acc', we use 'acc_micro' for backwards compatibility
+    if 'acc' in argmax_metrics and 'acc_micro' not in argmax_metrics:
+        argmax_metrics['acc_micro'] = argmax_metrics['acc']
 
     # Organize results
     results = {
@@ -2637,7 +2659,7 @@ def compute_comprehensive_tas_comparison(
 
     # Compute SKTR and argmax metrics using existing function
     print("Computing SKTR and argmax metrics...")
-    sktr_argmax_metrics = compute_evaluation_metrics(results_df)
+    sktr_argmax_metrics = compute_evaluation_metrics(results_df, dataset_name=dataset_name)
 
     # Compute KARI metrics using existing function
     print("Computing KARI metrics...")
@@ -2782,10 +2804,10 @@ def compute_kari_metrics(
     import pickle
     try:
         # Try relative import (for when used as part of the package)
-        from .evaluation import compute_tas_metrics_from_sequences
+        from .evaluation import compute_tas_metrics_asformer
     except ImportError:
         # Fall back to absolute import (for standalone usage)
-        from evaluation import compute_tas_metrics_from_sequences
+        from evaluation import compute_tas_metrics_asformer
 
     # Load KARI results
     pkl_path = Path(pkl_file_path)
@@ -2832,12 +2854,28 @@ def compute_kari_metrics(
             f"Sequence length mismatches found:\n" + "\n".join(length_mismatches)
         )
 
-    # Compute metrics using the standard function
-    metrics = compute_tas_metrics_from_sequences(
-        gt_sequences=gt_sequences,
-        pred_sequences=pred_sequences,
-        background=background
+    # Build DataFrame from sequences for ASFormer-compatible metrics
+    rows = []
+    for case_id, gt_seq, pred_seq in zip(case_id_order, gt_sequences, pred_sequences):
+        for gt_label, pred_label in zip(gt_seq, pred_seq):
+            rows.append({
+                'case:concept:name': case_id,
+                'ground_truth': gt_label,
+                'prediction': pred_label,
+            })
+    metrics_df = pd.DataFrame(rows)
+
+    # Compute metrics using ASFormer-compatible method
+    metrics = compute_tas_metrics_asformer(
+        df=metrics_df,
+        pred_col='prediction',
+        gt_col='ground_truth',
+        case_col='case:concept:name',
+        background=background,
     )
+    # Normalize key for backwards compatibility
+    if 'acc' in metrics and 'acc_micro' not in metrics:
+        metrics['acc_micro'] = metrics['acc']
 
     return {method_name: metrics}
 

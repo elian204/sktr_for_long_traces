@@ -1,0 +1,95 @@
+{
+  "chunk_size": 11,
+  "dataset": "50salads",
+  "evaluation_background": null,
+  "final_experiment": {
+    "alpha": 0.3,
+    "strategy": "unigram_super_heavy",
+    "variant_based_selection": false,
+    "variant_sweep": [
+      1,
+      5,
+      10,
+      20,
+      30,
+      40,
+      50
+    ],
+    "weights": [
+      0.75,
+      0.15,
+      0.1
+    ]
+  },
+  "hyperparameter_search": {
+    "alphas": [
+      0.05,
+      0.1,
+      0.3,
+      0.5,
+      0.7,
+      0.9,
+      0.95
+    ],
+    "best": {
+      "alpha": 0.3,
+      "avg_rank": 7.333333333333333,
+      "sktr_acc": 86.41577768313753,
+      "sktr_edit": 80.22303941089646,
+      "sktr_f1@25": 84.83073262749221,
+      "strategy": "unigram_super_heavy",
+      "weights": [
+        0.75,
+        0.15,
+        0.1
+      ]
+    },
+    "enabled": true,
+    "rank_metrics": [
+      "sktr_acc",
+      "sktr_edit",
+      "sktr_f1@25"
+    ],
+    "strategies": {
+      "balanced": [
+        0.33,
+        0.33,
+        0.34
+      ],
+      "bigram_heavy": [
+        0.2,
+        0.6,
+        0.2
+      ],
+      "trigram_heavy": [
+        0.1,
+        0.15,
+        0.75
+      ],
+      "unigram_super_heavy": [
+        0.75,
+        0.15,
+        0.1
+      ]
+    }
+  },
+  "model_source": "asformer",
+  "n_parallel_runs": 2,
+  "n_unique_variants": 50,
+  "random_seed": 42,
+  "skip_hp_search": false,
+  "state_mode": "topm",
+  "top_m": 1,
+  "train_variant_sweep": [
+    1,
+    5,
+    10,
+    20,
+    30,
+    40,
+    50
+  ],
+  "use_variant_based_selection": false,
+  "variant_selection_mode": "random",
+  "workers": 50
+}

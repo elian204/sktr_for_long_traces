@@ -1,0 +1,93 @@
+{
+  "chunk_size": 11,
+  "dataset": "gtea",
+  "evaluation_background": null,
+  "final_experiment": {
+    "alpha": 0.95,
+    "strategy": "trigram_heavy",
+    "variant_based_selection": false,
+    "variant_sweep": [
+      1,
+      5,
+      10,
+      15,
+      20,
+      28
+    ],
+    "weights": [
+      0.1,
+      0.15,
+      0.75
+    ]
+  },
+  "hyperparameter_search": {
+    "alphas": [
+      0.05,
+      0.1,
+      0.3,
+      0.5,
+      0.7,
+      0.9,
+      0.95
+    ],
+    "best": {
+      "alpha": 0.95,
+      "avg_rank": 2.0,
+      "sktr_acc": 76.57646116893515,
+      "sktr_edit": 73.94773453621049,
+      "sktr_f1@25": 74.09747604373295,
+      "strategy": "trigram_heavy",
+      "weights": [
+        0.1,
+        0.15,
+        0.75
+      ]
+    },
+    "enabled": true,
+    "rank_metrics": [
+      "sktr_acc",
+      "sktr_edit",
+      "sktr_f1@25"
+    ],
+    "strategies": {
+      "balanced": [
+        0.33,
+        0.33,
+        0.34
+      ],
+      "bigram_heavy": [
+        0.2,
+        0.6,
+        0.2
+      ],
+      "trigram_heavy": [
+        0.1,
+        0.15,
+        0.75
+      ],
+      "unigram_super_heavy": [
+        0.75,
+        0.15,
+        0.1
+      ]
+    }
+  },
+  "model_source": "mstcn2",
+  "n_parallel_runs": 1,
+  "n_unique_variants": 28,
+  "random_seed": 42,
+  "skip_hp_search": false,
+  "state_mode": "topm",
+  "top_m": 3,
+  "train_variant_sweep": [
+    1,
+    5,
+    10,
+    15,
+    20,
+    28
+  ],
+  "use_variant_based_selection": false,
+  "variant_selection_mode": "random",
+  "workers": 20
+}

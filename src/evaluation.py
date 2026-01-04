@@ -2,6 +2,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+from pathlib import Path
 
 # --- helpers -----------------------------------------------------------------
 def _collapse_runs(seq: Sequence[Any], background: Optional[Any]) -> List[Any]:
@@ -48,6 +49,180 @@ def _iou_1d(a: Tuple[int, int], b: Tuple[int, int]) -> float:
     union = (a[1]-a[0]) + (b[1]-b[0]) - inter
     return inter / union if union > 0 else 0.0
 
+
+def _normalize_background_value(background: Any) -> Any:
+    if isinstance(background, (list, tuple, set, np.ndarray)):
+        return [str(x) for x in background]
+    return str(background)
+
+
+def _read_background_from_mapping(mapping_path: Path) -> Optional[str]:
+    try:
+        with mapping_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(maxsplit=1)
+                if len(parts) == 2 and parts[1].lower() == "background":
+                    return str(parts[0])
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def _resolve_asformer_background(
+    background: Optional[Any],
+    *,
+    label_names: Optional[Sequence[Any]] = None,
+    sample_values: Optional[Iterable[Any]] = None,
+    dataset_name: Optional[str] = None,
+    mapping_path: Optional[Union[str, Path]] = None,
+) -> Optional[Any]:
+    if background is not None and str(background).lower() not in ("auto", "infer"):
+        return _normalize_background_value(background)
+
+    # Prefer explicit "background" label if present
+    for seq in (label_names, sample_values):
+        if not seq:
+            continue
+        for v in seq:
+            if str(v).lower() == "background":
+                return str(v)
+
+    paths: List[Path] = []
+    if mapping_path:
+        paths.append(Path(mapping_path))
+    if dataset_name:
+        ds = str(dataset_name).lower()
+        here = Path(__file__).resolve()
+        paths.extend([
+            Path.cwd() / "data" / "data" / ds / "mapping.txt",
+            here.parents[2] / "data" / "data" / ds / "mapping.txt",
+            Path.home() / "data" / "data" / ds / "mapping.txt",
+        ])
+
+    for p in paths:
+        if p.exists():
+            bg = _read_background_from_mapping(p)
+            if bg is not None:
+                return bg
+
+    return None
+
+
+def _asformer_bg_class(background: Optional[Any]) -> List[Any]:
+    if background is None:
+        return ["background"]
+    if isinstance(background, (list, tuple, set, np.ndarray)):
+        return list(background)
+    return [background]
+
+
+def _infer_dataset_name_from_path(path: str) -> Optional[str]:
+    lower = str(path).lower()
+    for name in ("50salads", "gtea", "breakfast"):
+        if name in lower:
+            return name
+    return None
+
+
+def _get_labels_start_end_time_asformer(
+    frame_wise_labels: Sequence[Any],
+    bg_class: Sequence[Any],
+) -> Tuple[List[Any], List[int], List[int]]:
+    labels: List[Any] = []
+    starts: List[int] = []
+    ends: List[int] = []
+    if not frame_wise_labels:
+        return labels, starts, ends
+    last_label = frame_wise_labels[0]
+    if frame_wise_labels[0] not in bg_class:
+        labels.append(frame_wise_labels[0])
+        starts.append(0)
+    for i in range(len(frame_wise_labels)):
+        if frame_wise_labels[i] != last_label:
+            if frame_wise_labels[i] not in bg_class:
+                labels.append(frame_wise_labels[i])
+                starts.append(i)
+            if last_label not in bg_class:
+                ends.append(i)
+            last_label = frame_wise_labels[i]
+    if last_label not in bg_class:
+        ends.append(i)
+    return labels, starts, ends
+
+
+def _edit_score_asformer(
+    recognized: Iterable[Any],
+    ground_truth: Iterable[Any],
+    bg_class: Sequence[Any],
+) -> float:
+    p_label, _, _ = _get_labels_start_end_time_asformer(list(recognized), bg_class)
+    y_label, _, _ = _get_labels_start_end_time_asformer(list(ground_truth), bg_class)
+    return _levenshtein_norm(p_label, y_label) * 100.0
+
+
+def _segmental_f1_counts_asformer(
+    y_true: Iterable[Any], y_pred: Iterable[Any], iou_threshold: float,
+    background: Optional[Any] = None,
+) -> Tuple[int, int, int]:
+    """
+    Compute TP, FP, FN for segmental F1 using ASFormer/MS-TCN2's matching strategy.
+
+    This uses per-prediction greedy matching: for each predicted segment, find the
+    best matching GT segment (argmax IoU), and if it passes the threshold and hasn't
+    been matched yet, count it as TP.
+
+    This matches the implementation in ASFormer/MS-TCN2 eval.py exactly.
+
+    Returns
+    -------
+    Tuple[int, int, int]
+        (TP, FP, FN) counts for this sequence.
+    """
+    bg_class = _asformer_bg_class(background)
+    y_label, y_start, y_end = _get_labels_start_end_time_asformer(list(y_true), bg_class)
+    p_label, p_start, p_end = _get_labels_start_end_time_asformer(list(y_pred), bg_class)
+
+    if not y_label and not p_label:
+        return (0, 0, 0)
+
+    y_start = np.array(y_start)
+    y_end = np.array(y_end)
+    p_start = np.array(p_start)
+    p_end = np.array(p_end)
+
+    tp = 0
+    fp = 0
+    hits = np.zeros(len(y_label))
+
+    # ASFormer-style per-prediction greedy matching
+    for j in range(len(p_label)):
+        if len(y_label) == 0:
+            fp += 1
+            continue
+
+        # Compute IoU with all GT segments (ASFormer style)
+        intersection = np.minimum(p_end[j], y_end) - np.maximum(p_start[j], y_start)
+        union = np.maximum(p_end[j], y_end) - np.minimum(p_start[j], y_start)
+
+        # Mask by label match (ASFormer multiplies by label equality)
+        label_match = np.array([p_label[j] == y_label[x] for x in range(len(y_label))], dtype=float)
+
+        # Avoid division by zero
+        with np.errstate(divide='ignore', invalid='ignore'):
+            IoU = np.where(union > 0, (intersection / union) * label_match, 0.0)
+
+        # Get the best scoring segment
+        idx = np.argmax(IoU)
+
+        if IoU[idx] >= iou_threshold and not hits[idx]:
+            tp += 1
+            hits[idx] = 1
+        else:
+            fp += 1
+
+    fn = len(y_label) - int(sum(hits))
+    return (tp, fp, fn)
+
 def _auto_background(label_names: Optional[Sequence[str]]) -> Optional[str]:
     if not label_names: return None
     lower = [str(x).lower() for x in label_names]
@@ -67,26 +242,47 @@ def _infer_background_value(
     Resolve which label should be treated as background.
 
     Priority:
-      1) Explicit `background` argument (if provided).
+      1) Explicit `background` argument (if provided) - will be normalized to match
+         the data type found in sample_values/label_names.
       2) Semantic match in `label_names` or `sample_values`
          for common background tokens: background/bg/sil/silence.
       3) Fallback: if labels look numeric and contain 0, treat 0 as background
          (common convention in TAS datasets, including GTEA).
     Returns the value from the supplied sequences to preserve type (str/int).
     """
-    if background is not None:
-        return background
-
-    def _find(seq: Iterable[Any]) -> Optional[Any]:
+    def _find(seq: Iterable[Any], target_str: Optional[str] = None) -> Optional[Any]:
+        """Find background value in sequence, optionally matching a target string."""
         for v in seq:
             lv = str(v).lower()
-            if lv in ("background", "bg", "sil", "silence"):
+            if target_str is not None:
+                if lv == target_str.lower():
+                    return v
+            elif lv in ("background", "bg", "sil", "silence"):
                 return v
-        for v in seq:
-            if str(v) == "0":
-                return v
+        # Fallback to numeric 0
+        if target_str is None or target_str == "0":
+            for v in seq:
+                if str(v) == "0":
+                    return v
         return None
 
+    # If explicit background provided, try to find matching value with same string repr
+    # This handles type normalization (e.g., "0" -> 0 if data has integers)
+    if background is not None:
+        bg_str = str(background)
+        # Try to find matching value in sample_values or label_names
+        if sample_values is not None:
+            found = _find(sample_values, bg_str)
+            if found is not None:
+                return found
+        if label_names:
+            found = _find(label_names, bg_str)
+            if found is not None:
+                return found
+        # No match found, return original
+        return background
+
+    # Auto-detection
     if label_names:
         found = _find(label_names)
         if found is not None:
@@ -267,6 +463,193 @@ def compute_tas_metrics_macro(
     return (summary, per_video_df) if return_per_video else summary
 
 
+def compute_tas_metrics_asformer(
+    df: pd.DataFrame,
+    pred_col: str,
+    *,
+    gt_col: str = "ground_truth",
+    case_col: str = "case:concept:name",
+    background: Optional[Any] = None,
+    dataset_name: Optional[str] = None,
+    mapping_path: Optional[Union[str, Path]] = None,
+    label_names: Optional[Sequence[str]] = None,
+    return_per_video: bool = False,
+) -> Union[Dict[str, float], Tuple[Dict[str, float], pd.DataFrame]]:
+    """
+    Compute dataset-level TAS metrics following ASFormer/MS-TCN2 protocol exactly.
+
+    Key differences from compute_tas_metrics_macro:
+      - F1 scores use MICRO-averaging: aggregate TP/FP/FN across all videos first,
+        then compute F1 once (instead of averaging per-video F1 scores).
+      - Segment matching uses per-prediction greedy (ASFormer style) instead of
+        global best-first greedy.
+      - Edit score is still macro-averaged (mean across videos) as in ASFormer.
+
+    This function produces results identical to ASFormer/MS-TCN2's eval.py.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Must contain columns `[case_col, gt_col, pred_col]`.
+    pred_col : str
+        Column with the per-frame predictions to evaluate.
+    gt_col : str, default "ground_truth"
+        Column with per-frame ground-truth labels.
+    case_col : str, default "case:concept:name"
+        Column identifying each video/sequence.
+    background : Any, optional
+        Label(s) to treat as background. If None, defaults to the literal
+        "background" (ASFormer/MS-TCN2 behavior). Pass a dataset-specific label
+        (e.g., "10") when your labels are numeric IDs.
+    dataset_name : str, optional
+        Dataset name used to locate a mapping.txt for auto background resolution.
+    mapping_path : str or Path, optional
+        Explicit mapping.txt path for auto background resolution.
+    label_names : Sequence[str], optional
+        Optional label names used for background auto-resolution.
+    return_per_video : bool, default False
+        If True, also return the per-video metrics DataFrame.
+
+    Returns
+    -------
+    dict
+        {
+          "acc": <global frame accuracy (micro)>,
+          "edit": <macro mean across videos>,
+          "f1@10": <micro F1 from aggregated TP/FP/FN>,
+          "f1@25": <micro F1 from aggregated TP/FP/FN>,
+          "f1@50": <micro F1 from aggregated TP/FP/FN>,
+        }
+    (dict, DataFrame) if return_per_video=True
+    """
+    required = {case_col, gt_col, pred_col}
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"Missing required column(s): {sorted(missing)}")
+
+    df_local = df.copy()
+    df_local[gt_col] = df_local[gt_col].astype(str)
+    df_local[pred_col] = df_local[pred_col].astype(str)
+
+    # Build label names if not provided (for background auto-resolution)
+    if label_names is None:
+        label_names = pd.concat([df_local[gt_col], df_local[pred_col]]).unique().tolist()
+
+    resolved_background = _resolve_asformer_background(
+        background,
+        label_names=label_names,
+        sample_values=pd.concat([df_local[gt_col], df_local[pred_col]]).tolist(),
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
+    )
+    bg_class = _asformer_bg_class(resolved_background)
+
+    # Aggregated counts for micro F1
+    overlap = [0.1, 0.25, 0.5]
+    tp_total = np.zeros(3)
+    fp_total = np.zeros(3)
+    fn_total = np.zeros(3)
+
+    # Per-video tracking
+    correct = 0
+    total = 0
+    edit_scores = []
+    per_video_rows = []
+
+    for vid, g in df_local.groupby(case_col, sort=False):
+        y_true = g[gt_col].tolist()
+        y_pred = g[pred_col].tolist()
+        if not y_true:
+            continue
+
+        # Frame accuracy (accumulate for micro)
+        for i in range(len(y_true)):
+            total += 1
+            if y_true[i] == y_pred[i]:
+                correct += 1
+
+        # Edit score (per-video, will be macro-averaged)
+        ed = _edit_score_asformer(y_true, y_pred, bg_class)
+        edit_scores.append(ed)
+
+        # F1 counts using ASFormer matching (aggregate for micro)
+        video_f1s = []
+        for s, thresh in enumerate(overlap):
+            tp1, fp1, fn1 = _segmental_f1_counts_asformer(
+                y_true, y_pred, thresh, bg_class
+            )
+            tp_total[s] += tp1
+            fp_total[s] += fp1
+            fn_total[s] += fn1
+
+            # Compute per-video F1 for the per_video_df
+            if tp1 + fp1 > 0:
+                prec = tp1 / (tp1 + fp1)
+            else:
+                prec = 0.0
+            if tp1 + fn1 > 0:
+                rec = tp1 / (tp1 + fn1)
+            else:
+                rec = 0.0
+            if prec + rec > 0:
+                f1 = 2.0 * prec * rec / (prec + rec) * 100.0
+            else:
+                f1 = 0.0
+            video_f1s.append(f1)
+
+        # Per-video accuracy
+        vid_correct = sum(1 for a, b in zip(y_true, y_pred) if a == b)
+        vid_acc = 100.0 * vid_correct / len(y_true) if y_true else 0.0
+
+        per_video_rows.append({
+            "video": vid,
+            "n_frames": len(y_true),
+            "acc": vid_acc,
+            "edit": ed,
+            "f1@10": video_f1s[0],
+            "f1@25": video_f1s[1],
+            "f1@50": video_f1s[2],
+        })
+
+    per_video_df = pd.DataFrame(per_video_rows)
+
+    # Handle empty case
+    if total == 0:
+        summary = {"acc": 0.0, "edit": 0.0, "f1@10": 0.0, "f1@25": 0.0, "f1@50": 0.0}
+        return (summary, per_video_df) if return_per_video else summary
+
+    # Micro accuracy
+    acc = 100.0 * correct / total
+
+    # Macro edit score
+    edit_macro = sum(edit_scores) / len(edit_scores) if edit_scores else 0.0
+
+    # Micro F1 scores (from aggregated counts)
+    f1_micro = {}
+    for s, thresh in enumerate(overlap):
+        if tp_total[s] + fp_total[s] > 0:
+            precision = tp_total[s] / (tp_total[s] + fp_total[s])
+        else:
+            precision = 0.0
+        if tp_total[s] + fn_total[s] > 0:
+            recall = tp_total[s] / (tp_total[s] + fn_total[s])
+        else:
+            recall = 0.0
+        if precision + recall > 0:
+            f1 = 2.0 * precision * recall / (precision + recall) * 100.0
+        else:
+            f1 = 0.0
+        f1_micro[f"f1@{int(thresh*100)}"] = f1
+
+    summary = {
+        "acc": float(acc),
+        "edit": float(edit_macro),
+        **{k: float(v) for k, v in f1_micro.items()},
+    }
+
+    return (summary, per_video_df) if return_per_video else summary
+
+
 def compute_tas_metrics_from_sequences(
     gt_sequences: List[List[str]],
     pred_sequences: List[List[str]],
@@ -277,7 +660,7 @@ def compute_tas_metrics_from_sequences(
     Compute TAS metrics directly from ground truth and prediction sequences.
 
     This function takes lists of sequences (one per video/case) and computes
-    aggregated metrics similar to compute_tas_metrics_macro.
+    aggregated metrics using ASFormer/MS-TCN2 compatible methodology.
 
     Parameters
     ----------
@@ -288,19 +671,20 @@ def compute_tas_metrics_from_sequences(
         Must have same length as gt_sequences.
     background : Any, optional
         Label to treat as background (ignored in Edit/F1 segmentization).
-        If None, `_auto_background` is used inside `tas_metrics`.
+        If None, defaults to "background" (ASFormer behavior).
     label_names : Sequence[str], optional
-        Optional label names (used for background auto-detection).
+        Optional label names (unused, present for API compatibility).
 
     Returns
     -------
     Dict[str, float]
         {
-          "acc_micro": <global frame accuracy over all sequences>,
+          "acc_micro": <global frame accuracy (micro)>,
+          "acc": <same as acc_micro>,
           "edit":  <macro mean edit score across sequences>,
-          "f1@10": <macro mean F1@10 across sequences>,
-          "f1@25": <macro mean F1@25 across sequences>,
-          "f1@50": <macro mean F1@50 across sequences>,
+          "f1@10": <micro F1@10 from aggregated TP/FP/FN>,
+          "f1@25": <micro F1@25 from aggregated TP/FP/FN>,
+          "f1@50": <micro F1@50 from aggregated TP/FP/FN>,
         }
 
     Raises
@@ -315,23 +699,7 @@ def compute_tas_metrics_from_sequences(
             f"Pred has {len(pred_sequences)}"
         )
 
-    if label_names is None:
-        label_universe = set()
-        for seq in gt_sequences + pred_sequences:
-            label_universe.update(seq)
-        label_names = list(label_universe)
-
-    resolved_background = _infer_background_value(
-        background,
-        label_names,
-        sample_values=[lbl for seq in (gt_sequences + pred_sequences) for lbl in seq],
-    )
-
-    # Compute per-sequence metrics
-    per_sequence_metrics = []
-    all_gt_frames = []
-    all_pred_frames = []
-
+    # Validate sequence lengths
     for i, (gt_seq, pred_seq) in enumerate(zip(gt_sequences, pred_sequences)):
         if len(gt_seq) != len(pred_seq):
             raise ValueError(
@@ -339,32 +707,32 @@ def compute_tas_metrics_from_sequences(
                 f"Pred has {len(pred_seq)}"
             )
 
-        # Get metrics for this sequence
-        seq_metrics = tas_metrics(
-            gt_seq,
-            pred_seq,
-            background=resolved_background,
-            label_names=label_names,
-        )
-        per_sequence_metrics.append(seq_metrics)
+    # Build DataFrame from sequences for ASFormer-compatible metrics
+    rows = []
+    for case_idx, (gt_seq, pred_seq) in enumerate(zip(gt_sequences, pred_sequences)):
+        case_id = f"case_{case_idx}"
+        for gt_label, pred_label in zip(gt_seq, pred_seq):
+            rows.append({
+                'case:concept:name': case_id,
+                'ground_truth': str(gt_label),
+                'prediction': str(pred_label),
+            })
+    metrics_df = pd.DataFrame(rows)
 
-        # Collect all frames for micro accuracy
-        all_gt_frames.extend(gt_seq)
-        all_pred_frames.extend(pred_seq)
+    # Compute metrics using ASFormer-compatible method
+    metrics = compute_tas_metrics_asformer(
+        df=metrics_df,
+        pred_col='prediction',
+        gt_col='ground_truth',
+        case_col='case:concept:name',
+        background=background,
+    )
 
-    # Compute macro averages for Edit/F1s
-    macro_metrics = {}
-    for key in ["edit", "f1@10", "f1@25", "f1@50"]:
-        values = [m[key] for m in per_sequence_metrics]
-        macro_metrics[key] = float(sum(values) / len(values))
+    # Add acc_micro alias for backwards compatibility
+    if 'acc' in metrics:
+        metrics['acc_micro'] = metrics['acc']
 
-    # Compute micro/global frame accuracy
-    acc_micro = frame_accuracy(all_gt_frames, all_pred_frames)
-
-    return {
-        "acc_micro": float(acc_micro),
-        **macro_metrics
-    }
+    return metrics
 
 
 def compute_sktr_vs_argmax_metrics(
@@ -376,11 +744,16 @@ def compute_sktr_vs_argmax_metrics(
     kari_pred_col: Optional[str] = "kari_activity",
     gt_col: str = "ground_truth",
     background: Optional[Any] = None,
+    dataset_name: Optional[str] = None,
+    mapping_path: Optional[Union[str, Path]] = None,
     label_names: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, float]]:
     """
     Compute TAS metrics for both SKTR and argmax approaches from a CSV file.
     Optionally computes KARI metrics if the specified KARI prediction column exists.
+
+    Uses ASFormer/MS-TCN2 compatible metrics computation (micro-averaged F1 scores)
+    to ensure fair comparison with published results.
 
     This function loads prediction results from a CSV file containing SKTR and argmax
     predictions alongside ground truth labels, and computes comprehensive TAS metrics
@@ -405,6 +778,11 @@ def compute_sktr_vs_argmax_metrics(
     background : Any, optional
         Label to treat as background (ignored in Edit/F1 segmentation).
         If None, auto-detection is used.
+    dataset_name : str, optional
+        Dataset name used for background auto-resolution. If None, attempts to infer
+        from the CSV path (50salads/gtea/breakfast).
+    mapping_path : str or Path, optional
+        Explicit mapping.txt path for background auto-resolution.
     label_names : Sequence[str], optional
         Optional label names for background auto-detection.
 
@@ -415,14 +793,14 @@ def compute_sktr_vs_argmax_metrics(
         a dictionary of TAS metrics:
         {
             'sktr': {
-                'acc_micro': float,
+                'acc': float,
                 'edit': float,
                 'f1@10': float,
                 'f1@25': float,
                 'f1@50': float,
             },
             'argmax': {
-                'acc_micro': float,
+                'acc': float,
                 'edit': float,
                 'f1@10': float,
                 'f1@25': float,
@@ -469,35 +847,56 @@ def compute_sktr_vs_argmax_metrics(
     if missing_cols:
         raise ValueError(f"Missing required columns: {sorted(missing_cols)}")
 
-    # Compute metrics for SKTR
-    sktr_metrics = compute_tas_metrics_macro(
+    if dataset_name is None:
+        dataset_name = _infer_dataset_name_from_path(csv_path)
+
+    # Normalize label columns to string for consistent matching
+    for col in [sktr_pred_col, argmax_pred_col, gt_col]:
+        df[col] = df[col].astype(str)
+    if kari_pred_col is not None and kari_pred_col in df.columns:
+        df[kari_pred_col] = df[kari_pred_col].astype(str)
+
+    if background is not None:
+        if isinstance(background, (list, tuple, set, np.ndarray)):
+            background = [str(x) for x in background]
+        else:
+            background = str(background)
+
+    # Compute metrics for SKTR (using ASFormer-compatible method)
+    sktr_metrics = compute_tas_metrics_asformer(
         df,
         pred_col=sktr_pred_col,
         gt_col=gt_col,
         case_col=case_col,
         background=background,
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
         label_names=label_names,
     )
 
-    # Compute metrics for argmax
-    argmax_metrics = compute_tas_metrics_macro(
+    # Compute metrics for argmax (using ASFormer-compatible method)
+    argmax_metrics = compute_tas_metrics_asformer(
         df,
         pred_col=argmax_pred_col,
         gt_col=gt_col,
         case_col=case_col,
         background=background,
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
         label_names=label_names,
     )
 
-    # Compute metrics for KARI if available
+    # Compute metrics for KARI if available (using ASFormer-compatible method)
     kari_metrics = None
     if kari_pred_col is not None:
-        kari_metrics = compute_tas_metrics_macro(
+        kari_metrics = compute_tas_metrics_asformer(
             df,
             pred_col=kari_pred_col,
             gt_col=gt_col,
             case_col=case_col,
             background=background,
+            dataset_name=dataset_name,
+            mapping_path=mapping_path,
             label_names=label_names,
         )
 
@@ -517,6 +916,8 @@ def print_tas_metrics_from_csv(
     kari_pred_col: Optional[str] = "kari_activity",
     gt_col: str = "ground_truth",
     background: Optional[Any] = None,
+    dataset_name: Optional[str] = None,
+    mapping_path: Optional[Union[str, Path]] = None,
     label_names: Optional[Sequence[str]] = None,
     precision: int = 2,
     return_tables: bool = False,
@@ -533,7 +934,11 @@ def print_tas_metrics_from_csv(
     case_col, sktr_pred_col, argmax_pred_col, kari_pred_col, gt_col : str
         Column names; defaults match the repository's CSVs.
     background : Any, optional
-        Background label for Edit/F1 (default 0). Use None for auto-detection.
+        Background label for Edit/F1. Use None or "auto" for auto-detection.
+    dataset_name : str, optional
+        Dataset name used for background auto-resolution.
+    mapping_path : str or Path, optional
+        Explicit mapping.txt path for background auto-resolution.
     label_names : Sequence[str], optional
         Label names for background auto-detection.
     precision : int, default 2
@@ -558,6 +963,8 @@ def print_tas_metrics_from_csv(
         kari_pred_col=kari_pred_col,
         gt_col=gt_col,
         background=background,
+        dataset_name=dataset_name,
+        mapping_path=mapping_path,
         label_names=label_names,
     )
 

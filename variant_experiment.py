@@ -30,7 +30,7 @@ import time
 import argparse
 import json
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 import pandas as pd
 import numpy as np
@@ -133,6 +133,48 @@ def parse_args():
         default=11,
         help='Chunk size for conformance checking'
     )
+    parser.add_argument(
+        '--prob-threshold',
+        type=float,
+        default=1e-6,
+        help='Minimum probability threshold for pruning'
+    )
+    parser.add_argument(
+        '--candidate-top-k',
+        type=int,
+        default=15,
+        help='Max candidate labels per timestamp (top-K)'
+    )
+    parser.add_argument(
+        '--candidate-top-p',
+        type=float,
+        default=0.9,
+        help='Cumulative probability cutoff for candidate labels (top-p)'
+    )
+    parser.add_argument(
+        '--candidate-min-k',
+        type=int,
+        default=1,
+        help='Minimum candidate labels per timestamp'
+    )
+    parser.add_argument(
+        '-p', '--parallel-runs',
+        type=int,
+        default=1,
+        help='Number of hyperparameter combinations to run in parallel (default: 1 = sequential)'
+    )
+    parser.add_argument(
+        '--unique-train-variants',
+        action='store_true',
+        help='Train on unique variants only (one representative video per variant). '
+             'For Breakfast: 267 unique variants instead of 1712 videos.'
+    )
+    parser.add_argument(
+        '--unique-test-variants',
+        action='store_true',
+        help='Test on unique variants only (one representative video per variant). '
+             'Useful for faster hyperparameter search on large datasets like Breakfast.'
+    )
     return parser.parse_args()
 
 
@@ -152,6 +194,13 @@ if __name__ == '__main__':
     CONDITIONING_STATE_MODE = args.state_mode
     CONDITIONING_TOP_M = args.top_m
     CHUNK_SIZE = args.chunk_size
+    N_PARALLEL_RUNS = args.parallel_runs
+    PROB_THRESHOLD = args.prob_threshold
+    CANDIDATE_TOP_K = args.candidate_top_k
+    CANDIDATE_TOP_P = args.candidate_top_p
+    CANDIDATE_MIN_K = args.candidate_min_k
+    UNIQUE_TRAIN_VARIANTS = args.unique_train_variants
+    UNIQUE_TEST_VARIANTS = args.unique_test_variants
 else:
     # Default values when imported as module
     DATASET_NAME = '50salads'
@@ -163,23 +212,30 @@ else:
     CONDITIONING_STATE_MODE = 'topm'
     CONDITIONING_TOP_M = 3
     CHUNK_SIZE = 11
+    N_PARALLEL_RUNS = 1
+    PROB_THRESHOLD = 1e-6
+    CANDIDATE_TOP_K = 15
+    CANDIDATE_TOP_P = 0.9
+    CANDIDATE_MIN_K = 1
+    UNIQUE_TRAIN_VARIANTS = False
+    UNIQUE_TEST_VARIANTS = False
 
 # --- Parallelization ---
-N_PARALLEL_RUNS = 1  # Sequential hyperparameter experiments
 DATASET_PARALLELIZATION = True
 
 # --- Hyperparameter Search Configuration ---
-HP_ALPHAS = [0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95]
+HP_ALPHAS = [0.1, 0.3, 0.5, 0.7, 0.9]
 HP_STRATEGIES = {
-    'unigram_super_heavy': [0.75, 0.15, 0.1],
-    'balanced': [0.33, 0.33, 0.34],
-    'bigram_heavy': [0.2, 0.6, 0.2],
+    # Top 2 strategies based on 50salads and GTEA HP search results:
+    # - trigram_heavy: best on GTEA (rank 13.57), 3rd on 50salads (rank 14.26)
+    # - unigram_super_heavy: best on 50salads (rank 13.31), 2nd on GTEA (rank 14.31)
     'trigram_heavy': [0.1, 0.15, 0.75],
+    'unigram_super_heavy': [0.75, 0.15, 0.1],
 }
 
 # Default hyperparameters (used when --skip-hp-search is set)
 DEFAULT_ALPHA = 0.5
-DEFAULT_STRATEGY = 'balanced'
+DEFAULT_STRATEGY = 'trigram_heavy'
 DEFAULT_WEIGHTS = HP_STRATEGIES[DEFAULT_STRATEGY]
 
 # --- Training Sweep Configuration ---
@@ -214,6 +270,11 @@ VARIANT_SELECTION_MODE = "random"
 
 def load_dataset(dataset_name: str, model_source: str):
     """Load dataset from specified source."""
+    # Warn about potentially outdated data for breakfast with original source
+    if dataset_name == 'breakfast' and model_source == 'original':
+        print("WARNING: Using 'original' model source with breakfast dataset.")
+        print("         The original pickle-based data may be outdated.")
+        print("         Consider using 'asformer' or 'mstcn2' instead.")
     print(f"Loading {dataset_name} from {model_source}...")
 
     if model_source == 'original':
@@ -236,7 +297,7 @@ def build_base_config() -> dict:
         'use_same_traces_for_train_test': False, 'allow_train_cases_in_test': True,
         'compute_marking_transition_map': False, 'sequential_sampling': True,
         'n_indices': None, 'n_per_run': 10000, 'independent_sampling': True,
-        'prob_threshold': 1e-6, 'chunk_size': CHUNK_SIZE, 'conformance_switch_penalty_weight': 1.0,
+        'prob_threshold': PROB_THRESHOLD, 'chunk_size': CHUNK_SIZE, 'conformance_switch_penalty_weight': 1.0,
         'merge_mismatched_boundaries': False, 'conditioning_combine_fn': linear_prob_combiner,
         'max_hist_len': 3, 'conditioning_n_prev_labels': 3, 'use_collapsed_runs': True,
         'cost_function': 'linear', 'model_move_cost': 1.0, 'log_move_cost': 1.0,
@@ -253,20 +314,54 @@ def build_base_config() -> dict:
         'conditioning_state_mode': CONDITIONING_STATE_MODE,
         'conditioning_top_m': CONDITIONING_TOP_M,
         # Bound branching factor
-        'candidate_top_p': 0.9,
-        'candidate_top_k': 15,
-        'candidate_min_k': 1,
+        'candidate_top_p': CANDIDATE_TOP_P,
+        'candidate_top_k': CANDIDATE_TOP_K,
+        'candidate_min_k': CANDIDATE_MIN_K,
         'candidate_source': 'observed',
         'candidate_apply_to_sync': True,
     }
 
 
+def resolve_background_label(dataset_name: str) -> Optional[str]:
+    """Return None to use auto background resolution."""
+    return None
+
+
+def build_result_filename(dataset_name: str, model_source: str, prefix: str,
+                          alpha: float, strategy: str,
+                          unique_train: bool = False, unique_test: bool = False) -> str:
+    """Build a result filename (unique flags intentionally do not affect naming)."""
+    return f"{dataset_name}_{model_source}_{prefix}_alpha_{alpha}_weights_{strategy}.csv"
+
+
+def _result_meta_path(csv_path: Path) -> Path:
+    return csv_path.with_suffix(".meta.json")
+
+
 def check_existing_result(results_dir: Path, dataset_name: str, model_source: str,
-                          prefix: str, alpha: float, strategy: str):
+                          prefix: str, alpha: float, strategy: str,
+                          unique_train: bool = False, unique_test: bool = False):
     """Check if result CSV exists and load metrics from it."""
-    csv_path = results_dir / f"{dataset_name}_{model_source}_{prefix}_alpha_{alpha}_weights_{strategy}.csv"
+    filename = build_result_filename(dataset_name, model_source, prefix, alpha, strategy,
+                                     unique_train, unique_test)
+    csv_path = results_dir / filename
     if not csv_path.exists():
         return None
+    meta_path = _result_meta_path(csv_path)
+    if meta_path.exists():
+        try:
+            with meta_path.open('r') as f:
+                meta = json.load(f)
+            meta_unique_train = bool(meta.get('unique_train_variants', False))
+            meta_unique_test = bool(meta.get('unique_test_variants', False))
+        except Exception as e:
+            print(f"  Warning: Could not read metadata {meta_path}: {e}")
+            return None
+        if meta_unique_train != unique_train or meta_unique_test != unique_test:
+            return None
+    else:
+        if unique_train or unique_test:
+            return None
 
     try:
         metrics = compute_sktr_vs_argmax_metrics(
@@ -275,7 +370,8 @@ def check_existing_result(results_dir: Path, dataset_name: str, model_source: st
             sktr_pred_col='sktr_activity',
             argmax_pred_col='argmax_activity',
             gt_col='ground_truth',
-            background=0
+            background=resolve_background_label(dataset_name),
+            dataset_name=dataset_name,
         )
         return metrics
     except Exception as e:
@@ -286,7 +382,7 @@ def check_existing_result(results_dir: Path, dataset_name: str, model_source: st
 def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, strategy, weights,
                           idx, total, df, softmax_lst, base_cfg, results_dir,
                           prefix, dataset_name, model_source, skip_existing=True,
-                          save_models=True):
+                          save_models=True, unique_train=False, unique_test=False):
     """Run a single experiment and return metrics including timing info.
 
     Parameters
@@ -299,6 +395,10 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
     test_cases : List[str] or None
         Explicit list of test case IDs. If None, uses all available cases.
         For variant-based selection, this contains all cases for selected variants.
+    unique_train : bool
+        Whether unique train variants mode is enabled (for filename).
+    unique_test : bool
+        Whether unique test variants mode is enabled (for filename).
     """
     n_train_display = len(train_cases) if train_cases else n_train_variants
     n_test_display = len(test_cases) if test_cases else 'all'
@@ -307,7 +407,8 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
     # Check for existing result to enable resume
     if skip_existing:
         existing_metrics = check_existing_result(
-            results_dir, dataset_name, model_source, prefix, alpha, strategy)
+            results_dir, dataset_name, model_source, prefix, alpha, strategy,
+            unique_train, unique_test)
         if existing_metrics is not None:
             print(f"  -> SKIPPED (already exists)")
             return {
@@ -315,10 +416,10 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
                 'n_train_traces': n_train_display,
                 'n_test_cases': n_test_display,
                 'alpha': alpha, 'strategy': strategy,
-                'sktr_acc': existing_metrics['sktr']['acc_micro'], 'sktr_edit': existing_metrics['sktr']['edit'],
+                'sktr_acc': existing_metrics['sktr']['acc'], 'sktr_edit': existing_metrics['sktr']['edit'],
                 'sktr_f1@10': existing_metrics['sktr']['f1@10'], 'sktr_f1@25': existing_metrics['sktr']['f1@25'],
                 'sktr_f1@50': existing_metrics['sktr']['f1@50'],
-                'argmax_acc': existing_metrics['argmax']['acc_micro'], 'argmax_edit': existing_metrics['argmax']['edit'],
+                'argmax_acc': existing_metrics['argmax']['acc'], 'argmax_edit': existing_metrics['argmax']['edit'],
                 'argmax_f1@10': existing_metrics['argmax']['f1@10'], 'argmax_f1@25': existing_metrics['argmax']['f1@25'],
                 'argmax_f1@50': existing_metrics['argmax']['f1@50'],
                 'total_time_sec': None, 'avg_time_per_trace_sec': None,
@@ -351,8 +452,16 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
     n_test = results_df['case:concept:name'].nunique()
     avg_time_per_trace = total_time / n_test if n_test > 0 else 0
 
-    csv_path = results_dir / f"{dataset_name}_{model_source}_{prefix}_alpha_{alpha}_weights_{strategy}.csv"
+    filename = build_result_filename(dataset_name, model_source, prefix, alpha, strategy,
+                                      unique_train, unique_test)
+    csv_path = results_dir / filename
     results_df.to_csv(csv_path, index=False)
+    meta_path = _result_meta_path(csv_path)
+    with meta_path.open('w') as f:
+        json.dump({
+            'unique_train_variants': unique_train,
+            'unique_test_variants': unique_test,
+        }, f, indent=2, sort_keys=True)
 
     metrics = compute_sktr_vs_argmax_metrics(
         str(csv_path),
@@ -360,7 +469,8 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
         sktr_pred_col='sktr_activity',
         argmax_pred_col='argmax_activity',
         gt_col='ground_truth',
-        background=0
+        background=resolve_background_label(dataset_name),
+        dataset_name=dataset_name,
     )
 
     print(f"  -> Time: {total_time:.1f}s total, {avg_time_per_trace:.2f}s/trace ({n_test} traces)")
@@ -370,10 +480,10 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
         'n_train_traces': n_train_display,
         'n_test_cases': n_test_display if isinstance(n_test_display, int) else n_test,
         'alpha': alpha, 'strategy': strategy,
-        'sktr_acc': metrics['sktr']['acc_micro'], 'sktr_edit': metrics['sktr']['edit'],
+        'sktr_acc': metrics['sktr']['acc'], 'sktr_edit': metrics['sktr']['edit'],
         'sktr_f1@10': metrics['sktr']['f1@10'], 'sktr_f1@25': metrics['sktr']['f1@25'],
         'sktr_f1@50': metrics['sktr']['f1@50'],
-        'argmax_acc': metrics['argmax']['acc_micro'], 'argmax_edit': metrics['argmax']['edit'],
+        'argmax_acc': metrics['argmax']['acc'], 'argmax_edit': metrics['argmax']['edit'],
         'argmax_f1@10': metrics['argmax']['f1@10'], 'argmax_f1@25': metrics['argmax']['f1@25'],
         'argmax_f1@50': metrics['argmax']['f1@50'],
         'total_time_sec': round(total_time, 2), 'avg_time_per_trace_sec': round(avg_time_per_trace, 3),
@@ -416,7 +526,7 @@ def plot_sweep_results(sweep_summary_df: pd.DataFrame, results_dir: Path,
         y_max = sweep_summary_df[plot_cols].max().max()
         y_lower = math.floor(y_min / 10) * 10
         y_max = max(y_max, 80)
-        tick_start = y_lower
+        tick_start = min(y_lower, 50)  # Start from 50 or lower if data goes below
         tick_end = math.ceil(y_max / 10) * 10
         y_limits = (tick_start, tick_end)
         y_ticks = list(range(int(tick_start), int(tick_end) + 1, 10))
@@ -460,11 +570,11 @@ def plot_sweep_results(sweep_summary_df: pd.DataFrame, results_dir: Path,
 
     plt.suptitle(
         f'Performance vs. Training Variants ({dataset_name} - {model_source})',
-        fontsize=18, y=1.02
+        fontsize=18
     )
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
     plot_path = results_dir / f'{dataset_name}_{model_source}_sweep_plots.png'
-    plt.savefig(plot_path, dpi=150)
+    plt.savefig(plot_path, dpi=150, bbox_inches='tight')
     print(f"Saved plot: {plot_path}")
     plt.close()
 
@@ -491,8 +601,15 @@ if __name__ == '__main__':
     print(f"  Model Source: {MODEL_SOURCE}")
     print(f"  State Mode: {CONDITIONING_STATE_MODE} (top_m={CONDITIONING_TOP_M})")
     print(f"  Chunk Size: {CHUNK_SIZE}")
+    print(f"  Prob Threshold: {PROB_THRESHOLD}")
+    print(f"  Candidate Top-K: {CANDIDATE_TOP_K}")
+    print(f"  Candidate Top-P: {CANDIDATE_TOP_P}")
+    print(f"  Candidate Min-K: {CANDIDATE_MIN_K}")
     print(f"  Workers: {N_DATASET_WORKERS}")
+    print(f"  Parallel HP runs: {N_PARALLEL_RUNS}")
     print(f"  Skip HP Search: {SKIP_HP_SEARCH}")
+    print(f"  Unique Train Variants: {UNIQUE_TRAIN_VARIANTS}")
+    print(f"  Unique Test Variants: {UNIQUE_TEST_VARIANTS}")
     print("=" * 70)
 
     # -------------------------------------------------------------------------
@@ -528,20 +645,37 @@ if __name__ == '__main__':
     use_variant_selection = USE_VARIANT_BASED_SELECTION.get(DATASET_NAME, False)
     n_jobs = N_PARALLEL_RUNS if N_PARALLEL_RUNS is not None else -1
 
+    # Warn if unique variant flags are set but not applicable
+    if (UNIQUE_TRAIN_VARIANTS or UNIQUE_TEST_VARIANTS) and not use_variant_selection:
+        print(f"\nWarning: --unique-train/test-variants has no effect for {DATASET_NAME}")
+        print(f"  (Each trace is already unique in this dataset)")
+    else:
+        if UNIQUE_TRAIN_VARIANTS:
+            print(f"\nUnique train variants mode: Training on {n_unique_variants} representative videos only")
+        if UNIQUE_TEST_VARIANTS:
+            print(f"\nUnique test variants mode: Testing on {n_unique_variants} representative videos only")
+
     experiment_config = {
         'dataset': DATASET_NAME,
         'model_source': MODEL_SOURCE,
         'random_seed': RANDOM_SEED,
         'variant_selection_mode': VARIANT_SELECTION_MODE,
         'use_variant_based_selection': use_variant_selection,
+        'unique_train_variants': UNIQUE_TRAIN_VARIANTS,
+        'unique_test_variants': UNIQUE_TEST_VARIANTS,
         'n_unique_variants': n_unique_variants,
         'state_mode': CONDITIONING_STATE_MODE,
         'top_m': CONDITIONING_TOP_M,
         'chunk_size': CHUNK_SIZE,
+        'prob_threshold': PROB_THRESHOLD,
+        'candidate_top_k': CANDIDATE_TOP_K,
+        'candidate_top_p': CANDIDATE_TOP_P,
+        'candidate_min_k': CANDIDATE_MIN_K,
         'workers': N_DATASET_WORKERS,
         'skip_hp_search': SKIP_HP_SEARCH,
         'train_variant_sweep': TRAIN_VARIANT_SWEEP.get(DATASET_NAME, list(range(1, 11))),
         'n_parallel_runs': N_PARALLEL_RUNS,
+        'evaluation_background': resolve_background_label(DATASET_NAME),
     }
 
     # =========================================================================
@@ -576,13 +710,17 @@ if __name__ == '__main__':
 
         if use_variant_selection:
             # Variant-based: get train_cases (one per variant) and test_cases (all for those variants)
-            hp_train_cases, hp_test_cases, _ = select_variants_for_experiment(
+            hp_train_cases_unique, hp_test_cases_all, _ = select_variants_for_experiment(
                 variant_df, n_variants=HP_N_VARIANTS, selection_mode=VARIANT_SELECTION_MODE, seed=RANDOM_SEED
             )
+            # Apply unique train/test variant settings
+            hp_train_cases = hp_train_cases_unique if UNIQUE_TRAIN_VARIANTS else hp_test_cases_all
+            hp_test_cases = hp_train_cases_unique if UNIQUE_TEST_VARIANTS else hp_test_cases_all
+
             print(f"Hyperparameter Search Setup (variant-based selection):")
             print(f"  Training variants: {HP_N_VARIANTS}")
-            print(f"  Training traces (1 per variant): {len(hp_train_cases)}")
-            print(f"  Test traces (all for selected variants): {len(hp_test_cases)}")
+            print(f"  Training traces: {len(hp_train_cases)} ({'unique' if UNIQUE_TRAIN_VARIANTS else 'all'})")
+            print(f"  Test traces: {len(hp_test_cases)} ({'unique' if UNIQUE_TEST_VARIANTS else 'all'})")
             print(f"  Variant selection mode: {VARIANT_SELECTION_MODE}")
         else:
             # Standard: use n_train_traces directly, test on all
@@ -613,7 +751,8 @@ if __name__ == '__main__':
             delayed(run_single_experiment)(
                 n_variants, train_cases, test_cases, alpha, strategy, weights,
                 i, len(hp_params), df, softmax_lst, base_config, hp_results_dir,
-                "hp_search", DATASET_NAME, MODEL_SOURCE, save_models=(i == 1)
+                "hp_search", DATASET_NAME, MODEL_SOURCE, save_models=(i == 1),
+                unique_train=UNIQUE_TRAIN_VARIANTS, unique_test=UNIQUE_TEST_VARIANTS
             )
             for i, (n_variants, train_cases, test_cases, alpha, strategy, weights) in enumerate(hp_params, 1)
         )
@@ -666,7 +805,7 @@ if __name__ == '__main__':
         y_max = hp_summary_df[plot_cols].max().max()
         y_lower = math.floor(y_min / 10) * 10
         y_max = max(y_max, 80)
-        tick_start = y_lower
+        tick_start = min(y_lower, 50)  # Start from 50 or lower if data goes below
         tick_end = math.ceil(y_max / 10) * 10
         y_limits = (tick_start, tick_end)
         y_ticks = list(range(int(tick_start), int(tick_end) + 1, 10))
@@ -686,8 +825,8 @@ if __name__ == '__main__':
 
         plt.suptitle(f'Hyperparameter Search Results ({DATASET_NAME} - {MODEL_SOURCE})',
                      fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        plt.savefig(hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png', dpi=150)
+        plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
+        plt.savefig(hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png', dpi=150, bbox_inches='tight')
         print(f"Saved plot: {hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png'}")
         plt.close()
 
@@ -711,6 +850,8 @@ if __name__ == '__main__':
     print(f"  Strategy: {FINAL_STRATEGY}")
     print(f"  Weights: {FINAL_WEIGHTS}")
     print(f"  Variant-based selection: {use_variant_selection}")
+    print(f"  Unique train variants: {UNIQUE_TRAIN_VARIANTS}")
+    print(f"  Unique test variants: {UNIQUE_TEST_VARIANTS}")
     print(f"  Training variant sweep: {sweep_variant_counts}")
     print(f"  Total experiments: {len(sweep_variant_counts)}")
     experiment_config['final_experiment'] = {
@@ -729,9 +870,12 @@ if __name__ == '__main__':
     sweep_params = []
     for n_variants in sweep_variant_counts:
         if use_variant_selection:
-            train_cases, test_cases, _ = select_variants_for_experiment(
+            train_cases_unique, test_cases_all, _ = select_variants_for_experiment(
                 variant_df, n_variants=n_variants, selection_mode=VARIANT_SELECTION_MODE, seed=RANDOM_SEED
             )
+            # Apply unique train/test variant settings
+            train_cases = train_cases_unique if UNIQUE_TRAIN_VARIANTS else test_cases_all
+            test_cases = train_cases_unique if UNIQUE_TEST_VARIANTS else test_cases_all
         else:
             train_cases = None
             test_cases = None
@@ -744,7 +888,8 @@ if __name__ == '__main__':
         delayed(run_single_experiment)(
             n_variants, train_cases, test_cases, alpha, strategy, weights,
             i, len(sweep_params), df, softmax_lst, base_config, final_results_dir,
-            f"sweep_v{n_variants}", DATASET_NAME, MODEL_SOURCE
+            f"sweep_v{n_variants}", DATASET_NAME, MODEL_SOURCE,
+            unique_train=UNIQUE_TRAIN_VARIANTS, unique_test=UNIQUE_TEST_VARIANTS
         )
         for i, (n_variants, train_cases, test_cases, alpha, strategy, weights) in enumerate(sweep_params, 1)
     )
