@@ -120,6 +120,18 @@ class Transition:
         # Store just indices for unweighted case (common, faster)
         if not self.has_weighted_inputs:
             self.in_indices = tuple(idx for idx, _ in self.in_idx_weights)
+
+        # Precompute sparse net token deltas for firing.
+        delta: Dict[int, int] = defaultdict(int)
+        for idx, weight in self.in_idx_weights:
+            delta[idx] -= weight
+        for idx, weight in self.out_idx_weights:
+            delta[idx] += weight
+        self.delta_idx_weights = tuple(
+            (idx, weight_delta)
+            for idx, weight_delta in delta.items()
+            if weight_delta != 0
+        )
     
     def is_enabled_optimized(self, mark_tuple: Tuple[int, ...]) -> bool:
         """Ultra-fast enabled check."""
@@ -799,6 +811,9 @@ class PetriNet:
                         transition: 'Transition') -> 'Marking':
         # Choose implementation based on finalization status
         if self._finalized and hasattr(transition, 'in_idx_weights') and transition.in_idx_weights is not None:
+            if not hasattr(transition, 'delta_idx_weights'):
+                transition.prepare_fire(self.places_indices)
+
             # Normalize marking
             places = mark if isinstance(mark, tuple) else mark.places
             
@@ -806,22 +821,21 @@ class PetriNet:
             if not transition.in_idx_weights and not transition.out_idx_weights:
                 return Marking(places)
             
-            # Fast firing
-            new_places = list(places)
-            
-            # Consume tokens
+            # Validate inputs before applying the sparse net delta.
             for idx, weight in transition.in_idx_weights:
-                new_places[idx] -= weight
-                if new_places[idx] < 0:
+                if places[idx] < weight:
                     place_name = self.places[idx].name
                     raise ValueError(
                         f"Firing '{transition.name}' yields negative tokens at {place_name}: "
-                        f"{places[idx]} - {weight} = {new_places[idx]}"
+                        f"{places[idx]} - {weight} = {places[idx] - weight}"
                     )
-            
-            # Produce tokens
-            for idx, weight in transition.out_idx_weights:
-                new_places[idx] += weight
+
+            if not transition.delta_idx_weights:
+                return Marking(places)
+
+            new_places = list(places)
+            for idx, weight_delta in transition.delta_idx_weights:
+                new_places[idx] += weight_delta
             
             return Marking(tuple(new_places))
         else:
@@ -1172,6 +1186,10 @@ class PetriNet:
         # Use sys.intern for label strings to ensure identical labels share memory
         label2idx = {sys.intern(str(i)): i for i in range(n_acts)}
         idx2label = {i: sys.intern(str(i)) for i in range(n_acts)}
+        class_labels = [idx2label[i] for i in range(n_acts)]
+        raw_top1_by_ts = np.argmax(softmax_matrix, axis=0) if n_ts > 0 else np.array([], dtype=int)
+        tau_cost_const = cost_fn(0.0, 'tau')
+        model_cost_const = cost_fn(0.0, 'model')
 
         # Memory optimization: bound path_prefix to only store what's needed for conditioning.
         # We need n_prev_labels previous DIFFERENT labels plus the current label.
@@ -1293,6 +1311,18 @@ class PetriNet:
         max_dist_size = len(dist)
         max_marking_by_key_size = len(marking_by_key)
         last_timestamp_seen = 0
+        prob_vec_cache: Dict[Tuple[int, Tuple[str, ...]], np.ndarray] = {}
+        candidate_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[Optional[np.ndarray], Optional[Set[int]]]] = {}
+        cost_vec_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[np.ndarray, np.ndarray]] = {}
+        fire_cache: Dict[Tuple[Tuple[int, ...], Transition, bool], 'Marking'] = {}
+        prob_vec_cache_hits = 0
+        prob_vec_cache_misses = 0
+        candidate_cache_hits = 0
+        candidate_cache_misses = 0
+        cost_vec_cache_hits = 0
+        cost_vec_cache_misses = 0
+        fire_cache_hits = 0
+        fire_cache_misses = 0
 
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
             """
@@ -1440,44 +1470,86 @@ class PetriNet:
                 raw_vec = softmax_matrix[:, timestamp]
                 if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
                     conditioning_calls += 1
-                    # Determine which mode to use based on conditioning_n_prev_labels
-                    if conditioning_n_prev_labels == 1 and bigram_map:
-                        # Legacy mode: single previous label with bigram_map
-                        prob_vec = adjust_probs_with_sequence_context(
-                            observed_probs=raw_vec,
-                            class_labels=[idx2label[i] for i in range(n_acts)],
-                            predicted_sequence=list(path_prefix),
-                            cond_prob_bigram=bigram_map,
-                            alpha=conditioning_alpha,
-                            combine_fn=conditioning_combine_fn,
-                            n_prev_labels=1,
-                        )
-                    elif conditioning_n_prev_labels > 1 and prob_dict_uncollapsed is not None:
-                        # Extended mode: multiple previous labels with interpolation
-                        # Uses TWO dictionaries: uncollapsed for continuation, collapsed for transitions
-                        prob_vec = adjust_probs_with_sequence_context(
-                            observed_probs=raw_vec,
-                            class_labels=[idx2label[i] for i in range(n_acts)],
-                            predicted_sequence=list(path_prefix),
-                            prob_dict_uncollapsed=prob_dict_uncollapsed,
-                            prob_dict_collapsed=prob_dict_collapsed,
-                            alpha=conditioning_alpha,
-                            combine_fn=conditioning_combine_fn,
-                            n_prev_labels=conditioning_n_prev_labels,
-                            interpolation_weights=conditioning_interpolation_weights,
-                        )
+                    prob_cache_key = (int(timestamp), path_prefix)
+                    cached_prob_vec = prob_vec_cache.get(prob_cache_key)
+                    if cached_prob_vec is not None:
+                        prob_vec_cache_hits += 1
+                        prob_vec = cached_prob_vec
                     else:
-                        prob_vec = raw_vec
+                        prob_vec_cache_misses += 1
+                        # Determine which mode to use based on conditioning_n_prev_labels
+                        if conditioning_n_prev_labels == 1 and bigram_map:
+                            # Legacy mode: single previous label with bigram_map
+                            prob_vec = adjust_probs_with_sequence_context(
+                                observed_probs=raw_vec,
+                                class_labels=class_labels,
+                                predicted_sequence=list(path_prefix),
+                                cond_prob_bigram=bigram_map,
+                                alpha=conditioning_alpha,
+                                combine_fn=conditioning_combine_fn,
+                                n_prev_labels=1,
+                            )
+                        elif conditioning_n_prev_labels > 1 and prob_dict_uncollapsed is not None:
+                            # Extended mode: multiple previous labels with interpolation
+                            # Uses TWO dictionaries: uncollapsed for continuation, collapsed for transitions
+                            prob_vec = adjust_probs_with_sequence_context(
+                                observed_probs=raw_vec,
+                                class_labels=class_labels,
+                                predicted_sequence=list(path_prefix),
+                                prob_dict_uncollapsed=prob_dict_uncollapsed,
+                                prob_dict_collapsed=prob_dict_collapsed,
+                                alpha=conditioning_alpha,
+                                combine_fn=conditioning_combine_fn,
+                                n_prev_labels=conditioning_n_prev_labels,
+                                interpolation_weights=conditioning_interpolation_weights,
+                            )
+                        else:
+                            prob_vec = raw_vec
+                        prob_vec_cache[prob_cache_key] = prob_vec
                 else:
                     prob_vec = raw_vec
 
                 # Candidate pruning: always use conditioned probabilities (prob_vec).
                 # When conditioning is disabled, prob_vec == raw_vec.
                 candidate_selection_calls += 1
-                cand_idx = _select_candidate_indices(prob_vec)
+                candidate_cache_key = (int(timestamp), path_prefix)
+                cached_candidates = candidate_cache.get(candidate_cache_key)
+                if cached_candidates is not None:
+                    candidate_cache_hits += 1
+                    cand_idx, cand_idx_set = cached_candidates
+                else:
+                    candidate_cache_misses += 1
+                    cand_idx = _select_candidate_indices(prob_vec)
+                    cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
+                    candidate_cache[candidate_cache_key] = (cand_idx, cand_idx_set)
                 if cand_idx is not None:
                     candidate_total += int(len(cand_idx))
-                cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
+
+                cached_cost_vecs = cost_vec_cache.get(candidate_cache_key)
+                if cached_cost_vecs is not None:
+                    cost_vec_cache_hits += 1
+                    sync_cost_vec, log_cost_vec = cached_cost_vecs
+                else:
+                    cost_vec_cache_misses += 1
+                    sync_cost_vec = np.empty(n_acts, dtype=float)
+                    log_cost_vec = np.empty(n_acts, dtype=float)
+                    for cost_idx in range(n_acts):
+                        p_cost = max(float(prob_vec[cost_idx]), 1e-12)
+                        sync_cost_vec[cost_idx] = cost_fn(p_cost, 'sync')
+                        log_cost_vec[cost_idx] = cost_fn(p_cost, 'log')
+                    cost_vec_cache[candidate_cache_key] = (sync_cost_vec, log_cost_vec)
+
+                marking_transition_map = self.marking_transition_map
+                marking_transition_entry = (
+                    marking_transition_map.get(places)
+                    if marking_transition_map is not None
+                    else None
+                )
+                available_transition_map = (
+                    marking_transition_entry.get("available_transitions")
+                    if marking_transition_entry is not None
+                    else None
+                )
 
                 # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
                 model_edges_considered += len(enabled)
@@ -1488,23 +1560,32 @@ class PetriNet:
                         continue
                     tau_cost_total = 0.0
                     # Use macro transition if this transition comes from marking_transition_map
-                    if (
-                        hasattr(self, "marking_transition_map")
-                        and self.marking_transition_map is not None
-                        and places in self.marking_transition_map
-                        and t in self.marking_transition_map[places]["available_transitions"]
-                    ):
+                    if available_transition_map is not None and t in available_transition_map:
                         # This transition requires τ-path firing; include τ costs
-                        tau_path = self.marking_transition_map[places]["available_transitions"][t]
-                        tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                        new_mark = self._fire_macro_transition(marking, t)
-                        macro_fire_calls += 1
+                        tau_path = available_transition_map[t]
+                        tau_cost_total = len(tau_path) * tau_cost_const
+                        fire_key = (places, t, True)
+                        new_mark = fire_cache.get(fire_key)
+                        if new_mark is None:
+                            fire_cache_misses += 1
+                            new_mark = self._fire_macro_transition(marking, t)
+                            fire_cache[fire_key] = new_mark
+                            macro_fire_calls += 1
+                        else:
+                            fire_cache_hits += 1
                     else:
                         # This is a directly enabled transition
-                        new_mark = self._fire_transition(marking, t)
-                        fire_transition_calls += 1
+                        fire_key = (places, t, False)
+                        new_mark = fire_cache.get(fire_key)
+                        if new_mark is None:
+                            fire_cache_misses += 1
+                            new_mark = self._fire_transition(marking, t)
+                            fire_cache[fire_key] = new_mark
+                            fire_transition_calls += 1
+                        else:
+                            fire_cache_hits += 1
                     move_type = 'tau' if t.label is None else 'model'
-                    c = cost_fn(0.0, move_type)
+                    c = tau_cost_const if t.label is None else model_cost_const
                     new_cost = cost + tau_cost_total + c
                     new_key = make_key(new_mark.places, timestamp, last_label, path_prefix)
                     new_base_key = (new_mark.places, timestamp, last_label) if use_last_label_in_state else (new_mark.places, timestamp)
@@ -1531,7 +1612,7 @@ class PetriNet:
                         # Restricted mode: only allow top-1 probability + parent's last_label
                         # This limits log moves to at most 2 options per timestamp
                         # Use raw (observed) probabilities for top-1.
-                        top1_idx = int(np.argmax(raw_vec))
+                        top1_idx = int(raw_top1_by_ts[timestamp])
                         restricted_indices = [top1_idx]
                         if last_label is not None and last_label in label2idx:
                             last_idx = label2idx[last_label]
@@ -1552,7 +1633,7 @@ class PetriNet:
                             continue
                         label = idx2label[int(idx)]
                         p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
-                        c = cost_fn(p, 'log')
+                        c = float(log_cost_vec[int(idx)])
                         # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                         add_switch = 0.0
                         if switch_penalty_weight > 0.0 and last_label is not None and label != last_label and prob_dict_uncollapsed is not None:
@@ -1603,26 +1684,35 @@ class PetriNet:
                         continue
                     # no observed-move restriction
                     p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
-                    c = cost_fn(p, 'sync')
+                    c = float(sync_cost_vec[idx])
 
                     tau_cost_total = 0.0
 
                     # Use macro transition if this transition comes from marking_transition_map
-                    if (
-                        hasattr(self, "marking_transition_map")
-                        and self.marking_transition_map is not None
-                        and places in self.marking_transition_map
-                        and t in self.marking_transition_map[places]["available_transitions"]
-                    ):
+                    if available_transition_map is not None and t in available_transition_map:
                         # This transition requires τ-path firing; include τ costs
-                        tau_path = self.marking_transition_map[places]["available_transitions"][t]
-                        tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                        new_mark = self._fire_macro_transition(marking, t)
-                        macro_fire_calls += 1
+                        tau_path = available_transition_map[t]
+                        tau_cost_total = len(tau_path) * tau_cost_const
+                        fire_key = (places, t, True)
+                        new_mark = fire_cache.get(fire_key)
+                        if new_mark is None:
+                            fire_cache_misses += 1
+                            new_mark = self._fire_macro_transition(marking, t)
+                            fire_cache[fire_key] = new_mark
+                            macro_fire_calls += 1
+                        else:
+                            fire_cache_hits += 1
                     else:
                         # This is a directly enabled transition
-                        new_mark = self._fire_transition(marking, t)
-                        fire_transition_calls += 1
+                        fire_key = (places, t, False)
+                        new_mark = fire_cache.get(fire_key)
+                        if new_mark is None:
+                            fire_cache_misses += 1
+                            new_mark = self._fire_transition(marking, t)
+                            fire_cache[fire_key] = new_mark
+                            fire_transition_calls += 1
+                        else:
+                            fire_cache_hits += 1
 
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
@@ -1709,6 +1799,14 @@ class PetriNet:
                 profile_stats["topm_rejects"] = profile_stats.get("topm_rejects", 0) + topm_rejects
                 profile_stats["topm_evictions"] = profile_stats.get("topm_evictions", 0) + topm_evictions
                 profile_stats["heap_compactions"] = profile_stats.get("heap_compactions", 0) + heap_compactions
+                profile_stats["prob_vec_cache_hits"] = profile_stats.get("prob_vec_cache_hits", 0) + prob_vec_cache_hits
+                profile_stats["prob_vec_cache_misses"] = profile_stats.get("prob_vec_cache_misses", 0) + prob_vec_cache_misses
+                profile_stats["candidate_cache_hits"] = profile_stats.get("candidate_cache_hits", 0) + candidate_cache_hits
+                profile_stats["candidate_cache_misses"] = profile_stats.get("candidate_cache_misses", 0) + candidate_cache_misses
+                profile_stats["cost_vec_cache_hits"] = profile_stats.get("cost_vec_cache_hits", 0) + cost_vec_cache_hits
+                profile_stats["cost_vec_cache_misses"] = profile_stats.get("cost_vec_cache_misses", 0) + cost_vec_cache_misses
+                profile_stats["fire_cache_hits"] = profile_stats.get("fire_cache_hits", 0) + fire_cache_hits
+                profile_stats["fire_cache_misses"] = profile_stats.get("fire_cache_misses", 0) + fire_cache_misses
                 profile_stats["max_heap_size"] = max(profile_stats.get("max_heap_size", 0), max_heap_size)
                 profile_stats["max_dist_size"] = max(profile_stats.get("max_dist_size", 0), max_dist_size)
                 profile_stats["max_marking_by_key_size"] = max(profile_stats.get("max_marking_by_key_size", 0), max_marking_by_key_size)

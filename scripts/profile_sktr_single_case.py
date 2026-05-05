@@ -196,6 +196,7 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
         candidate_min_k=args.candidate_min_k,
         restrict_log_moves=args.restrict_log_moves,
         restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
+        enabled_cache_size=args.enabled_cache_size,
         use_calibration=args.use_calibration,
         workers=1,
         dataset_parallelization=False,

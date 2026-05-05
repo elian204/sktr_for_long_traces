@@ -359,6 +359,16 @@ def main():
     parser.add_argument("--candidate-top-p", type=float, default=1.0)
     parser.add_argument("--candidate-min-k", type=int, default=1)
     parser.add_argument(
+        "--restrict-log-moves",
+        action="store_true",
+        help="Approximate SKTR: restrict log moves to top-1 observed label plus previous label.",
+    )
+    parser.add_argument(
+        "--restrict-model-moves-to-tau",
+        action="store_true",
+        help="Approximate SKTR: allow only tau transitions as model moves.",
+    )
+    parser.add_argument(
         "--enabled-cache-size",
         type=int,
         default=100000,
@@ -469,8 +479,8 @@ def main():
                 candidate_top_k=args.candidate_top_k,
                 candidate_top_p=args.candidate_top_p,
                 candidate_min_k=args.candidate_min_k,
-                restrict_log_moves=False,
-                restrict_model_moves_to_tau=False,
+                restrict_log_moves=args.restrict_log_moves,
+                restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
                 enabled_cache_size=args.enabled_cache_size,
                 use_calibration=args.use_calibration,
                 workers=args.workers,
