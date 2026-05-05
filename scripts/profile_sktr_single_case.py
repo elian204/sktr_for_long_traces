@@ -14,6 +14,7 @@ import argparse
 import cProfile
 import json
 import logging
+import pickle
 import pstats
 import signal
 import sys
@@ -211,6 +212,61 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
     return base
 
 
+def _setup_cache_metadata(
+    args: argparse.Namespace,
+    fold_inputs: Dict[str, Any],
+    cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "dataset": args.dataset,
+        "fold": args.fold,
+        "softmax_dir": str(fold_inputs["softmax_dir"]),
+        "train_cases": list(fold_inputs["train_cases"]),
+        "hp": dict(fold_inputs["hp"]),
+        "weights": list(fold_inputs["weights"]),
+        "max_hist_len": cfg["max_hist_len"],
+        "compute_marking_transition_map": cfg.get("compute_marking_transition_map", True),
+        "precompute_marking_transition_map": cfg.get("precompute_marking_transition_map", False),
+    }
+
+
+def _load_setup_cache(
+    cache_path: Optional[Path],
+    metadata: Dict[str, Any],
+    refresh: bool,
+) -> Optional[Dict[str, Any]]:
+    if cache_path is None or refresh or not cache_path.exists():
+        return None
+    with cache_path.open("rb") as fh:
+        payload = pickle.load(fh)
+    if payload.get("metadata") != metadata:
+        return None
+    return payload
+
+
+def _save_setup_cache(
+    cache_path: Optional[Path],
+    metadata: Dict[str, Any],
+    model: Any,
+    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]],
+    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]],
+) -> None:
+    if cache_path is None:
+        return
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with cache_path.open("wb") as fh:
+        pickle.dump(
+            {
+                "metadata": metadata,
+                "model": model,
+                "prob_dict_uncollapsed": prob_dict_uncollapsed,
+                "prob_dict_collapsed": prob_dict_collapsed,
+            },
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+
 def _prepare_fold_inputs(args: argparse.Namespace) -> Dict[str, Any]:
     diffact_root = Path(args.diffact_root)
     softmax_dir = resolve_diffact_softmax_dir(
@@ -316,6 +372,7 @@ def _profile_recovery(
 def _build_conformance_setup(
     fold_inputs: Dict[str, Any],
     cfg: Dict[str, Any],
+    args: argparse.Namespace,
 ) -> Dict[str, Any]:
     if cfg["use_calibration"]:
         raise ValueError("--use-calibration is only supported with --target recovery")
@@ -347,37 +404,62 @@ def _build_conformance_setup(
         random_seed=cfg["random_seed"],
     )
 
-    model_start = time.perf_counter()
-    model = discover_petri_net(train_df)
-    model.enable_caching(True)
-    if cfg["compute_marking_transition_map"]:
-        if cfg["precompute_marking_transition_map"]:
-            model.build_marking_transition_map()
-            model._allow_lazy_map_build = False
-        else:
-            model._allow_lazy_map_build = True
-            model.get_or_build_marking_transition_map(max_tau_depth=100)
-            model.get_tau_reachable_transitions_initial(max_tau_depth=100)
-    else:
-        model._allow_lazy_map_build = False
-        model.marking_transition_map = None
-    model_elapsed = time.perf_counter() - model_start
+    cache_metadata = _setup_cache_metadata(args, fold_inputs, cfg)
+    cache_payload = _load_setup_cache(
+        args.setup_cache_path,
+        cache_metadata,
+        refresh=args.refresh_setup_cache,
+    )
+    setup_cache_hit = cache_payload is not None
+    setup_cache_path = str(args.setup_cache_path) if args.setup_cache_path is not None else None
 
-    prob_start = time.perf_counter()
-    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    if cfg["conformance_switch_penalty_weight"] > 0.0 or fold_inputs["hp"]["alpha"] is not None:
-        prob_dict_uncollapsed = build_probability_dict(
-            train_df,
-            max_hist_len=cfg["max_hist_len"],
-            use_collapsed=False,
+    if cache_payload is not None:
+        model_start = time.perf_counter()
+        model = cache_payload["model"]
+        model.enable_caching(True, max_size=args.enabled_cache_size)
+        prob_dict_uncollapsed = cache_payload["prob_dict_uncollapsed"]
+        prob_dict_collapsed = cache_payload["prob_dict_collapsed"]
+        model_elapsed = time.perf_counter() - model_start
+        prob_elapsed = 0.0
+    else:
+        model_start = time.perf_counter()
+        model = discover_petri_net(train_df)
+        model.enable_caching(True, max_size=args.enabled_cache_size)
+        if cfg.get("compute_marking_transition_map", True):
+            if cfg.get("precompute_marking_transition_map", False):
+                model.build_marking_transition_map()
+                model._allow_lazy_map_build = False
+            else:
+                model._allow_lazy_map_build = True
+                model.get_or_build_marking_transition_map(max_tau_depth=100)
+                model.get_tau_reachable_transitions_initial(max_tau_depth=100)
+        else:
+            model._allow_lazy_map_build = False
+            model.marking_transition_map = None
+        model_elapsed = time.perf_counter() - model_start
+
+        prob_start = time.perf_counter()
+        prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+        prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+        if cfg["conformance_switch_penalty_weight"] > 0.0 or fold_inputs["hp"]["alpha"] is not None:
+            prob_dict_uncollapsed = build_probability_dict(
+                train_df,
+                max_hist_len=cfg["max_hist_len"],
+                use_collapsed=False,
+            )
+            prob_dict_collapsed = build_probability_dict(
+                train_df,
+                max_hist_len=cfg["max_hist_len"],
+                use_collapsed=True,
+            )
+        prob_elapsed = time.perf_counter() - prob_start
+        _save_setup_cache(
+            args.setup_cache_path,
+            cache_metadata,
+            model,
+            prob_dict_uncollapsed,
+            prob_dict_collapsed,
         )
-        prob_dict_collapsed = build_probability_dict(
-            train_df,
-            max_hist_len=cfg["max_hist_len"],
-            use_collapsed=True,
-        )
-    prob_elapsed = time.perf_counter() - prob_start
 
     if filtered_softmax is None:
         raise ValueError("filtered softmax matrices are required")
@@ -412,6 +494,9 @@ def _build_conformance_setup(
         "model_transitions": int(len(model.transitions)),
         "prob_histories_uncollapsed": int(len(prob_dict_uncollapsed)),
         "prob_histories_collapsed": int(len(prob_dict_collapsed)),
+        "setup_cache_hit": setup_cache_hit,
+        "setup_cache_path": setup_cache_path,
+        "enabled_cache_size": int(args.enabled_cache_size),
     }
 
 
@@ -420,8 +505,9 @@ def _profile_conformance(
     cfg: Dict[str, Any],
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
-    setup = _build_conformance_setup(fold_inputs, cfg)
+    setup = _build_conformance_setup(fold_inputs, cfg, args)
     partial_call_counter = {"completed": 0}
+    search_stats: Dict[str, Any] = {}
     if args.max_partial_calls is not None:
         if args.max_partial_calls <= 0:
             raise ValueError("--max-partial-calls must be positive when set")
@@ -450,8 +536,8 @@ def _profile_conformance(
             prob_dict_uncollapsed=setup["prob_dict_uncollapsed"],
             prob_dict_collapsed=setup["prob_dict_collapsed"],
             switch_penalty_weight=cfg["conformance_switch_penalty_weight"],
-            use_state_caching=cfg["use_state_caching"],
-            merge_mismatched_boundaries=cfg["merge_mismatched_boundaries"],
+            use_state_caching=cfg.get("use_state_caching", True),
+            merge_mismatched_boundaries=cfg.get("merge_mismatched_boundaries", True),
             conditioning_alpha=fold_inputs["hp"]["alpha"],
             conditioning_combine_fn=cfg["conditioning_combine_fn"],
             conditioning_n_prev_labels=cfg["conditioning_n_prev_labels"],
@@ -465,6 +551,7 @@ def _profile_conformance(
             candidate_apply_to_sync=cfg["candidate_apply_to_sync"],
             restrict_log_moves=cfg["restrict_log_moves"],
             restrict_model_moves_to_tau=cfg["restrict_model_moves_to_tau"],
+            profile_stats=search_stats,
         )
 
     result, elapsed, profile_status = _run_profile(
@@ -495,8 +582,12 @@ def _profile_conformance(
                 "model_transitions",
                 "prob_histories_uncollapsed",
                 "prob_histories_collapsed",
+                "setup_cache_hit",
+                "setup_cache_path",
+                "enabled_cache_size",
             }
         },
+        "search_stats": search_stats,
     }
     if result is None:
         summary.update({"predictions": None, "move_costs": None})
@@ -551,6 +642,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default=DEFAULT_DATA_ROOT)
     parser.add_argument("--diffact-root", default=str(REPO_ROOT / "baselines" / "DiffAct"))
     parser.add_argument("--out-dir", default=str(REPO_ROOT / "results" / "profiling"))
+    parser.add_argument("--setup-cache-path", default=None)
+    parser.add_argument("--no-setup-cache", action="store_true")
+    parser.add_argument("--refresh-setup-cache", action="store_true")
     parser.add_argument("--stats-path", default=None)
     parser.add_argument("--text-path", default=None)
     parser.add_argument("--summary-path", default=None)
@@ -571,6 +665,7 @@ def parse_args() -> argparse.Namespace:
         help="Conformance target only: stop after this many partial_trace_conformance calls",
     )
     parser.add_argument("--max-frames", type=int, default=None, help="Trim selected test case to first N frames for smoke profiling")
+    parser.add_argument("--enabled-cache-size", type=int, default=10000, help="Max entries for PetriNet enabled-transition cache")
     parser.add_argument("--disallow-legacy", action="store_true", help="Require softmax_foldK instead of fold-1 legacy fallback")
 
     parser.add_argument("--chunk-size", type=int, default=11)
@@ -597,6 +692,16 @@ def main() -> None:
     fold_inputs = _prepare_fold_inputs(args)
     _default_output_paths(args, fold_inputs["selected_case"])
     cfg = _build_base_config(args)
+    if args.no_setup_cache:
+        args.setup_cache_path = None
+    elif args.setup_cache_path is None:
+        args.setup_cache_path = (
+            Path(args.out_dir)
+            / "setup_cache"
+            / f"{args.dataset}_fold{args.fold}_diffact_sktr_setup.pkl"
+        )
+    else:
+        args.setup_cache_path = Path(args.setup_cache_path)
 
     print(
         "Profiling "

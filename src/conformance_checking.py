@@ -36,6 +36,7 @@ def process_trace_chunked(
     candidate_apply_to_sync: bool = True,
     restrict_log_moves: bool = False,
     restrict_model_moves_to_tau: bool = False,
+    profile_stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -82,4 +83,5 @@ def process_trace_chunked(
         candidate_apply_to_sync=candidate_apply_to_sync,
         restrict_log_moves=restrict_log_moves,
         restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+        profile_stats=profile_stats,
     )

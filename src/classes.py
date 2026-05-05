@@ -1147,6 +1147,7 @@ class PetriNet:
         restrict_log_moves: bool = False,
         # Restricted model moves: only allow tau (silent) transitions
         restrict_model_moves_to_tau: bool = False,
+        profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1256,6 +1257,43 @@ class PetriNet:
         COMPACT_THRESHOLD = 100000
         iterations_since_compact = 0
 
+        profile_completed = False
+        profile_no_path = False
+        heap_pops = 0
+        heap_pushes = 1
+        stale_pops = 0
+        missing_marking_pops = 0
+        dominance_prunes = 0
+        states_expanded = 0
+        enabled_calls = 0
+        enabled_total = 0
+        enabled_scanned_transitions = 0
+        conditioning_calls = 0
+        candidate_selection_calls = 0
+        candidate_total = 0
+        model_edges_considered = 0
+        model_moves_skipped_restrict = 0
+        model_relaxations = 0
+        model_pushes = 0
+        log_edges_considered = 0
+        log_edges_below_eps = 0
+        log_relaxations = 0
+        log_pushes = 0
+        sync_edges_considered = 0
+        sync_edges_skipped_candidate = 0
+        sync_edges_below_eps = 0
+        sync_relaxations = 0
+        sync_pushes = 0
+        fire_transition_calls = 0
+        macro_fire_calls = 0
+        topm_rejects = 0
+        topm_evictions = 0
+        heap_compactions = 0
+        max_heap_size = len(open_set)
+        max_dist_size = len(dist)
+        max_marking_by_key_size = len(marking_by_key)
+        last_timestamp_seen = 0
+
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
             """
             Return sorted indices of candidate labels to expand (top-p within top-k),
@@ -1298,6 +1336,7 @@ class PetriNet:
             Return True if this (base_key, state_key) variant is allowed under the top-M cap.
             May evict a worse variant from the same base_key to make room.
             """
+            nonlocal topm_rejects, topm_evictions
             if top_m is None:
                 return True
 
@@ -1316,273 +1355,367 @@ class PetriNet:
             worst_key, worst_cost = max(variants.items(), key=lambda kv: kv[1])
             if new_cost < worst_cost - 1e-12:
                 del variants[worst_key]
+                topm_evictions += 1
                 # Remove heavy per-state data to free memory; leave came_from for reconstruction
                 dist.pop(worst_key, None)
                 marking_by_key.pop(worst_key, None)
                 variants[state_key] = new_cost
                 return True
 
+            topm_rejects += 1
             return False
 
-        while open_set:
-            cost, _, key = heapq.heappop(open_set)
+        try:
+            while open_set:
+                heap_pops += 1
+                cost, _, key = heapq.heappop(open_set)
 
-            # Skip stale entries: if we've already found a better path to this state
-            if cost > dist.get(key, float('inf')):
-                continue
-
-            marking = marking_by_key.get(key)
-            if marking is None:
-                continue
-
-            # Extract key components (key structure depends on flags)
-            if use_conditioning_context:
-                if use_last_label_in_state:
-                    places, timestamp, last_label, path_prefix = key
-                else:
-                    places, timestamp, path_prefix = key
-                    last_label = None
-            else:
-                if use_last_label_in_state:
-                    places, timestamp, last_label = key
-                else:
-                    places, timestamp = key
-                    last_label = None
-                path_prefix = tuple()
-
-            base_key = (places, timestamp, last_label) if use_last_label_in_state else (places, timestamp)
-            unlabeled_key = (places, timestamp)
-
-            # Dominance prune across different last_label variants
-            if switch_penalty_weight > 0.0:
-                current_best_unlabeled = best_unlabeled[unlabeled_key]
-                max_advantage = switch_penalty_weight
-                if cost > current_best_unlabeled + max_advantage + 1e-12:
+                # Skip stale entries: if we've already found a better path to this state
+                if cost > dist.get(key, float('inf')):
+                    stale_pops += 1
                     continue
 
-            # Update unlabeled best after acceptance
-            if cost < best_unlabeled[unlabeled_key]:
-                best_unlabeled[unlabeled_key] = cost
+                marking = marking_by_key.get(key)
+                if marking is None:
+                    missing_marking_pops += 1
+                    continue
 
-            # Goal reached: consumed all timestamps
-            if timestamp == n_ts:
-                # Reconstruct path from came_from
-                alignment = []
-                current_key = key
-                while current_key in came_from:
-                    parent_key, move_type, move_label, move_cost = came_from[current_key]
-                    alignment.append((move_type, move_label, move_cost))
-                    current_key = parent_key
-                alignment.reverse()
+                # Extract key components (key structure depends on flags)
+                if use_conditioning_context:
+                    if use_last_label_in_state:
+                        places, timestamp, last_label, path_prefix = key
+                    else:
+                        places, timestamp, path_prefix = key
+                        last_label = None
+                else:
+                    if use_last_label_in_state:
+                        places, timestamp, last_label = key
+                    else:
+                        places, timestamp = key
+                        last_label = None
+                    path_prefix = tuple()
+                last_timestamp_seen = max(last_timestamp_seen, int(timestamp))
 
-                result = {
-                    'alignment': alignment,
-                    'total_cost': cost,
-                    'final_marking': marking
-                }
-                return result
+                base_key = (places, timestamp, last_label) if use_last_label_in_state else (places, timestamp)
+                unlabeled_key = (places, timestamp)
 
-            enabled = self._find_available_transitions(places)
+                # Dominance prune across different last_label variants
+                if switch_penalty_weight > 0.0:
+                    current_best_unlabeled = best_unlabeled[unlabeled_key]
+                    max_advantage = switch_penalty_weight
+                    if cost > current_best_unlabeled + max_advantage + 1e-12:
+                        dominance_prunes += 1
+                        continue
 
-            # Prepare per-timestamp probability vector (optionally conditioned)
-            raw_vec = softmax_matrix[:, timestamp]
-            if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
-                # Determine which mode to use based on conditioning_n_prev_labels
-                if conditioning_n_prev_labels == 1 and bigram_map:
-                    # Legacy mode: single previous label with bigram_map
-                    prob_vec = adjust_probs_with_sequence_context(
-                        observed_probs=raw_vec,
-                        class_labels=[idx2label[i] for i in range(n_acts)],
-                        predicted_sequence=list(path_prefix),
-                        cond_prob_bigram=bigram_map,
-                        alpha=conditioning_alpha,
-                        combine_fn=conditioning_combine_fn,
-                        n_prev_labels=1,
-                    )
-                elif conditioning_n_prev_labels > 1 and prob_dict_uncollapsed is not None:
-                    # Extended mode: multiple previous labels with interpolation
-                    # Uses TWO dictionaries: uncollapsed for continuation, collapsed for transitions
-                    prob_vec = adjust_probs_with_sequence_context(
-                        observed_probs=raw_vec,
-                        class_labels=[idx2label[i] for i in range(n_acts)],
-                        predicted_sequence=list(path_prefix),
-                        prob_dict_uncollapsed=prob_dict_uncollapsed,
-                        prob_dict_collapsed=prob_dict_collapsed,
-                        alpha=conditioning_alpha,
-                        combine_fn=conditioning_combine_fn,
-                        n_prev_labels=conditioning_n_prev_labels,
-                        interpolation_weights=conditioning_interpolation_weights,
-                    )
+                # Update unlabeled best after acceptance
+                if cost < best_unlabeled[unlabeled_key]:
+                    best_unlabeled[unlabeled_key] = cost
+                states_expanded += 1
+
+                # Goal reached: consumed all timestamps
+                if timestamp == n_ts:
+                    # Reconstruct path from came_from
+                    alignment = []
+                    current_key = key
+                    while current_key in came_from:
+                        parent_key, move_type, move_label, move_cost = came_from[current_key]
+                        alignment.append((move_type, move_label, move_cost))
+                        current_key = parent_key
+                    alignment.reverse()
+
+                    result = {
+                        'alignment': alignment,
+                        'total_cost': cost,
+                        'final_marking': marking
+                    }
+                    profile_completed = True
+                    return result
+
+                enabled_calls += 1
+                enabled_scanned_transitions += len(self.transitions)
+                enabled = self._find_available_transitions(places)
+                enabled_total += len(enabled)
+
+                # Prepare per-timestamp probability vector (optionally conditioned)
+                raw_vec = softmax_matrix[:, timestamp]
+                if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
+                    conditioning_calls += 1
+                    # Determine which mode to use based on conditioning_n_prev_labels
+                    if conditioning_n_prev_labels == 1 and bigram_map:
+                        # Legacy mode: single previous label with bigram_map
+                        prob_vec = adjust_probs_with_sequence_context(
+                            observed_probs=raw_vec,
+                            class_labels=[idx2label[i] for i in range(n_acts)],
+                            predicted_sequence=list(path_prefix),
+                            cond_prob_bigram=bigram_map,
+                            alpha=conditioning_alpha,
+                            combine_fn=conditioning_combine_fn,
+                            n_prev_labels=1,
+                        )
+                    elif conditioning_n_prev_labels > 1 and prob_dict_uncollapsed is not None:
+                        # Extended mode: multiple previous labels with interpolation
+                        # Uses TWO dictionaries: uncollapsed for continuation, collapsed for transitions
+                        prob_vec = adjust_probs_with_sequence_context(
+                            observed_probs=raw_vec,
+                            class_labels=[idx2label[i] for i in range(n_acts)],
+                            predicted_sequence=list(path_prefix),
+                            prob_dict_uncollapsed=prob_dict_uncollapsed,
+                            prob_dict_collapsed=prob_dict_collapsed,
+                            alpha=conditioning_alpha,
+                            combine_fn=conditioning_combine_fn,
+                            n_prev_labels=conditioning_n_prev_labels,
+                            interpolation_weights=conditioning_interpolation_weights,
+                        )
+                    else:
+                        prob_vec = raw_vec
                 else:
                     prob_vec = raw_vec
-            else:
-                prob_vec = raw_vec
 
-            # Candidate pruning: always use conditioned probabilities (prob_vec).
-            # When conditioning is disabled, prob_vec == raw_vec.
-            cand_idx = _select_candidate_indices(prob_vec)
-            cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
+                # Candidate pruning: always use conditioned probabilities (prob_vec).
+                # When conditioning is disabled, prob_vec == raw_vec.
+                candidate_selection_calls += 1
+                cand_idx = _select_candidate_indices(prob_vec)
+                if cand_idx is not None:
+                    candidate_total += int(len(cand_idx))
+                cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
 
-            # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
-            for t in enabled:
-                # Skip labeled transitions if restricted to tau-only model moves
-                if restrict_model_moves_to_tau and t.label is not None:
-                    continue
-                tau_cost_total = 0.0
-                # Use macro transition if this transition comes from marking_transition_map
-                if (
-                    hasattr(self, "marking_transition_map")
-                    and self.marking_transition_map is not None
-                    and places in self.marking_transition_map
-                    and t in self.marking_transition_map[places]["available_transitions"]
-                ):
-                    # This transition requires τ-path firing; include τ costs
-                    tau_path = self.marking_transition_map[places]["available_transitions"][t]
-                    tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                    new_mark = self._fire_macro_transition(marking, t)
-                else:
-                    # This is a directly enabled transition
-                    new_mark = self._fire_transition(marking, t)
-                move_type = 'tau' if t.label is None else 'model'
-                c = cost_fn(0.0, move_type)
-                new_cost = cost + tau_cost_total + c
-                new_key = make_key(new_mark.places, timestamp, last_label, path_prefix)
-                new_base_key = (new_mark.places, timestamp, last_label) if use_last_label_in_state else (new_mark.places, timestamp)
-
-                # Dist-on-push: only push if this is a better path
-                if new_cost < dist.get(new_key, float('inf')):
-                    if not _apply_top_m(new_base_key, new_key, new_cost):
+                # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
+                model_edges_considered += len(enabled)
+                for t in enabled:
+                    # Skip labeled transitions if restricted to tau-only model moves
+                    if restrict_model_moves_to_tau and t.label is not None:
+                        model_moves_skipped_restrict += 1
                         continue
-                    dist[new_key] = new_cost
-                    came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
-                    marking_by_key[new_key] = new_mark
-                    heapq.heappush(open_set, (new_cost, counter, new_key))
-                    counter += 1
+                    tau_cost_total = 0.0
+                    # Use macro transition if this transition comes from marking_transition_map
+                    if (
+                        hasattr(self, "marking_transition_map")
+                        and self.marking_transition_map is not None
+                        and places in self.marking_transition_map
+                        and t in self.marking_transition_map[places]["available_transitions"]
+                    ):
+                        # This transition requires τ-path firing; include τ costs
+                        tau_path = self.marking_transition_map[places]["available_transitions"][t]
+                        tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
+                        new_mark = self._fire_macro_transition(marking, t)
+                        macro_fire_calls += 1
+                    else:
+                        # This is a directly enabled transition
+                        new_mark = self._fire_transition(marking, t)
+                        fire_transition_calls += 1
+                    move_type = 'tau' if t.label is None else 'model'
+                    c = cost_fn(0.0, move_type)
+                    new_cost = cost + tau_cost_total + c
+                    new_key = make_key(new_mark.places, timestamp, last_label, path_prefix)
+                    new_base_key = (new_mark.places, timestamp, last_label) if use_last_label_in_state else (new_mark.places, timestamp)
 
-            # 2) Log moves (advance timestamp without firing any transition)
-            if timestamp < n_ts:
-                # Determine which indices to consider for log moves
-                if restrict_log_moves:
-                    # Restricted mode: only allow top-1 probability + parent's last_label
-                    # This limits log moves to at most 2 options per timestamp
-                    # Use raw (observed) probabilities for top-1.
-                    top1_idx = int(np.argmax(raw_vec))
-                    restricted_indices = [top1_idx]
-                    if last_label is not None and last_label in label2idx:
-                        last_idx = label2idx[last_label]
-                        if last_idx not in restricted_indices:
-                            restricted_indices.append(last_idx)
-                    iter_indices = restricted_indices
-                elif cand_idx is None:
-                    iter_indices = range(n_acts)
-                else:
-                    iter_indices = cand_idx
+                    # Dist-on-push: only push if this is a better path
+                    model_relaxations += 1
+                    if new_cost < dist.get(new_key, float('inf')):
+                        if not _apply_top_m(new_base_key, new_key, new_cost):
+                            continue
+                        dist[new_key] = new_cost
+                        came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
+                        marking_by_key[new_key] = new_mark
+                        heapq.heappush(open_set, (new_cost, counter, new_key))
+                        heap_pushes += 1
+                        model_pushes += 1
+                        counter += 1
+                        if len(open_set) > max_heap_size:
+                            max_heap_size = len(open_set)
 
-                for idx in iter_indices:
+                # 2) Log moves (advance timestamp without firing any transition)
+                if timestamp < n_ts:
+                    # Determine which indices to consider for log moves
+                    if restrict_log_moves:
+                        # Restricted mode: only allow top-1 probability + parent's last_label
+                        # This limits log moves to at most 2 options per timestamp
+                        # Use raw (observed) probabilities for top-1.
+                        top1_idx = int(np.argmax(raw_vec))
+                        restricted_indices = [top1_idx]
+                        if last_label is not None and last_label in label2idx:
+                            last_idx = label2idx[last_label]
+                            if last_idx not in restricted_indices:
+                                restricted_indices.append(last_idx)
+                        iter_indices = restricted_indices
+                    elif cand_idx is None:
+                        iter_indices = range(n_acts)
+                    else:
+                        iter_indices = cand_idx
+
+                    for idx in iter_indices:
+                        log_edges_considered += 1
+                        p_adj = float(prob_vec[idx])
+                        # Filter out activities below threshold after adjustment
+                        if p_adj < eps:
+                            log_edges_below_eps += 1
+                            continue
+                        label = idx2label[int(idx)]
+                        p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
+                        c = cost_fn(p, 'log')
+                        # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
+                        add_switch = 0.0
+                        if switch_penalty_weight > 0.0 and last_label is not None and label != last_label and prob_dict_uncollapsed is not None:
+                            bigram_prefix = (last_label,)
+                            p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
+                            p_stay = max(min(p_stay, 1.0), 0.0)
+                            add_switch = switch_penalty_weight * p_stay
+
+                        new_cost = cost + c + add_switch
+                        new_path_prefix = (
+                            _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
+                            if use_conditioning_context
+                            else tuple()
+                        )
+                        new_key = make_key(places, timestamp + 1, label, new_path_prefix)
+                        new_base_key = (places, timestamp + 1, label) if use_last_label_in_state else (places, timestamp + 1)
+
+                        # Dist-on-push: only push if this is a better path
+                        log_relaxations += 1
+                        if new_cost < dist.get(new_key, float('inf')):
+                            if not _apply_top_m(new_base_key, new_key, new_cost):
+                                continue
+                            dist[new_key] = new_cost
+                            came_from[new_key] = (key, 'log', label, c + add_switch)
+                            marking_by_key[new_key] = marking
+                            heapq.heappush(open_set, (new_cost, counter, new_key))
+                            heap_pushes += 1
+                            log_pushes += 1
+                            counter += 1
+                            if len(open_set) > max_heap_size:
+                                max_heap_size = len(open_set)
+
+                # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
+                for t in enabled:
+                    sync_edges_considered += 1
+                    if t.label is None or t.label not in label2idx:
+                        continue
+                    idx = label2idx[t.label]
+                    # Allow parent's last_label for sync moves even if not in top-k
+                    if cand_idx_set is not None and int(idx) not in cand_idx_set:
+                        if last_label is None or t.label != last_label:
+                            sync_edges_skipped_candidate += 1
+                            continue
                     p_adj = float(prob_vec[idx])
                     # Filter out activities below threshold after adjustment
                     if p_adj < eps:
+                        sync_edges_below_eps += 1
                         continue
-                    label = idx2label[int(idx)]
+                    # no observed-move restriction
                     p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
-                    c = cost_fn(p, 'log')
+                    c = cost_fn(p, 'sync')
+
+                    tau_cost_total = 0.0
+
+                    # Use macro transition if this transition comes from marking_transition_map
+                    if (
+                        hasattr(self, "marking_transition_map")
+                        and self.marking_transition_map is not None
+                        and places in self.marking_transition_map
+                        and t in self.marking_transition_map[places]["available_transitions"]
+                    ):
+                        # This transition requires τ-path firing; include τ costs
+                        tau_path = self.marking_transition_map[places]["available_transitions"][t]
+                        tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
+                        new_mark = self._fire_macro_transition(marking, t)
+                        macro_fire_calls += 1
+                    else:
+                        # This is a directly enabled transition
+                        new_mark = self._fire_transition(marking, t)
+                        fire_transition_calls += 1
+
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
-                    if switch_penalty_weight > 0.0 and last_label is not None and label != last_label and prob_dict_uncollapsed is not None:
+                    if switch_penalty_weight > 0.0 and last_label is not None and t.label != last_label and prob_dict_uncollapsed is not None:
                         bigram_prefix = (last_label,)
                         p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
                         p_stay = max(min(p_stay, 1.0), 0.0)
                         add_switch = switch_penalty_weight * p_stay
 
-                    new_cost = cost + c + add_switch
+                    new_cost = cost + tau_cost_total + c + add_switch
                     new_path_prefix = (
-                        _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
+                        _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
                         if use_conditioning_context
                         else tuple()
                     )
-                    new_key = make_key(places, timestamp + 1, label, new_path_prefix)
-                    new_base_key = (places, timestamp + 1, label) if use_last_label_in_state else (places, timestamp + 1)
+                    new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix)
+                    new_base_key = (new_mark.places, timestamp + 1, t.label) if use_last_label_in_state else (new_mark.places, timestamp + 1)
 
                     # Dist-on-push: only push if this is a better path
+                    sync_relaxations += 1
                     if new_cost < dist.get(new_key, float('inf')):
                         if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
-                        came_from[new_key] = (key, 'log', label, c + add_switch)
-                        marking_by_key[new_key] = marking
+                        came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
+                        marking_by_key[new_key] = new_mark
                         heapq.heappush(open_set, (new_cost, counter, new_key))
+                        heap_pushes += 1
+                        sync_pushes += 1
                         counter += 1
+                        if len(open_set) > max_heap_size:
+                            max_heap_size = len(open_set)
 
-            # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
-            for t in enabled:
-                if t.label is None or t.label not in label2idx:
-                    continue
-                idx = label2idx[t.label]
-                # Allow parent's last_label for sync moves even if not in top-k
-                if cand_idx_set is not None and int(idx) not in cand_idx_set:
-                    if last_label is None or t.label != last_label:
-                        continue
-                p_adj = float(prob_vec[idx])
-                # Filter out activities below threshold after adjustment
-                if p_adj < eps:
-                    continue
-                # no observed-move restriction
-                p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
-                c = cost_fn(p, 'sync')
+                max_dist_size = max(max_dist_size, len(dist))
+                max_marking_by_key_size = max(max_marking_by_key_size, len(marking_by_key))
 
-                tau_cost_total = 0.0
+                # Periodic heap compaction: remove stale entries
+                iterations_since_compact += 1
+                if iterations_since_compact >= COMPACT_THRESHOLD and len(open_set) > COMPACT_THRESHOLD:
+                    # Filter out stale entries (where heap cost != dist[key])
+                    open_set = [(c, cnt, k) for c, cnt, k in open_set if dist.get(k, float('inf')) == c]
+                    heapq.heapify(open_set)
+                    heap_compactions += 1
+                    iterations_since_compact = 0
 
-                # Use macro transition if this transition comes from marking_transition_map
-                if (
-                    hasattr(self, "marking_transition_map")
-                    and self.marking_transition_map is not None
-                    and places in self.marking_transition_map
-                    and t in self.marking_transition_map[places]["available_transitions"]
-                ):
-                    # This transition requires τ-path firing; include τ costs
-                    tau_path = self.marking_transition_map[places]["available_transitions"][t]
-                    tau_cost_total = len(tau_path) * cost_fn(0.0, 'tau')
-                    new_mark = self._fire_macro_transition(marking, t)
-                else:
-                    # This is a directly enabled transition
-                    new_mark = self._fire_transition(marking, t)
-
-                # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
-                add_switch = 0.0
-                if switch_penalty_weight > 0.0 and last_label is not None and t.label != last_label and prob_dict_uncollapsed is not None:
-                    bigram_prefix = (last_label,)
-                    p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
-                    p_stay = max(min(p_stay, 1.0), 0.0)
-                    add_switch = switch_penalty_weight * p_stay
-
-                new_cost = cost + tau_cost_total + c + add_switch
-                new_path_prefix = (
-                    _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
-                    if use_conditioning_context
-                    else tuple()
-                )
-                new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix)
-                new_base_key = (new_mark.places, timestamp + 1, t.label) if use_last_label_in_state else (new_mark.places, timestamp + 1)
-
-                # Dist-on-push: only push if this is a better path
-                if new_cost < dist.get(new_key, float('inf')):
-                    if not _apply_top_m(new_base_key, new_key, new_cost):
-                        continue
-                    dist[new_key] = new_cost
-                    came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
-                    marking_by_key[new_key] = new_mark
-                    heapq.heappush(open_set, (new_cost, counter, new_key))
-                    counter += 1
-
-            # Periodic heap compaction: remove stale entries
-            iterations_since_compact += 1
-            if iterations_since_compact >= COMPACT_THRESHOLD and len(open_set) > COMPACT_THRESHOLD:
-                # Filter out stale entries (where heap cost != dist[key])
-                open_set = [(c, cnt, k) for c, cnt, k in open_set if dist.get(k, float('inf')) == c]
-                heapq.heapify(open_set)
-                iterations_since_compact = 0
-
-        raise ValueError("No conforming path found for the partial trace.")
+            profile_no_path = True
+            raise ValueError("No conforming path found for the partial trace.")
+        finally:
+            if profile_stats is not None:
+                profile_stats["partial_calls_started"] = profile_stats.get("partial_calls_started", 0) + 1
+                if profile_completed:
+                    profile_stats["partial_calls_completed"] = profile_stats.get("partial_calls_completed", 0) + 1
+                if profile_no_path:
+                    profile_stats["partial_calls_no_path"] = profile_stats.get("partial_calls_no_path", 0) + 1
+                profile_stats["partial_frames_total"] = profile_stats.get("partial_frames_total", 0) + int(n_ts)
+                profile_stats["partial_max_frames"] = max(profile_stats.get("partial_max_frames", 0), int(n_ts))
+                profile_stats["heap_pops"] = profile_stats.get("heap_pops", 0) + heap_pops
+                profile_stats["heap_pushes"] = profile_stats.get("heap_pushes", 0) + heap_pushes
+                profile_stats["stale_pops"] = profile_stats.get("stale_pops", 0) + stale_pops
+                profile_stats["missing_marking_pops"] = profile_stats.get("missing_marking_pops", 0) + missing_marking_pops
+                profile_stats["dominance_prunes"] = profile_stats.get("dominance_prunes", 0) + dominance_prunes
+                profile_stats["states_expanded"] = profile_stats.get("states_expanded", 0) + states_expanded
+                profile_stats["enabled_calls"] = profile_stats.get("enabled_calls", 0) + enabled_calls
+                profile_stats["enabled_total"] = profile_stats.get("enabled_total", 0) + enabled_total
+                profile_stats["enabled_scanned_transitions"] = profile_stats.get("enabled_scanned_transitions", 0) + enabled_scanned_transitions
+                profile_stats["conditioning_calls"] = profile_stats.get("conditioning_calls", 0) + conditioning_calls
+                profile_stats["candidate_selection_calls"] = profile_stats.get("candidate_selection_calls", 0) + candidate_selection_calls
+                profile_stats["candidate_total"] = profile_stats.get("candidate_total", 0) + candidate_total
+                profile_stats["model_edges_considered"] = profile_stats.get("model_edges_considered", 0) + model_edges_considered
+                profile_stats["model_moves_skipped_restrict"] = profile_stats.get("model_moves_skipped_restrict", 0) + model_moves_skipped_restrict
+                profile_stats["model_relaxations"] = profile_stats.get("model_relaxations", 0) + model_relaxations
+                profile_stats["model_pushes"] = profile_stats.get("model_pushes", 0) + model_pushes
+                profile_stats["log_edges_considered"] = profile_stats.get("log_edges_considered", 0) + log_edges_considered
+                profile_stats["log_edges_below_eps"] = profile_stats.get("log_edges_below_eps", 0) + log_edges_below_eps
+                profile_stats["log_relaxations"] = profile_stats.get("log_relaxations", 0) + log_relaxations
+                profile_stats["log_pushes"] = profile_stats.get("log_pushes", 0) + log_pushes
+                profile_stats["sync_edges_considered"] = profile_stats.get("sync_edges_considered", 0) + sync_edges_considered
+                profile_stats["sync_edges_skipped_candidate"] = profile_stats.get("sync_edges_skipped_candidate", 0) + sync_edges_skipped_candidate
+                profile_stats["sync_edges_below_eps"] = profile_stats.get("sync_edges_below_eps", 0) + sync_edges_below_eps
+                profile_stats["sync_relaxations"] = profile_stats.get("sync_relaxations", 0) + sync_relaxations
+                profile_stats["sync_pushes"] = profile_stats.get("sync_pushes", 0) + sync_pushes
+                profile_stats["fire_transition_calls"] = profile_stats.get("fire_transition_calls", 0) + fire_transition_calls
+                profile_stats["macro_fire_calls"] = profile_stats.get("macro_fire_calls", 0) + macro_fire_calls
+                profile_stats["topm_rejects"] = profile_stats.get("topm_rejects", 0) + topm_rejects
+                profile_stats["topm_evictions"] = profile_stats.get("topm_evictions", 0) + topm_evictions
+                profile_stats["heap_compactions"] = profile_stats.get("heap_compactions", 0) + heap_compactions
+                profile_stats["max_heap_size"] = max(profile_stats.get("max_heap_size", 0), max_heap_size)
+                profile_stats["max_dist_size"] = max(profile_stats.get("max_dist_size", 0), max_dist_size)
+                profile_stats["max_marking_by_key_size"] = max(profile_stats.get("max_marking_by_key_size", 0), max_marking_by_key_size)
+                profile_stats["last_open_set_size"] = len(open_set)
+                profile_stats["last_dist_size"] = len(dist)
+                profile_stats["last_marking_by_key_size"] = len(marking_by_key)
+                profile_stats["last_timestamp_seen"] = last_timestamp_seen
 
 
     def conformance_chunked(
@@ -1613,6 +1746,7 @@ class PetriNet:
         candidate_apply_to_sync: bool = True,
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
+        profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1721,6 +1855,7 @@ class PetriNet:
                     candidate_apply_to_sync=candidate_apply_to_sync,
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                    profile_stats=profile_stats,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
                 c1_steps = end_ts1 - start_ts
@@ -1781,6 +1916,7 @@ class PetriNet:
                 candidate_apply_to_sync=candidate_apply_to_sync,
                 restrict_log_moves=restrict_log_moves,
                 restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                profile_stats=profile_stats,
             )
             c2_elapsed = time.perf_counter() - c2_start
             c2_steps = end_ts2 - end_ts1
@@ -1816,6 +1952,7 @@ class PetriNet:
                     candidate_apply_to_sync=candidate_apply_to_sync,
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                    profile_stats=profile_stats,
                 )
                 m_elapsed = time.perf_counter() - m_start
                 m_steps = end_ts2 - start_ts
@@ -1925,6 +2062,7 @@ class PetriNet:
         candidate_apply_to_sync: bool = True,
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
+        profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1971,6 +2109,7 @@ class PetriNet:
             candidate_apply_to_sync=candidate_apply_to_sync,
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+            profile_stats=profile_stats,
         )
 
         # Extract sequence and costs from alignment

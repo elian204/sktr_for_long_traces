@@ -129,6 +129,7 @@ def build_base_config_for_fold(
     candidate_min_k: int,
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
+    enabled_cache_size: int,
     use_calibration: bool,
     workers: int,
     dataset_parallelization: bool,
@@ -183,6 +184,7 @@ def build_base_config_for_fold(
         "candidate_apply_to_sync": True,
         "restrict_log_moves": restrict_log_moves,
         "restrict_model_moves_to_tau": restrict_model_moves_to_tau,
+        "enabled_cache_size": enabled_cache_size,
     }
 
 
@@ -356,6 +358,12 @@ def main():
     parser.add_argument("--candidate-top-k", type=int, default=3)
     parser.add_argument("--candidate-top-p", type=float, default=1.0)
     parser.add_argument("--candidate-min-k", type=int, default=1)
+    parser.add_argument(
+        "--enabled-cache-size",
+        type=int,
+        default=100000,
+        help="Max PetriNet enabled-transition cache entries per worker.",
+    )
     parser.add_argument("--use-calibration", action="store_true")
     parser.add_argument("--inner-parallel", action="store_true")
     parser.add_argument("--workers", type=int, default=8)
@@ -463,6 +471,7 @@ def main():
                 candidate_min_k=args.candidate_min_k,
                 restrict_log_moves=False,
                 restrict_model_moves_to_tau=False,
+                enabled_cache_size=args.enabled_cache_size,
                 use_calibration=args.use_calibration,
                 workers=args.workers,
                 dataset_parallelization=args.inner_parallel,

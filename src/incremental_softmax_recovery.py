@@ -523,6 +523,7 @@ def incremental_softmax_recovery(
     adaptive_chunk_sizing: bool = False,
     max_chunk_size: int = 50,
     use_state_caching: bool = True,
+    enabled_cache_size: int = 10000,
     parallel_processing: bool = False,
     dataset_parallelization: bool = False,
     dataset_parallelization_context: Optional[str] = None,
@@ -558,6 +559,9 @@ def incremental_softmax_recovery(
         Otherwise, τ-reachability is cached on demand per marking.
     precompute_marking_transition_map : bool, default=False
         If True, eagerly build the complete marking-to-transition map.
+    enabled_cache_size : int, default=10000
+        Maximum number of direct enabled-transition cache entries on the Petri net.
+        Larger values preserve results but can trade memory for fewer prerequisite scans.
     parallel_processing : bool, default=False
         If True, processes test traces in parallel (trace-level parallelization).
         Each trace is processed independently by a separate worker. Results are collected
@@ -703,7 +707,7 @@ def incremental_softmax_recovery(
     # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
     model = discover_petri_net(train_df)
-    model.enable_caching(True)
+    model.enable_caching(True, max_size=enabled_cache_size)
     
     if save_model:
         try:
