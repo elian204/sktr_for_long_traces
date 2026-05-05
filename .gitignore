@@ -142,6 +142,8 @@ Thumbs.db
 
 # Logs
 *.log
+# Slurm / batch stderr (e.g. kfold_learning_curve_experiment job output)
+kfold*.err
 logs/ discovered_petri_net.pdf
 discovered_petri_net.png
 discovered_petri_net.pdf

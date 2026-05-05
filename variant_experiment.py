@@ -22,6 +22,15 @@ Configuration:
     Edit the CONFIGURATION section below to select dataset, model source, and experiment parameters.
 """
 
+from src.evaluation import compute_sktr_vs_argmax_metrics
+from src.incremental_softmax_recovery import incremental_softmax_recovery
+from src.utils import (
+    prepare_df, prepare_df_from_model, linear_prob_combiner,
+    get_variant_info, get_cases_for_variants, select_variants_for_experiment
+)
+from joblib import Parallel, delayed
+import seaborn as sns
+import matplotlib.pyplot as plt
 import math
 import os
 import sys
@@ -36,9 +45,6 @@ import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # Non-interactive backend for terminal/tmux
-import matplotlib.pyplot as plt
-import seaborn as sns
-from joblib import Parallel, delayed
 
 # =============================================================================
 # SETUP
@@ -49,12 +55,6 @@ workspace_root = '/home/dsi/eli-bogdanov/sktr_for_long_traces'
 if workspace_root not in sys.path:
     sys.path.insert(0, workspace_root)
 
-from src.utils import (
-    prepare_df, prepare_df_from_model, linear_prob_combiner,
-    get_variant_info, get_cases_for_variants, select_variants_for_experiment
-)
-from src.incremental_softmax_recovery import incremental_softmax_recovery
-from src.evaluation import compute_sktr_vs_argmax_metrics
 
 # Configure logging
 logging.basicConfig(
@@ -72,6 +72,7 @@ for mod in ['graphviz', 'matplotlib', 'PIL']:
 # COMMAND-LINE ARGUMENTS
 # =============================================================================
 
+
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -88,7 +89,7 @@ def parse_args():
     parser.add_argument(
         '-m', '--model',
         type=str,
-        choices=['asformer', 'mstcn2', 'original'],
+        choices=['asformer', 'mstcn2', 'diffact', 'original'],
         default='asformer',
         help='Model source for softmax predictions'
     )
@@ -140,6 +141,12 @@ def parse_args():
         help='Minimum probability threshold for pruning'
     )
     parser.add_argument(
+        '--model-move-cost',
+        type=float,
+        default=1.0,
+        help='Cost for labeled model moves'
+    )
+    parser.add_argument(
         '--candidate-top-k',
         type=int,
         default=15,
@@ -148,14 +155,24 @@ def parse_args():
     parser.add_argument(
         '--candidate-top-p',
         type=float,
-        default=0.9,
-        help='Cumulative probability cutoff for candidate labels (top-p)'
+        default=1.0,
+        help='Cumulative probability cutoff for candidate labels (top-p); 1.0 disables cutoff'
     )
     parser.add_argument(
         '--candidate-min-k',
         type=int,
         default=1,
         help='Minimum candidate labels per timestamp'
+    )
+    parser.add_argument(
+        '--restrict-log-moves',
+        action='store_true',
+        help='Restrict log moves to only top-1 observed probability + parent\'s last label (max 2 log moves per timestamp)'
+    )
+    parser.add_argument(
+        '--restrict-model-moves-to-tau',
+        action='store_true',
+        help='Restrict model moves to only tau (silent) transitions'
     )
     parser.add_argument(
         '-p', '--parallel-runs',
@@ -196,9 +213,12 @@ if __name__ == '__main__':
     CHUNK_SIZE = args.chunk_size
     N_PARALLEL_RUNS = args.parallel_runs
     PROB_THRESHOLD = args.prob_threshold
+    MODEL_MOVE_COST = args.model_move_cost
     CANDIDATE_TOP_K = args.candidate_top_k
     CANDIDATE_TOP_P = args.candidate_top_p
     CANDIDATE_MIN_K = args.candidate_min_k
+    RESTRICT_LOG_MOVES = args.restrict_log_moves
+    RESTRICT_MODEL_MOVES_TO_TAU = args.restrict_model_moves_to_tau
     UNIQUE_TRAIN_VARIANTS = args.unique_train_variants
     UNIQUE_TEST_VARIANTS = args.unique_test_variants
 else:
@@ -214,9 +234,12 @@ else:
     CHUNK_SIZE = 11
     N_PARALLEL_RUNS = 1
     PROB_THRESHOLD = 1e-6
+    MODEL_MOVE_COST = 1.0
     CANDIDATE_TOP_K = 15
-    CANDIDATE_TOP_P = 0.9
+    CANDIDATE_TOP_P = 1.0
     CANDIDATE_MIN_K = 1
+    RESTRICT_LOG_MOVES = False
+    RESTRICT_MODEL_MOVES_TO_TAU = False
     UNIQUE_TRAIN_VARIANTS = False
     UNIQUE_TEST_VARIANTS = False
 
@@ -300,8 +323,8 @@ def build_base_config() -> dict:
         'prob_threshold': PROB_THRESHOLD, 'chunk_size': CHUNK_SIZE, 'conformance_switch_penalty_weight': 1.0,
         'merge_mismatched_boundaries': False, 'conditioning_combine_fn': linear_prob_combiner,
         'max_hist_len': 3, 'conditioning_n_prev_labels': 3, 'use_collapsed_runs': True,
-        'cost_function': 'linear', 'model_move_cost': 1.0, 'log_move_cost': 1.0,
-        'tau_move_cost': 0.0, 'non_sync_penalty': 1.0,
+        'cost_function': 'linear', 'model_move_cost': MODEL_MOVE_COST, 'log_move_cost': 1.0,
+        'tau_move_cost': 1e-6, 'non_sync_penalty': 1.0,
         'use_calibration': True, 'temp_bounds': (1.0, 10.0), 'temperature': None,
         'verbose': True, 'log_level': logging.INFO, 'round_precision': 2,
         'random_seed': RANDOM_SEED,
@@ -309,6 +332,8 @@ def build_base_config() -> dict:
         'save_model': False,
         'parallel_processing': False,
         'dataset_parallelization': DATASET_PARALLELIZATION,
+        # Use 'spawn' if outer Parallel has n_jobs>1
+        'dataset_parallelization_context': None,
         'max_workers': N_DATASET_WORKERS,
         # Conditioning history mode
         'conditioning_state_mode': CONDITIONING_STATE_MODE,
@@ -317,8 +342,12 @@ def build_base_config() -> dict:
         'candidate_top_p': CANDIDATE_TOP_P,
         'candidate_top_k': CANDIDATE_TOP_K,
         'candidate_min_k': CANDIDATE_MIN_K,
-        'candidate_source': 'observed',
+        'candidate_source': 'conditioned',
         'candidate_apply_to_sync': True,
+        # Restrict log moves to top-1 + parent's last_label
+        'restrict_log_moves': RESTRICT_LOG_MOVES,
+        # Restrict model moves to tau-only
+        'restrict_model_moves_to_tau': RESTRICT_MODEL_MOVES_TO_TAU,
     }
 
 
@@ -375,7 +404,8 @@ def check_existing_result(results_dir: Path, dataset_name: str, model_source: st
         )
         return metrics
     except Exception as e:
-        print(f"  Warning: Could not load existing result from {csv_path}: {e}")
+        print(
+            f"  Warning: Could not load existing result from {csv_path}: {e}")
         return None
 
 
@@ -453,7 +483,7 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
     avg_time_per_trace = total_time / n_test if n_test > 0 else 0
 
     filename = build_result_filename(dataset_name, model_source, prefix, alpha, strategy,
-                                      unique_train, unique_test)
+                                     unique_train, unique_test)
     csv_path = results_dir / filename
     results_df.to_csv(csv_path, index=False)
     meta_path = _result_meta_path(csv_path)
@@ -473,7 +503,8 @@ def run_single_experiment(n_train_variants, train_cases, test_cases, alpha, stra
         dataset_name=dataset_name,
     )
 
-    print(f"  -> Time: {total_time:.1f}s total, {avg_time_per_trace:.2f}s/trace ({n_test} traces)")
+    print(
+        f"  -> Time: {total_time:.1f}s total, {avg_time_per_trace:.2f}s/trace ({n_test} traces)")
 
     return {
         'n_train_variants': n_train_variants,
@@ -526,7 +557,8 @@ def plot_sweep_results(sweep_summary_df: pd.DataFrame, results_dir: Path,
         y_max = sweep_summary_df[plot_cols].max().max()
         y_lower = math.floor(y_min / 10) * 10
         y_max = max(y_max, 80)
-        tick_start = min(y_lower, 50)  # Start from 50 or lower if data goes below
+        # Start from 50 or lower if data goes below
+        tick_start = min(y_lower, 50)
         tick_end = math.ceil(y_max / 10) * 10
         y_limits = (tick_start, tick_end)
         y_ticks = list(range(int(tick_start), int(tick_end) + 1, 10))
@@ -599,12 +631,15 @@ if __name__ == '__main__':
     print("Configuration:")
     print(f"  Dataset: {DATASET_NAME}")
     print(f"  Model Source: {MODEL_SOURCE}")
-    print(f"  State Mode: {CONDITIONING_STATE_MODE} (top_m={CONDITIONING_TOP_M})")
+    print(
+        f"  State Mode: {CONDITIONING_STATE_MODE} (top_m={CONDITIONING_TOP_M})")
     print(f"  Chunk Size: {CHUNK_SIZE}")
     print(f"  Prob Threshold: {PROB_THRESHOLD}")
     print(f"  Candidate Top-K: {CANDIDATE_TOP_K}")
     print(f"  Candidate Top-P: {CANDIDATE_TOP_P}")
     print(f"  Candidate Min-K: {CANDIDATE_MIN_K}")
+    print(f"  Restrict Log Moves: {RESTRICT_LOG_MOVES}")
+    print(f"  Restrict Model Moves to Tau: {RESTRICT_MODEL_MOVES_TO_TAU}")
     print(f"  Workers: {N_DATASET_WORKERS}")
     print(f"  Parallel HP runs: {N_PARALLEL_RUNS}")
     print(f"  Skip HP Search: {SKIP_HP_SEARCH}")
@@ -630,7 +665,8 @@ if __name__ == '__main__':
     print(f"  Unique variants: {n_unique_variants}")
 
     # Setup results directory
-    results_dir = Path(workspace_root) / 'results' / DATASET_NAME / 'variant_experiment' / MODEL_SOURCE
+    results_dir = Path(workspace_root) / 'results' / \
+        DATASET_NAME / 'variant_experiment' / MODEL_SOURCE
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"\nResults directory: {results_dir}")
 
@@ -642,18 +678,22 @@ if __name__ == '__main__':
     print("Base config ready.")
 
     # Check if we need variant-based selection for this dataset
-    use_variant_selection = USE_VARIANT_BASED_SELECTION.get(DATASET_NAME, False)
+    use_variant_selection = USE_VARIANT_BASED_SELECTION.get(
+        DATASET_NAME, False)
     n_jobs = N_PARALLEL_RUNS if N_PARALLEL_RUNS is not None else -1
 
     # Warn if unique variant flags are set but not applicable
     if (UNIQUE_TRAIN_VARIANTS or UNIQUE_TEST_VARIANTS) and not use_variant_selection:
-        print(f"\nWarning: --unique-train/test-variants has no effect for {DATASET_NAME}")
+        print(
+            f"\nWarning: --unique-train/test-variants has no effect for {DATASET_NAME}")
         print(f"  (Each trace is already unique in this dataset)")
     else:
         if UNIQUE_TRAIN_VARIANTS:
-            print(f"\nUnique train variants mode: Training on {n_unique_variants} representative videos only")
+            print(
+                f"\nUnique train variants mode: Training on {n_unique_variants} representative videos only")
         if UNIQUE_TEST_VARIANTS:
-            print(f"\nUnique test variants mode: Testing on {n_unique_variants} representative videos only")
+            print(
+                f"\nUnique test variants mode: Testing on {n_unique_variants} representative videos only")
 
     experiment_config = {
         'dataset': DATASET_NAME,
@@ -668,9 +708,12 @@ if __name__ == '__main__':
         'top_m': CONDITIONING_TOP_M,
         'chunk_size': CHUNK_SIZE,
         'prob_threshold': PROB_THRESHOLD,
+        'model_move_cost': MODEL_MOVE_COST,
         'candidate_top_k': CANDIDATE_TOP_K,
         'candidate_top_p': CANDIDATE_TOP_P,
         'candidate_min_k': CANDIDATE_MIN_K,
+        'restrict_log_moves': RESTRICT_LOG_MOVES,
+        'restrict_model_moves_to_tau': RESTRICT_MODEL_MOVES_TO_TAU,
         'workers': N_DATASET_WORKERS,
         'skip_hp_search': SKIP_HP_SEARCH,
         'train_variant_sweep': TRAIN_VARIANT_SWEEP.get(DATASET_NAME, list(range(1, 11))),
@@ -719,8 +762,10 @@ if __name__ == '__main__':
 
             print(f"Hyperparameter Search Setup (variant-based selection):")
             print(f"  Training variants: {HP_N_VARIANTS}")
-            print(f"  Training traces: {len(hp_train_cases)} ({'unique' if UNIQUE_TRAIN_VARIANTS else 'all'})")
-            print(f"  Test traces: {len(hp_test_cases)} ({'unique' if UNIQUE_TEST_VARIANTS else 'all'})")
+            print(
+                f"  Training traces: {len(hp_train_cases)} ({'unique' if UNIQUE_TRAIN_VARIANTS else 'all'})")
+            print(
+                f"  Test traces: {len(hp_test_cases)} ({'unique' if UNIQUE_TEST_VARIANTS else 'all'})")
             print(f"  Variant selection mode: {VARIANT_SELECTION_MODE}")
         else:
             # Standard: use n_train_traces directly, test on all
@@ -757,11 +802,14 @@ if __name__ == '__main__':
             for i, (n_variants, train_cases, test_cases, alpha, strategy, weights) in enumerate(hp_params, 1)
         )
 
-        hp_summary_df = pd.DataFrame(hp_results).sort_values('sktr_acc', ascending=False)
+        hp_summary_df = pd.DataFrame(hp_results).sort_values(
+            'sktr_acc', ascending=False)
         rank_metrics = ['sktr_acc', 'sktr_edit', 'sktr_f1@25']
-        ranks = hp_summary_df[rank_metrics].rank(ascending=False, method='average')
+        ranks = hp_summary_df[rank_metrics].rank(
+            ascending=False, method='average')
         hp_summary_df['avg_rank'] = ranks.mean(axis=1)
-        hp_summary_path = hp_results_dir / f"{DATASET_NAME}_{MODEL_SOURCE}_hp_search_summary.csv"
+        hp_summary_path = hp_results_dir / \
+            f"{DATASET_NAME}_{MODEL_SOURCE}_hp_search_summary.csv"
         hp_summary_df.to_csv(hp_summary_path, index=False)
         print(f"\nSaved: {hp_summary_path}")
 
@@ -775,7 +823,8 @@ if __name__ == '__main__':
                    .sort_values(['avg_rank', 'sktr_acc'], ascending=[True, False])
                    .iloc[0]
                    .to_dict())
-        print(f"\nBest hyperparameters (avg-rank on {', '.join(rank_metrics)}):")
+        print(
+            f"\nBest hyperparameters (avg-rank on {', '.join(rank_metrics)}):")
         print(f"  Alpha: {best_hp['alpha']}")
         print(f"  Strategy: {best_hp['strategy']}")
         print(f"  SKTR Accuracy: {best_hp['sktr_acc']:.4f}")
@@ -805,17 +854,21 @@ if __name__ == '__main__':
         y_max = hp_summary_df[plot_cols].max().max()
         y_lower = math.floor(y_min / 10) * 10
         y_max = max(y_max, 80)
-        tick_start = min(y_lower, 50)  # Start from 50 or lower if data goes below
+        # Start from 50 or lower if data goes below
+        tick_start = min(y_lower, 50)
         tick_end = math.ceil(y_max / 10) * 10
         y_limits = (tick_start, tick_end)
         y_ticks = list(range(int(tick_start), int(tick_end) + 1, 10))
 
         for ax, metric in zip(axes, plot_cols):
-            pivot = hp_summary_df.pivot(index='alpha', columns='strategy', values=metric)
+            pivot = hp_summary_df.pivot(
+                index='alpha', columns='strategy', values=metric)
             pivot.plot(kind='bar', ax=ax, rot=0)
             ax.set_xlabel('Alpha')
-            ax.set_ylabel(metric.replace('sktr_', '').replace('_', ' ').title())
-            ax.set_title(f'SKTR {metric.replace("sktr_", "").replace("_", " ").title()}')
+            ax.set_ylabel(metric.replace(
+                'sktr_', '').replace('_', ' ').title())
+            ax.set_title(
+                f'SKTR {metric.replace("sktr_", "").replace("_", " ").title()}')
             ax.legend(title='Strategy', fontsize=8)
             ax.grid(True, alpha=0.3, axis='y')
             if y_limits is not None:
@@ -826,8 +879,10 @@ if __name__ == '__main__':
         plt.suptitle(f'Hyperparameter Search Results ({DATASET_NAME} - {MODEL_SOURCE})',
                      fontsize=14, fontweight='bold')
         plt.tight_layout(rect=[0, 0, 1, 0.96])  # Leave room for suptitle
-        plt.savefig(hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png', dpi=150, bbox_inches='tight')
-        print(f"Saved plot: {hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png'}")
+        plt.savefig(
+            hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png', dpi=150, bbox_inches='tight')
+        print(
+            f"Saved plot: {hp_results_dir / f'{DATASET_NAME}_{MODEL_SOURCE}_hp_search_plots.png'}")
         plt.close()
 
     # =========================================================================
@@ -843,7 +898,8 @@ if __name__ == '__main__':
     FINAL_WEIGHTS = HP_STRATEGIES[best_hp['strategy']]
 
     # Get sweep range for this dataset
-    sweep_variant_counts = TRAIN_VARIANT_SWEEP.get(DATASET_NAME, list(range(1, 11)))
+    sweep_variant_counts = TRAIN_VARIANT_SWEEP.get(
+        DATASET_NAME, list(range(1, 11)))
 
     print(f"Final Experiment Configuration:")
     print(f"  Alpha: {FINAL_ALPHA}")
@@ -879,7 +935,8 @@ if __name__ == '__main__':
         else:
             train_cases = None
             test_cases = None
-        sweep_params.append((n_variants, train_cases, test_cases, FINAL_ALPHA, FINAL_STRATEGY, FINAL_WEIGHTS))
+        sweep_params.append((n_variants, train_cases, test_cases,
+                            FINAL_ALPHA, FINAL_STRATEGY, FINAL_WEIGHTS))
 
     print(f"\nRunning {len(sweep_params)} sweep experiments...")
     print("=" * 60)
@@ -894,11 +951,14 @@ if __name__ == '__main__':
         for i, (n_variants, train_cases, test_cases, alpha, strategy, weights) in enumerate(sweep_params, 1)
     )
 
-    sweep_summary_df = pd.DataFrame(sweep_results).sort_values('n_train_variants')
-    sweep_summary_path = final_results_dir / f"{DATASET_NAME}_{MODEL_SOURCE}_sweep_summary.csv"
+    sweep_summary_df = pd.DataFrame(
+        sweep_results).sort_values('n_train_variants')
+    sweep_summary_path = final_results_dir / \
+        f"{DATASET_NAME}_{MODEL_SOURCE}_sweep_summary.csv"
     sweep_summary_df.to_csv(sweep_summary_path, index=False)
     print(f"\nSaved: {sweep_summary_path}")
-    write_experiment_config(final_results_dir, experiment_config, 'experiment_config.json')
+    write_experiment_config(
+        final_results_dir, experiment_config, 'experiment_config.json')
 
     # Display sweep results
     print("\nTraining Sweep Results:\n")
@@ -911,7 +971,8 @@ if __name__ == '__main__':
     print(sweep_summary_df[display_cols].to_string())
 
     # Visualization
-    plot_sweep_results(sweep_summary_df, final_results_dir, DATASET_NAME, MODEL_SOURCE)
+    plot_sweep_results(sweep_summary_df, final_results_dir,
+                       DATASET_NAME, MODEL_SOURCE)
 
     # Improvement analysis
     analysis = sweep_summary_df.copy()
@@ -920,23 +981,30 @@ if __name__ == '__main__':
     analysis['f1@25_gain'] = analysis['sktr_f1@25'] - analysis['argmax_f1@25']
 
     print("\nSKTR Improvement over Argmax:")
-    print(f"  Accuracy:  mean={analysis['acc_gain'].mean():+.4f}, max={analysis['acc_gain'].max():+.4f}")
-    print(f"  Edit:      mean={analysis['edit_gain'].mean():+.4f}, max={analysis['edit_gain'].max():+.4f}")
-    print(f"  F1@25:     mean={analysis['f1@25_gain'].mean():+.4f}, max={analysis['f1@25_gain'].max():+.4f}")
+    print(
+        f"  Accuracy:  mean={analysis['acc_gain'].mean():+.4f}, max={analysis['acc_gain'].max():+.4f}")
+    print(
+        f"  Edit:      mean={analysis['edit_gain'].mean():+.4f}, max={analysis['edit_gain'].max():+.4f}")
+    print(
+        f"  F1@25:     mean={analysis['f1@25_gain'].mean():+.4f}, max={analysis['f1@25_gain'].max():+.4f}")
 
     # Timing summary
     if 'avg_time_per_trace_sec' in sweep_summary_df.columns:
         valid_times = sweep_summary_df['avg_time_per_trace_sec'].dropna()
         if len(valid_times) > 0:
             print(f"\nTiming Summary:")
-            print(f"  Avg time per trace: {valid_times.mean():.3f}s (min={valid_times.min():.3f}s, max={valid_times.max():.3f}s)")
+            print(
+                f"  Avg time per trace: {valid_times.mean():.3f}s (min={valid_times.min():.3f}s, max={valid_times.max():.3f}s)")
             total_times = sweep_summary_df['total_time_sec'].dropna()
             if len(total_times) > 0:
-                print(f"  Total experiment time: {total_times.sum():.1f}s ({total_times.sum()/60:.1f} min)")
+                print(
+                    f"  Total experiment time: {total_times.sum():.1f}s ({total_times.sum()/60:.1f} min)")
 
     best_idx = analysis['sktr_acc'].idxmax()
-    best_n_variants = analysis.loc[best_idx, 'n_train_variants'] if 'n_train_variants' in analysis.columns else analysis.loc[best_idx, 'n_train_traces']
-    print(f"\nBest SKTR accuracy: {analysis.loc[best_idx, 'sktr_acc']:.4f} at n_train_variants={best_n_variants}")
+    best_n_variants = analysis.loc[best_idx,
+                                   'n_train_variants'] if 'n_train_variants' in analysis.columns else analysis.loc[best_idx, 'n_train_traces']
+    print(
+        f"\nBest SKTR accuracy: {analysis.loc[best_idx, 'sktr_acc']:.4f} at n_train_variants={best_n_variants}")
 
     print("\n" + "=" * 70)
     print("Experiment Complete!")

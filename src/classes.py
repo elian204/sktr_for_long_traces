@@ -1141,8 +1141,12 @@ class PetriNet:
         candidate_top_p: Optional[float] = None,
         candidate_top_k: Optional[int] = None,
         candidate_min_k: int = 1,
-        candidate_source: str = "auto",  # "auto" | "observed" | "conditioned"
+        candidate_source: str = "conditioned",  # Deprecated: candidates always use conditioned probs
         candidate_apply_to_sync: bool = True,
+        # Restricted log moves: only allow top-1 probability + parent's last_label
+        restrict_log_moves: bool = False,
+        # Restricted model moves: only allow tau (silent) transitions
+        restrict_model_moves_to_tau: bool = False,
     ) -> Dict[str, Any]:
         """
         Compute a partial trace conformance alignment using Dijkstra/A*-style search.
@@ -1414,20 +1418,16 @@ class PetriNet:
             else:
                 prob_vec = raw_vec
 
-            # Candidate pruning: pick a bounded label set for log (and optionally sync) moves.
-            # Note: if conditioning is active and candidate_source is "conditioned"/"auto",
-            # this selection can differ across paths (because prob_vec depends on history).
-            source = (candidate_source or "auto").lower()
-            if source not in ("auto", "observed", "conditioned"):
-                raise ValueError("candidate_source must be one of: auto, observed, conditioned")
-            if source == "observed" or (source == "auto" and conditioning_alpha is None):
-                cand_idx = _select_candidate_indices(raw_vec)
-            else:
-                cand_idx = _select_candidate_indices(prob_vec)
+            # Candidate pruning: always use conditioned probabilities (prob_vec).
+            # When conditioning is disabled, prob_vec == raw_vec.
+            cand_idx = _select_candidate_indices(prob_vec)
             cand_idx_set = set(map(int, cand_idx)) if cand_idx is not None and candidate_apply_to_sync else None
 
             # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
             for t in enabled:
+                # Skip labeled transitions if restricted to tau-only model moves
+                if restrict_model_moves_to_tau and t.label is not None:
+                    continue
                 tau_cost_total = 0.0
                 # Use macro transition if this transition comes from marking_transition_map
                 if (
@@ -1461,7 +1461,19 @@ class PetriNet:
 
             # 2) Log moves (advance timestamp without firing any transition)
             if timestamp < n_ts:
-                if cand_idx is None:
+                # Determine which indices to consider for log moves
+                if restrict_log_moves:
+                    # Restricted mode: only allow top-1 probability + parent's last_label
+                    # This limits log moves to at most 2 options per timestamp
+                    # Use raw (observed) probabilities for top-1.
+                    top1_idx = int(np.argmax(raw_vec))
+                    restricted_indices = [top1_idx]
+                    if last_label is not None and last_label in label2idx:
+                        last_idx = label2idx[last_label]
+                        if last_idx not in restricted_indices:
+                            restricted_indices.append(last_idx)
+                    iter_indices = restricted_indices
+                elif cand_idx is None:
                     iter_indices = range(n_acts)
                 else:
                     iter_indices = cand_idx
@@ -1506,8 +1518,10 @@ class PetriNet:
                 if t.label is None or t.label not in label2idx:
                     continue
                 idx = label2idx[t.label]
+                # Allow parent's last_label for sync moves even if not in top-k
                 if cand_idx_set is not None and int(idx) not in cand_idx_set:
-                    continue
+                    if last_label is None or t.label != last_label:
+                        continue
                 p_adj = float(prob_vec[idx])
                 # Filter out activities below threshold after adjustment
                 if p_adj < eps:
@@ -1595,8 +1609,10 @@ class PetriNet:
         candidate_top_p: Optional[float] = None,
         candidate_top_k: Optional[int] = None,
         candidate_min_k: int = 1,
-        candidate_source: str = "auto",
+        candidate_source: str = "conditioned",
         candidate_apply_to_sync: bool = True,
+        restrict_log_moves: bool = False,
+        restrict_model_moves_to_tau: bool = False,
     ) -> Dict[str, Any]:
         """
         Process softmax_matrix in sequential chunks, calling partial_trace_conformance
@@ -1703,6 +1719,8 @@ class PetriNet:
                     candidate_min_k=candidate_min_k,
                     candidate_source=candidate_source,
                     candidate_apply_to_sync=candidate_apply_to_sync,
+                    restrict_log_moves=restrict_log_moves,
+                    restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
                 c1_steps = end_ts1 - start_ts
@@ -1761,6 +1779,8 @@ class PetriNet:
                 candidate_min_k=candidate_min_k,
                 candidate_source=candidate_source,
                 candidate_apply_to_sync=candidate_apply_to_sync,
+                restrict_log_moves=restrict_log_moves,
+                restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             )
             c2_elapsed = time.perf_counter() - c2_start
             c2_steps = end_ts2 - end_ts1
@@ -1794,6 +1814,8 @@ class PetriNet:
                     candidate_min_k=candidate_min_k,
                     candidate_source=candidate_source,
                     candidate_apply_to_sync=candidate_apply_to_sync,
+                    restrict_log_moves=restrict_log_moves,
+                    restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                 )
                 m_elapsed = time.perf_counter() - m_start
                 m_steps = end_ts2 - start_ts
@@ -1899,8 +1921,10 @@ class PetriNet:
         candidate_top_p: Optional[float] = None,
         candidate_top_k: Optional[int] = None,
         candidate_min_k: int = 1,
-        candidate_source: str = "auto",
+        candidate_source: str = "conditioned",
         candidate_apply_to_sync: bool = True,
+        restrict_log_moves: bool = False,
+        restrict_model_moves_to_tau: bool = False,
     ) -> Tuple[List[str], List[float]]:
         """
         Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
@@ -1945,9 +1969,10 @@ class PetriNet:
             candidate_min_k=candidate_min_k,
             candidate_source=candidate_source,
             candidate_apply_to_sync=candidate_apply_to_sync,
-            # no observed restriction
+            restrict_log_moves=restrict_log_moves,
+            restrict_model_moves_to_tau=restrict_model_moves_to_tau,
         )
-        
+
         # Extract sequence and costs from alignment
         predicted_sequence = []
         move_costs = []

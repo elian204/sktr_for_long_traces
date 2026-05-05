@@ -13,6 +13,7 @@ import numpy as np
 import concurrent.futures
 import multiprocessing
 import pickle
+import time
 from .utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from .data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from .petri_model import discover_petri_net, build_probability_dict
@@ -31,6 +32,7 @@ _WORKER_COST_FN = None
 _WORKER_PROB_UNCOLLAPSED = None
 _WORKER_PROB_COLLAPSED = None
 _WORKER_SETTINGS: Dict[str, Any] = {}
+_TAU_MOVE_COST_FORCED = 1e-6
 
 
 def _init_trace_worker(
@@ -44,6 +46,7 @@ def _init_trace_worker(
     global _WORKER_MODEL, _WORKER_COST_FN, _WORKER_PROB_UNCOLLAPSED, _WORKER_PROB_COLLAPSED, _WORKER_SETTINGS
 
     cost_function, model_move_cost, log_move_cost, tau_move_cost, round_precision = cost_fn_params
+    tau_move_cost = _TAU_MOVE_COST_FORCED
     _WORKER_MODEL = pickle.loads(model_pickled)
     _WORKER_COST_FN = make_cost_function(
         base=cost_function,
@@ -92,8 +95,10 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         candidate_top_p=_WORKER_SETTINGS.get('candidate_top_p'),
         candidate_top_k=_WORKER_SETTINGS.get('candidate_top_k'),
         candidate_min_k=_WORKER_SETTINGS.get('candidate_min_k', 1),
-        candidate_source=_WORKER_SETTINGS.get('candidate_source', "auto"),
+        candidate_source=_WORKER_SETTINGS.get('candidate_source', "conditioned"),
         candidate_apply_to_sync=_WORKER_SETTINGS.get('candidate_apply_to_sync', True),
+        restrict_log_moves=_WORKER_SETTINGS.get('restrict_log_moves', False),
+        restrict_model_moves_to_tau=_WORKER_SETTINGS.get('restrict_model_moves_to_tau', False),
     )
 
     # Compute accuracy
@@ -218,6 +223,8 @@ def _process_single_test_case(
     candidate_min_k: int,
     candidate_source: str,
     candidate_apply_to_sync: bool,
+    restrict_log_moves: bool,
+    restrict_model_moves_to_tau: bool,
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -225,6 +232,7 @@ def _process_single_test_case(
     Returns:
         Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy, records_df)
     """
+    tau_move_cost = _TAU_MOVE_COST_FORCED
     # Unpickle model and recreate cost function (needed for multiprocessing compatibility)
     model = pickle.loads(model_pickled)
     cost_fn = make_cost_function(
@@ -263,6 +271,8 @@ def _process_single_test_case(
         candidate_min_k=candidate_min_k,
         candidate_source=candidate_source,
         candidate_apply_to_sync=candidate_apply_to_sync,
+        restrict_log_moves=restrict_log_moves,
+        restrict_model_moves_to_tau=restrict_model_moves_to_tau,
     )
 
     # Compute accuracy
@@ -308,6 +318,8 @@ def _process_test_chunk(
     candidate_min_k: int,
     candidate_source: str,
     candidate_apply_to_sync: bool,
+    restrict_log_moves: bool,
+    restrict_model_moves_to_tau: bool,
 ) -> Tuple[List[dict], List[float], List[float]]:
     """
     Process a chunk of test cases using conformance checking. Used for dataset-level parallel processing.
@@ -360,6 +372,7 @@ def _process_test_chunk(
     Tuple[List[dict], List[float], List[float]]
         Tuple of (recovery_records, sktr_accs, argmax_accs) for this chunk
     """
+    tau_move_cost = _TAU_MOVE_COST_FORCED
     # Unpickle model
     model = pickle.loads(model_pickled)
     
@@ -377,9 +390,24 @@ def _process_test_chunk(
     sktr_accs = []
     argmax_accs = []
     
-    for case_id, softmax_matrix, ground_truth_sequence in zip(
-        chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences
+    logger.info(
+        "Starting dataset chunk with %d case(s): %s",
+        len(chunk_case_ids),
+        [str(case_id) for case_id in chunk_case_ids],
+    )
+
+    for local_idx, (case_id, softmax_matrix, ground_truth_sequence) in enumerate(
+        zip(chunk_case_ids, chunk_softmax_matrices, chunk_ground_truth_sequences),
+        start=1,
     ):
+        case_start = time.perf_counter()
+        logger.info(
+            "Chunk case %d/%d (%s): start, frames=%d",
+            local_idx,
+            len(chunk_case_ids),
+            case_id,
+            softmax_matrix.shape[1],
+        )
         # Argmax predictions
         argmax_indices = np.argmax(softmax_matrix, axis=0)
         argmax_preds = [str(idx) for idx in argmax_indices]
@@ -408,6 +436,8 @@ def _process_test_chunk(
             candidate_min_k=candidate_min_k,
             candidate_source=candidate_source,
             candidate_apply_to_sync=candidate_apply_to_sync,
+            restrict_log_moves=restrict_log_moves,
+            restrict_model_moves_to_tau=restrict_model_moves_to_tau,
         )
 
         # Compute accuracy
@@ -424,6 +454,22 @@ def _process_test_chunk(
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
         argmax_accs.append(argmax_acc)
+        logger.info(
+            "Chunk case %d/%d (%s): done in %.3fs, SKTR=%.3f, Argmax=%.3f, records=%d",
+            local_idx,
+            len(chunk_case_ids),
+            case_id,
+            time.perf_counter() - case_start,
+            sktr_acc,
+            argmax_acc,
+            len(records_df),
+        )
+
+    logger.info(
+        "Finished dataset chunk with %d case(s): %s",
+        len(chunk_case_ids),
+        [str(case_id) for case_id in chunk_case_ids],
+    )
     
     return recovery_records, sktr_accs, argmax_accs
 
@@ -469,14 +515,17 @@ def incremental_softmax_recovery(
     candidate_top_p: Optional[float] = None,
     candidate_top_k: Optional[int] = None,
     candidate_min_k: int = 1,
-    candidate_source: str = "auto",
+    candidate_source: str = "conditioned",
     candidate_apply_to_sync: bool = True,
+    restrict_log_moves: bool = False,
+    restrict_model_moves_to_tau: bool = False,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = False,
     max_chunk_size: int = 50,
     use_state_caching: bool = True,
     parallel_processing: bool = False,
     dataset_parallelization: bool = False,
+    dataset_parallelization_context: Optional[str] = None,
     max_workers: Optional[int] = None,
     merge_mismatched_boundaries: bool = True,
     # removed: restrict_to_observed_moves
@@ -521,6 +570,12 @@ def incremental_softmax_recovery(
         
         When enabled with only 1 test case, falls back to sequential processing
         (logged at INFO level).
+        For better load balancing, the test set is split into multiple chunks
+        (up to 4x the number of workers) so faster workers can pick up more work.
+    dataset_parallelization_context : str, optional
+        Optional multiprocessing start method to use for dataset parallelization.
+        Common values: "spawn", "fork", "forkserver". When set, the specified
+        context is used to create the ProcessPoolExecutor.
 
     Notes
     -----
@@ -539,6 +594,7 @@ def incremental_softmax_recovery(
         raise ValueError("parallel_processing and dataset_parallelization cannot both be True. Choose one parallelization strategy.")
     
     logger.info("Starting incremental softmax recovery (conformance-only).")
+    tau_move_cost = _TAU_MOVE_COST_FORCED
 
     # Prepare default containers
     
@@ -790,9 +846,10 @@ def incremental_softmax_recovery(
         n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
         logger.info(f"Using {n_workers} workers for dataset parallelization")
 
-        # Split test traces into chunks
-        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_ground_truth_sequences, n_workers)
-        logger.info(f"Split test dataset into {len(chunks)} chunks")
+        # Split test traces into more chunks than workers for better load balancing
+        n_chunks = min(len(test_case_ids), n_workers * 4)
+        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_ground_truth_sequences, n_chunks)
+        logger.info(f"Split test dataset into {len(chunks)} chunks (target={n_chunks})")
 
         # Pickle model for sharing across workers
         model_pickled = pickle.dumps(model)
@@ -828,11 +885,18 @@ def incremental_softmax_recovery(
                 candidate_min_k,
                 candidate_source,
                 candidate_apply_to_sync,
+                restrict_log_moves,
+                restrict_model_moves_to_tau,
             )
             parallel_args.append(args)
 
         # Process chunks in parallel, preserving order as if computed sequentially
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
+        executor_kwargs = {'max_workers': n_workers}
+        if dataset_parallelization_context:
+            executor_kwargs['mp_context'] = multiprocessing.get_context(dataset_parallelization_context)
+            logger.info(f"Using multiprocessing start method '{dataset_parallelization_context}' for dataset parallelization")
+
+        with concurrent.futures.ProcessPoolExecutor(**executor_kwargs) as executor:
             futures = [executor.submit(_process_test_chunk, *args) for args in parallel_args]
 
             # Collect results in submission order to preserve sequential ordering
@@ -842,7 +906,7 @@ def incremental_softmax_recovery(
                     recovery_records.extend(chunk_records)
                     sktr_accs.extend(chunk_sktr_accs)
                     argmax_accs.extend(chunk_argmax_accs)
-                    logger.debug(f"Processed chunk {idx}/{len(chunks)}: {len(chunk_records)} records, {len(chunk_sktr_accs)} accuracies")
+                    logger.info(f"Collected chunk {idx}/{len(chunks)}: {len(chunk_records)} records, {len(chunk_sktr_accs)} accuracies")
                 except Exception as exc:
                     logger.error(f"Dataset parallelization failed for chunk {idx}: {exc}")
                     raise
@@ -880,6 +944,8 @@ def incremental_softmax_recovery(
             'candidate_min_k': candidate_min_k,
             'candidate_source': candidate_source,
             'candidate_apply_to_sync': candidate_apply_to_sync,
+            'restrict_log_moves': restrict_log_moves,
+            'restrict_model_moves_to_tau': restrict_model_moves_to_tau,
         }
 
         tasks = (
@@ -946,6 +1012,8 @@ def incremental_softmax_recovery(
                 candidate_min_k=candidate_min_k,
                 candidate_source=candidate_source,
                 candidate_apply_to_sync=candidate_apply_to_sync,
+                restrict_log_moves=restrict_log_moves,
+                restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             )
 
             # Extract ground truth sequence for accuracy computation

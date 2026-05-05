@@ -26,7 +26,8 @@ from graphviz import Digraph
 MoveType = str
 
 logger = logging.getLogger(__name__)
-        
+
+
 def validate_input_parameters(
     n_indices: int,
     round_precision: int,
@@ -35,7 +36,7 @@ def validate_input_parameters(
 ) -> None:
     """
     Validate input parameters for the incremental softmax recovery function.
-    
+
     Parameters
     ----------
     n_indices : int
@@ -59,32 +60,41 @@ def validate_input_parameters(
         raise TypeError(f"n_indices must be an integer, got {type(n_indices)}")
     if n_indices <= 0:
         raise ValueError(f"n_indices must be positive, got {n_indices}")
-    
+
     # Validate round_precision
     if not isinstance(round_precision, int):
-        raise TypeError(f"round_precision must be an integer, got {type(round_precision)}")
+        raise TypeError(
+            f"round_precision must be an integer, got {type(round_precision)}")
     if round_precision < 0:
-        raise ValueError(f"round_precision must be non-negative, got {round_precision}")
-    
+        raise ValueError(
+            f"round_precision must be non-negative, got {round_precision}")
+
     # Validate non_sync_penalty
     if not isinstance(non_sync_penalty, (int, float)):
-        raise TypeError(f"non_sync_penalty must be a number, got {type(non_sync_penalty)}")
+        raise TypeError(
+            f"non_sync_penalty must be a number, got {type(non_sync_penalty)}")
     if non_sync_penalty < 0:
-        raise ValueError(f"non_sync_penalty must be non-negative, got {non_sync_penalty}")
-    
+        raise ValueError(
+            f"non_sync_penalty must be non-negative, got {non_sync_penalty}")
+
     # Validate temp_bounds
     if not isinstance(temp_bounds, tuple):
-        raise TypeError(f"temp_bounds must be a tuple, got {type(temp_bounds)}")
+        raise TypeError(
+            f"temp_bounds must be a tuple, got {type(temp_bounds)}")
     if len(temp_bounds) != 2:
-        raise ValueError(f"temp_bounds must be a tuple of length 2, got length {len(temp_bounds)}")
-    
+        raise ValueError(
+            f"temp_bounds must be a tuple of length 2, got length {len(temp_bounds)}")
+
     min_temp, max_temp = temp_bounds
     if not isinstance(min_temp, (int, float)) or not isinstance(max_temp, (int, float)):
-        raise TypeError(f"temp_bounds values must be numbers, got ({type(min_temp)}, {type(max_temp)})")
+        raise TypeError(
+            f"temp_bounds values must be numbers, got ({type(min_temp)}, {type(max_temp)})")
     if min_temp >= max_temp:
-        raise ValueError(f"temp_bounds min must be less than max, got {temp_bounds}")
+        raise ValueError(
+            f"temp_bounds min must be less than max, got {temp_bounds}")
     if min_temp <= 0:
-        raise ValueError(f"temp_bounds values must be positive, got {temp_bounds}")
+        raise ValueError(
+            f"temp_bounds values must be positive, got {temp_bounds}")
 
 
 def make_cost_function(
@@ -116,7 +126,8 @@ def make_cost_function(
             raise ValueError(f"Unknown cost '{cf}'")
         if callable(cf):
             return cf
-        raise TypeError(f"Cost spec must be float, str or callable, got {type(cf)}")
+        raise TypeError(
+            f"Cost spec must be float, str or callable, got {type(cf)}")
 
     base_fn = normalize(base)
     overrides = {
@@ -180,10 +191,10 @@ def compute_conditional_probability(
 ) -> float:
     """
     Compute conditional probability based on path history.
-    
+
     Supports both n-gram smoothing and prefix search approaches for
     computing conditional probabilities based on path history.
-    
+
     Parameters
     ----------
     path_prefix : tuple of str
@@ -200,7 +211,7 @@ def compute_conditional_probability(
         Blending factor between base and conditional probabilities
     use_ngram_smoothing : bool
         Whether to use n-gram smoothing approach
-        
+
     Returns
     -------
     float
@@ -208,12 +219,13 @@ def compute_conditional_probability(
     """
     if not prob_dict:
         return base_probability
-    
+
     if use_ngram_smoothing:
         # Validate lambdas when using n-gram smoothing
         if not lambdas:
-            raise ValueError("lambdas must be provided when use_ngram_smoothing is True")
-        
+            raise ValueError(
+                "lambdas must be provided when use_ngram_smoothing is True")
+
         conditional_prob = compute_ngram_probability(
             path_prefix, activity_name, prob_dict, lambdas
         )
@@ -221,7 +233,7 @@ def compute_conditional_probability(
         conditional_prob = compute_prefix_search_probability(
             path_prefix, activity_name, prob_dict
         )
-    
+
     # Blend conditional probability with base probability
     return (1 - alpha) * conditional_prob + alpha * base_probability
 
@@ -235,17 +247,18 @@ def simple_bigram_blend(
 ) -> float:
     """
     Simple function to blend base probability with bigram conditional probability for testing.
-    
+
     Uses bigram P(activity|previous) if previous exists, unigram P(activity) otherwise.
-    
+
     Parameters same as compute_conditional_probability, but ignores lambdas and use_ngram_smoothing.
     """
     if not path_prefix:
         conditional_prob = prob_dict.get((), {}).get(activity_name, 0.0)
     else:
         previous = path_prefix[-1]
-        conditional_prob = prob_dict.get((previous,), {}).get(activity_name, 0.0)
-    
+        conditional_prob = prob_dict.get(
+            (previous,), {}).get(activity_name, 0.0)
+
     return (1 - alpha) * conditional_prob + alpha * base_probability
 
 
@@ -257,7 +270,7 @@ def compute_ngram_probability(
 ) -> float:
     """
     Compute probability using n-gram smoothing.
-    
+
     Parameters
     ----------
     path_prefix_tuple : tuple of str
@@ -270,7 +283,7 @@ def compute_ngram_probability(
         Weights for different n-gram lengths, ordered from unigram to higher n-grams.
         lambdas[0] = unigram weight, lambdas[1] = bigram weight, 
         lambdas[2] = trigram weight, etc.
-        
+
     Returns
     -------
     float
@@ -278,20 +291,21 @@ def compute_ngram_probability(
     """
     logger = logging.getLogger("ngram_prob")
     if not lambdas:
-        raise ValueError("lambdas cannot be empty for n-gram probability computation")
-    
+        raise ValueError(
+            "lambdas cannot be empty for n-gram probability computation")
+
     if not path_prefix_tuple:
         base_prob = prob_dict.get((), {}).get(activity_name, 0.0)
         logger.debug(
             f"[n-gram] Empty prefix: returning unigram prob for '{activity_name}': {base_prob}"
         )
         return base_prob
-    
+
     total_weighted_prob = 0.0
     total_lambda_weight = 0.0
     max_n = min(len(path_prefix_tuple), len(lambdas))
     ngram_details = []
-    
+
     for n in range(1, max_n + 1):
         prefix_n_gram = path_prefix_tuple[-n:]
         prob = prob_dict.get(prefix_n_gram, {}).get(activity_name, 0.0)
@@ -302,13 +316,13 @@ def compute_ngram_probability(
         ngram_details.append(
             f"n={n} prefix={prefix_n_gram} lambda={lambda_weight:.3f} prob={prob:.5f} contrib={contribution:.5f}"
         )
-    
+
     if total_lambda_weight == 0:
         logger.debug(
             f"[n-gram] All lambda weights zero for prefix {path_prefix_tuple} and activity '{activity_name}'. Returning 0.0."
         )
         return 0.0
-    
+
     final_prob = total_weighted_prob / total_lambda_weight
     logger.debug(
         f"[n-gram] path_prefix={path_prefix_tuple}, activity='{activity_name}'\n"
@@ -325,7 +339,7 @@ def compute_prefix_search_probability(
 ) -> float:
     """
     Compute probability using prefix search.
-    
+
     Parameters
     ----------
     path_prefix_tuple : tuple of str
@@ -334,7 +348,7 @@ def compute_prefix_search_probability(
         Name of current activity
     prob_dict : dict
         Prefix probability dictionary
-        
+
     Returns
     -------
     float
@@ -342,16 +356,16 @@ def compute_prefix_search_probability(
     """
     if not path_prefix_tuple:
         return prob_dict.get((), {}).get(activity_name, 0.0)
-    
+
     # Check exact prefix match
     if path_prefix_tuple in prob_dict:
         return prob_dict[path_prefix_tuple].get(activity_name, 0.0)
-    
+
     # Find longest matching prefix
     longest_prefix = find_longest_prefix(path_prefix_tuple, prob_dict)
     if longest_prefix:
         return prob_dict[longest_prefix].get(activity_name, 0.0)
-    
+
     return 0.0
 
 
@@ -361,14 +375,14 @@ def find_longest_prefix(
 ) -> Optional[Tuple[str, ...]]:
     """
     Find longest prefix that exists in dictionary.
-    
+
     Parameters
     ----------
     path_prefix_tuple : tuple of str
         Complete path to search in
     prob_dict : dict
         Dictionary to search for prefixes
-        
+
     Returns
     -------
     tuple of str or None
@@ -526,7 +540,8 @@ def interpolate_conditional_probs(
     # If we have fewer context levels than weights, truncate weights
     if len(interpolation_weights) < n_levels:
         # Pad with zeros
-        weights = list(interpolation_weights) + [0.0] * (n_levels - len(interpolation_weights))
+        weights = list(interpolation_weights) + \
+            [0.0] * (n_levels - len(interpolation_weights))
     else:
         # Truncate to match context length
         weights = interpolation_weights[:n_levels]
@@ -597,7 +612,8 @@ def adjust_probs_with_conditioning_vector(
 
     probs = np.asarray(observed_probs, dtype=float).copy()
     if probs.ndim != 1 or len(probs) != len(class_labels):
-        raise ValueError("observed_probs must be 1D and match class_labels length")
+        raise ValueError(
+            "observed_probs must be 1D and match class_labels length")
 
     # If we don't have a current run label or no conditioning dict, return observed (normalized)
     if current_run_label is None or not cond_prob_bigram:
@@ -608,7 +624,8 @@ def adjust_probs_with_conditioning_vector(
 
     # Pre-fetch conditional maps with graceful fallbacks
     cond_from_current = cond_prob_bigram.get(current_run_label, {})
-    cond_from_previous = cond_prob_bigram.get(last_different_label, {}) if last_different_label is not None else {}
+    cond_from_previous = cond_prob_bigram.get(
+        last_different_label, {}) if last_different_label is not None else {}
 
     for idx, label in enumerate(class_labels):
         observed_p = probs[idx]
@@ -640,7 +657,8 @@ def adjust_probs_with_conditioning_vector_extended(
     current_run_label: Optional[str],
     previous_different_labels: List[str],
     prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]],
-    prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+    prob_dict_collapsed: Optional[Dict[Tuple[str, ...],
+                                       Dict[str, float]]] = None,
     alpha: float = 0.5,
     combine_fn: Optional[Callable[[float, float, float], float]] = None,
     interpolation_weights: Optional[List[float]] = None,
@@ -699,7 +717,8 @@ def adjust_probs_with_conditioning_vector_extended(
 
     probs = np.asarray(observed_probs, dtype=float).copy()
     if probs.ndim != 1 or len(probs) != len(class_labels):
-        raise ValueError("observed_probs must be 1D and match class_labels length")
+        raise ValueError(
+            "observed_probs must be 1D and match class_labels length")
 
     # If we don't have a current run label or no conditioning dict, return observed (normalized)
     if current_run_label is None or not prob_dict_uncollapsed:
@@ -760,8 +779,10 @@ def adjust_probs_with_sequence_context(
     predicted_sequence: Sequence[str],
     *,
     cond_prob_bigram: Optional[Dict[str, Dict[str, float]]] = None,
-    prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
-    prob_dict_collapsed: Optional[Dict[Tuple[str, ...], Dict[str, float]]] = None,
+    prob_dict_uncollapsed: Optional[Dict[Tuple[str, ...],
+                                         Dict[str, float]]] = None,
+    prob_dict_collapsed: Optional[Dict[Tuple[str, ...],
+                                       Dict[str, float]]] = None,
     alpha: float = 0.5,
     combine_fn: Optional[Callable[[float, float, float], float]] = None,
     n_prev_labels: int = 1,
@@ -882,7 +903,8 @@ def prepare_df(
         def find_class(self, module, name):
             if module == 'torch.storage' and name == '_load_from_bytes':
                 return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
-            else: return super().find_class(module, name)
+            else:
+                return super().find_class(module, name)
 
     # 1) validate dataset
     valid = {'50salads', 'gtea', 'breakfast'}
@@ -949,14 +971,16 @@ def prepare_df(
     # 4) fix orientation
     softmax_list: List[np.ndarray] = []
     for idx, entry in enumerate(raw_softmax):
-        arr = entry.cpu().numpy() if isinstance(entry, torch.Tensor) else np.asarray(entry)
+        arr = entry.cpu().numpy() if isinstance(
+            entry, torch.Tensor) else np.asarray(entry)
         arr = np.squeeze(arr)
         L = len(target_list[idx])
         if arr.ndim == 1:
             # reshape 1D ג†’ (n_classes, L)
             c = arr.size // L
             if arr.size % L:
-                raise ValueError(f"Cannot reshape array of size {arr.size} to match length {L}")
+                raise ValueError(
+                    f"Cannot reshape array of size {arr.size} to match length {L}")
             arr = arr.reshape(c, L)
         else:
             c, e = arr.shape
@@ -964,7 +988,8 @@ def prepare_df(
                 arr = arr.T
                 c, e = arr.shape
             if e != L:
-                raise ValueError(f"Case {idx}: expected {L} columns but got {e}")
+                raise ValueError(
+                    f"Case {idx}: expected {L} columns but got {e}")
 
         softmax_list.append(arr)
 
@@ -1005,22 +1030,23 @@ def prepare_df_from_model(
     Tuple[pd.DataFrame, List[np.ndarray], Dict[str, str]]
 ]:
     """
-    Load dataset from model-specific softmax outputs (ASFormer or MS-TCN2).
+    Load dataset from model-specific softmax outputs (ASFormer, MS-TCN2, or DiffAct).
 
     This function loads softmax predictions from individual .npy files generated
-    by ASFormer or MS-TCN2 models, along with ground truth labels.
+    by ASFormer, MS-TCN2, or the DiffAct export script, along with ground truth labels.
 
     Parameters
     ----------
     dataset_name : str
         One of: '50salads', 'gtea', 'breakfast'.
     model_source : str
-        Model source: 'asformer' or 'mstcn2'.
+        Model source: 'asformer', 'mstcn2', or 'diffact'.
     base_path : str or Path, optional
         Base directory containing the model results. If None, uses default paths
         relative to user's home directory:
         - ~/ASFormer/results/{dataset}/softmax/
         - ~/MS-TCN2/results/{dataset}/softmax/
+        - sktr_for_long_traces/baselines/DiffAct/results/{dataset}/softmax/ (for diffact)
     return_mapping : bool, optional
         If True, returns the activity mapping dict as the third element.
 
@@ -1036,7 +1062,7 @@ def prepare_df_from_model(
     if dataset_name not in valid_datasets:
         raise ValueError(f"dataset_name must be one of {valid_datasets}")
 
-    valid_sources = {'asformer', 'mstcn2'}
+    valid_sources = {'asformer', 'mstcn2', 'diffact'}
     model_source = model_source.lower()
     if model_source not in valid_sources:
         raise ValueError(f"model_source must be one of {valid_sources}")
@@ -1046,8 +1072,11 @@ def prepare_df_from_model(
         home = Path.home()
         if model_source == 'asformer':
             base_path = home / 'ASFormer'
-        else:
+        elif model_source == 'mstcn2':
             base_path = home / 'MS-TCN2'
+        else:
+            base_path = Path(__file__).resolve(
+            ).parent.parent / 'baselines' / 'DiffAct'
     else:
         base_path = Path(base_path)
 
@@ -1094,7 +1123,8 @@ def prepare_df_from_model(
         softmax_list.append(arr)
 
         # Get ground truth for this case
-        case_gt = gt_df[gt_df['case:concept:name'] == case_id]['concept:name'].values
+        case_gt = gt_df[gt_df['case:concept:name']
+                        == case_id]['concept:name'].values
         target_list.append(case_gt)
 
     # Build DataFrame
@@ -1179,23 +1209,26 @@ def map_to_string_numbers(
 
 def group_cases_by_trace(df: pd.DataFrame) -> pd.DataFrame:
     # Group by 'case:concept:name' and aggregate the 'concept:name' into a tuple
-    grouped = df.groupby('case:concept:name')['concept:name'].apply(tuple).reset_index()
-    
+    grouped = df.groupby('case:concept:name')[
+        'concept:name'].apply(tuple).reset_index()
+
     # Group by the trace (sequence of activities) and aggregate the case IDs
-    trace_groups = grouped.groupby('concept:name')['case:concept:name'].apply(list).reset_index()
-    
+    trace_groups = grouped.groupby('concept:name')[
+        'case:concept:name'].apply(list).reset_index()
+
     # Add a column for the length of each trace
     trace_groups['trace_length'] = trace_groups['concept:name'].apply(len)
-    
+
     # Sort case_list numerically
-    trace_groups['case:concept:name'] = trace_groups['case:concept:name'].apply(lambda x: sorted(x, key=int))
-    
+    trace_groups['case:concept:name'] = trace_groups['case:concept:name'].apply(
+        lambda x: sorted(x, key=int))
+
     # Create result DataFrame with explicit column names
     result = pd.DataFrame({
         'case_list': trace_groups['case:concept:name'],
         'trace_length': trace_groups['trace_length']
     })
-    
+
     return result
 
 
@@ -1335,18 +1368,21 @@ def normalize_sequences_for_evaluation(gt_sequences: List[List[str]], pred_seque
     >>> # Both are now lists of lists of strings
     """
     if len(gt_sequences) != len(pred_sequences):
-        raise ValueError(f"Number of sequences don't match: GT has {len(gt_sequences)}, Pred has {len(pred_sequences)}")
+        raise ValueError(
+            f"Number of sequences don't match: GT has {len(gt_sequences)}, Pred has {len(pred_sequences)}")
 
     normalized_pred_sequences = []
 
     for i, (gt_seq, pred_seq) in enumerate(zip(gt_sequences, pred_sequences)):
         # Convert numpy array to list of strings
-        pred_seq_list = pred_seq.tolist() if hasattr(pred_seq, 'tolist') else list(pred_seq)
+        pred_seq_list = pred_seq.tolist() if hasattr(
+            pred_seq, 'tolist') else list(pred_seq)
         pred_seq_str = [str(x) for x in pred_seq_list]
 
         # Check lengths match
         if len(gt_seq) != len(pred_seq_str):
-            raise ValueError(f"Sequence {i} length mismatch: GT has {len(gt_seq)}, Pred has {len(pred_seq_str)}")
+            raise ValueError(
+                f"Sequence {i} length mismatch: GT has {len(gt_seq)}, Pred has {len(pred_seq_str)}")
 
         normalized_pred_sequences.append(pred_seq_str)
 
@@ -1386,19 +1422,21 @@ def get_variant_info(df: pd.DataFrame, use_collapsed: bool = True) -> pd.DataFra
     trace_variants = {}
     for case_id in df['case:concept:name'].unique():
         trace = df[df['case:concept:name'] == case_id]['concept:name'].tolist()
-        trace_signature = _collapse_runs(trace) if use_collapsed else tuple(trace)
+        trace_signature = _collapse_runs(
+            trace) if use_collapsed else tuple(trace)
         if trace_signature not in trace_variants:
             trace_variants[trace_signature] = {
                 'case_ids': [],
                 'length': len(trace_signature)
             }
         trace_variants[trace_signature]['case_ids'].append(case_id)
-    
+
     data = [{'variant_id': i, 'trace_signature': sig, 'case_ids': info['case_ids'],
              'frequency': len(info['case_ids']), 'trace_length': info['length']}
             for i, (sig, info) in enumerate(trace_variants.items())]
-    
-    variant_df = pd.DataFrame(data).sort_values('frequency', ascending=False).reset_index(drop=True)
+
+    variant_df = pd.DataFrame(data).sort_values(
+        'frequency', ascending=False).reset_index(drop=True)
     variant_df['variant_id'] = range(len(variant_df))
     return variant_df
 
@@ -1406,7 +1444,7 @@ def get_variant_info(df: pd.DataFrame, use_collapsed: bool = True) -> pd.DataFra
 def select_variants(variant_df: pd.DataFrame, n: int, method: str = 'frequency', seed: int = 42) -> List[int]:
     """
     Select n variants by frequency or randomly.
-    
+
     Parameters
     ----------
     variant_df : pd.DataFrame
@@ -1417,7 +1455,7 @@ def select_variants(variant_df: pd.DataFrame, n: int, method: str = 'frequency',
         Selection method: 'frequency' (top N by frequency) or 'random'.
     seed : int, default 42
         Random seed for reproducible selection.
-    
+
     Returns
     -------
     List[int]
@@ -1433,7 +1471,7 @@ def select_variants(variant_df: pd.DataFrame, n: int, method: str = 'frequency',
 def get_cases_for_variants(variant_df: pd.DataFrame, variant_ids: List[int], seed: int = 42) -> List[str]:
     """
     Get all case IDs for the specified variants.
-    
+
     Parameters
     ----------
     variant_df : pd.DataFrame
@@ -1442,7 +1480,7 @@ def get_cases_for_variants(variant_df: pd.DataFrame, variant_ids: List[int], see
         List of variant IDs to get cases for.
     seed : int, default 42
         Random seed (currently unused, kept for API consistency).
-    
+
     Returns
     -------
     List[str]
@@ -1548,7 +1586,8 @@ def select_variants_for_experiment(
         rng = random.Random(seed)
         selected_variant_ids = sorted(rng.sample(all_variant_ids, n_variants))
     else:
-        raise ValueError(f"Unknown selection_mode: {selection_mode}. Use 'frequency' or 'random'.")
+        raise ValueError(
+            f"Unknown selection_mode: {selection_mode}. Use 'frequency' or 'random'.")
 
     # Get train cases: ONE representative per variant (first case in each variant's list)
     train_cases = []
@@ -1601,7 +1640,8 @@ def compute_activity_run_counts(
     required_cols = {"case:concept:name", "concept:name"}
     missing = required_cols.difference(df.columns)
     if missing:
-        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+        raise ValueError(
+            f"Input DataFrame missing required columns: {missing}")
 
     # Result: activity -> { case_id -> run_count }
     activity_to_case_runs: Dict[str, Dict[str, int]] = {}
@@ -1626,7 +1666,8 @@ def compute_activity_run_counts(
         for activity_label, run_count in per_trace_runs.items():
             if activity_label not in activity_to_case_runs:
                 activity_to_case_runs[activity_label] = {}
-            activity_to_case_runs[activity_label][str(case_id)] = int(run_count)
+            activity_to_case_runs[activity_label][str(
+                case_id)] = int(run_count)
 
     return activity_to_case_runs
 
@@ -1660,7 +1701,8 @@ def compute_activity_run_lengths(
     required_cols = {"case:concept:name", "concept:name"}
     missing = required_cols.difference(df.columns)
     if missing:
-        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+        raise ValueError(
+            f"Input DataFrame missing required columns: {missing}")
 
     activity_to_case_run_lengths: Dict[str, Dict[str, List[int]]] = {}
 
@@ -1680,17 +1722,20 @@ def compute_activity_run_lengths(
                 current_run_length += 1
             else:
                 if current_label is not None:
-                    per_trace_lengths.setdefault(current_label, []).append(current_run_length)
+                    per_trace_lengths.setdefault(
+                        current_label, []).append(current_run_length)
                 current_label = label
                 current_run_length = 1
 
         # Flush last run
         if current_label is not None:
-            per_trace_lengths.setdefault(current_label, []).append(current_run_length)
+            per_trace_lengths.setdefault(
+                current_label, []).append(current_run_length)
 
         # Merge into global structure
         for activity_label, lengths in per_trace_lengths.items():
-            activity_to_case_run_lengths.setdefault(activity_label, {})[str(case_id)] = [int(x) for x in lengths]
+            activity_to_case_run_lengths.setdefault(activity_label, {})[str(case_id)] = [
+                int(x) for x in lengths]
 
     return activity_to_case_run_lengths
 
@@ -1725,6 +1770,7 @@ def compute_unique_activity_run_lengths(
 
     return activity_to_unique_lengths
 
+
 def visualize_petri_net(net, marking=None, output_path="./model"):
     """
     Generates a visual representation of a Petri Net model using Graphviz.
@@ -1739,7 +1785,8 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
         output_path (str, optional): Path (without extension) to save the visualization. Defaults to "./model".
     """
     if not hasattr(net, 'place_mapping') or not hasattr(net, 'reverse_place_mapping'):
-        raise AttributeError("The provided Petri net does not have the required place_mapping and reverse_place_mapping attributes")
+        raise AttributeError(
+            "The provided Petri net does not have the required place_mapping and reverse_place_mapping attributes")
 
     viz = Digraph(engine='dot')
     viz.attr(rankdir='TB')  # Set rank direction to top-to-bottom
@@ -1748,7 +1795,8 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
     marking_dict = {}
     if marking is not None:
         if len(marking) != len(net.place_mapping):
-            raise ValueError(f"The length of the marking tuple ({len(marking)}) does not match the number of places in the net ({len(net.place_mapping)})")
+            raise ValueError(
+                f"The length of the marking tuple ({len(marking)}) does not match the number of places in the net ({len(net.place_mapping)})")
         for idx, tokens in enumerate(marking):
             if tokens > 0:
                 place = net.reverse_place_mapping[idx]
@@ -1762,9 +1810,10 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
             if tokens > 0:
                 # Add a large token to the label with larger font size
                 label += f"\n<FONT POINT-SIZE='30'>ג—</FONT>"
-        
+
         # Ensure that the label is treated as an HTML-like label
-        viz.node(str(place), label=f"<{label}>", shape='circle', style='filled', fillcolor='white', fixedsize='true', width='0.75', height='0.75')
+        viz.node(str(place), label=f"<{label}>", shape='circle', style='filled',
+                 fillcolor='white', fixedsize='true', width='0.75', height='0.75')
 
     # Add Transitions (Rectangles)
     for transition in net.transitions:
@@ -1787,7 +1836,7 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
     # Redirect stderr to null to suppress warnings
     with open(os.devnull, 'w') as f:
         saved_paths = []
-        
+
         # Try to save in PNG format
         try:
             png_path = viz.render(output_path, format='png', cleanup=True)
@@ -1795,7 +1844,7 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
             logger.info(f"PNG visualization saved to: {png_path}")
         except Exception as e:
             logger.warning(f"Failed to generate PNG visualization: {e}")
-        
+
         # Try to save in PDF format
         try:
             pdf_path = viz.render(output_path, format='pdf', cleanup=True)
@@ -1803,10 +1852,11 @@ def visualize_petri_net(net, marking=None, output_path="./model"):
             logger.info(f"PDF visualization saved to: {pdf_path}")
         except Exception as e:
             logger.warning(f"Failed to generate PDF visualization: {e}")
-        
+
         # If neither format worked, raise an exception
         if not saved_paths:
-            raise RuntimeError("Failed to generate visualization in both PNG and PDF formats")
+            raise RuntimeError(
+                "Failed to generate visualization in both PNG and PDF formats")
 
 
 def sample_sequence_preserving_runs(sequence: Union[str, List[str]], sampling_ratio: float, min_run_length: int = 1) -> Union[str, List[str]]:
@@ -1962,7 +2012,8 @@ def get_activity_run_lengths_by_case(
     required_cols = {"case:concept:name", "concept:name"}
     missing = required_cols.difference(df.columns)
     if missing:
-        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+        raise ValueError(
+            f"Input DataFrame missing required columns: {missing}")
 
     if min_runs < 0:
         raise ValueError(f"min_runs must be non-negative, got {min_runs}")
@@ -2089,7 +2140,8 @@ def compute_argmax_accuracy_from_softmax(
         gt_indices = [int(label) for label in gt_sequence]
 
         # Count correct predictions
-        correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+        correct = sum(1 for pred, gt in zip(
+            argmax_predictions, gt_indices) if pred == gt)
         total_correct += correct
         total_predictions += len(gt_sequence)
 
@@ -2160,7 +2212,8 @@ def compute_group_statistics(
 
             # Compute accuracy for this case
             if len(argmax_predictions) == len(gt_indices):
-                correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+                correct = sum(1 for pred, gt in zip(
+                    argmax_predictions, gt_indices) if pred == gt)
                 accuracy = correct / len(gt_sequence)
                 accuracies.append(accuracy)
 
@@ -2269,7 +2322,8 @@ def compute_comprehensive_group_statistics(
             # Only process if lengths match
             if len(argmax_predictions) == len(gt_indices):
                 # Accuracy
-                correct = sum(1 for pred, gt in zip(argmax_predictions, gt_indices) if pred == gt)
+                correct = sum(1 for pred, gt in zip(
+                    argmax_predictions, gt_indices) if pred == gt)
                 accuracy = correct / len(gt_sequence)
                 accuracies.append(accuracy)
 
@@ -2281,10 +2335,12 @@ def compute_comprehensive_group_statistics(
 
                 # Class distributions
                 for gt_class in gt_indices:
-                    gt_class_counts[gt_class] = gt_class_counts.get(gt_class, 0) + 1
+                    gt_class_counts[gt_class] = gt_class_counts.get(
+                        gt_class, 0) + 1
 
                 for pred_class in argmax_predictions:
-                    pred_class_counts[pred_class] = pred_class_counts.get(pred_class, 0) + 1
+                    pred_class_counts[pred_class] = pred_class_counts.get(
+                        pred_class, 0) + 1
 
         if accuracies:
             results[group_name] = {
@@ -2347,7 +2403,8 @@ def compute_accuracies_by_case(results_df: pd.DataFrame) -> pd.DataFrame:
             'sktr_accuracy': (group['sktr_activity'] == group['ground_truth']).mean(),
             'argmax_accuracy': (group['argmax_activity'] == group['ground_truth']).mean()
         })
-    acc_df = results_df.groupby('case:concept:name').apply(_case_acc, include_groups=False).reset_index()
+    acc_df = results_df.groupby('case:concept:name').apply(
+        _case_acc, include_groups=False).reset_index()
     # Compute mean accuracies
     mean_sktr = acc_df['sktr_accuracy'].mean()
     mean_argmax = acc_df['argmax_accuracy'].mean()
@@ -2397,7 +2454,8 @@ def compute_group_accuracies_from_results(results_df: pd.DataFrame, group1_cases
     """
     def _compute_case_accuracies(group):
         sktr_correct = (group['sktr_activity'] == group['ground_truth']).sum()
-        argmax_correct = (group['argmax_activity'] == group['ground_truth']).sum()
+        argmax_correct = (group['argmax_activity'] ==
+                          group['ground_truth']).sum()
         total = len(group)
         return pd.Series({
             'sktr_accuracy': sktr_correct / total if total > 0 else 0,
@@ -2412,7 +2470,8 @@ def compute_group_accuracies_from_results(results_df: pd.DataFrame, group1_cases
 
         if len(group_df) > 0:
             # Compute per-case accuracies
-            case_accuracies = group_df.groupby('case:concept:name').apply(_compute_case_accuracies, include_groups=False).reset_index()
+            case_accuracies = group_df.groupby('case:concept:name').apply(
+                _compute_case_accuracies, include_groups=False).reset_index()
 
             # Overall group statistics
             sktr_individual = case_accuracies['sktr_accuracy'].tolist()
@@ -2514,10 +2573,12 @@ def compute_evaluation_metrics(
         try:
             from evaluation import compute_tas_metrics_asformer
         except ImportError:
-            raise ImportError("Cannot import compute_tas_metrics_asformer from evaluation.py")
+            raise ImportError(
+                "Cannot import compute_tas_metrics_asformer from evaluation.py")
 
     # Validate required columns
-    required_cols = {'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth'}
+    required_cols = {'case:concept:name', 'sktr_activity',
+                     'argmax_activity', 'ground_truth'}
     missing = required_cols.difference(results_df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
@@ -2535,7 +2596,8 @@ def compute_evaluation_metrics(
             [df['ground_truth'], df['sktr_activity'], df['argmax_activity']]
         ).unique().tolist()
 
-    print(f"Computing evaluation metrics for {df['case:concept:name'].nunique()} cases...")
+    print(
+        f"Computing evaluation metrics for {df['case:concept:name'].nunique()} cases...")
 
     # Compute metrics for SKTR (using ASFormer-compatible method)
     print("Computing SKTR metrics...")
@@ -2645,25 +2707,30 @@ def compute_comprehensive_tas_comparison(
     from pathlib import Path
 
     # Validate inputs
-    required_cols = {'case:concept:name', 'sktr_activity', 'argmax_activity', 'ground_truth'}
+    required_cols = {'case:concept:name', 'sktr_activity',
+                     'argmax_activity', 'ground_truth'}
     missing = required_cols.difference(results_df.columns)
     if missing:
-        raise ValueError(f"Missing required columns in results_df: {sorted(missing)}")
+        raise ValueError(
+            f"Missing required columns in results_df: {sorted(missing)}")
 
     # Check KARI file exists
     pkl_path = Path(kari_pkl_path)
     if not pkl_path.exists():
         raise FileNotFoundError(f"KARI results file not found: {pkl_path}")
 
-    print(f"Computing comprehensive TAS comparison for {results_df['case:concept:name'].nunique()} cases...")
+    print(
+        f"Computing comprehensive TAS comparison for {results_df['case:concept:name'].nunique()} cases...")
 
     # Compute SKTR and argmax metrics using existing function
     print("Computing SKTR and argmax metrics...")
-    sktr_argmax_metrics = compute_evaluation_metrics(results_df, dataset_name=dataset_name)
+    sktr_argmax_metrics = compute_evaluation_metrics(
+        results_df, dataset_name=dataset_name)
 
     # Compute KARI metrics using existing function
     print("Computing KARI metrics...")
-    case_order = results_df['case:concept:name'].astype(str).drop_duplicates().tolist()
+    case_order = results_df['case:concept:name'].astype(
+        str).drop_duplicates().tolist()
     # Adapt results_df to the schema expected by compute_kari_metrics/get_sequences_by_case:
     # it needs a DataFrame with columns 'case:concept:name' and 'concept:name' for GT.
     gt_df_for_kari = (
@@ -2673,8 +2740,10 @@ def compute_comprehensive_tas_comparison(
     )
     # Ensure both columns are strings so filtering by case_id matches
     gt_df_for_kari["concept:name"] = gt_df_for_kari["concept:name"].astype(str)
-    gt_df_for_kari["case:concept:name"] = gt_df_for_kari["case:concept:name"].astype(str)
-    kari_metrics = compute_kari_metrics(pkl_path, gt_df_for_kari, case_order, method_name="kari")
+    gt_df_for_kari["case:concept:name"] = gt_df_for_kari["case:concept:name"].astype(
+        str)
+    kari_metrics = compute_kari_metrics(
+        pkl_path, gt_df_for_kari, case_order, method_name="kari")
 
     # Combine all metrics into a single comparison dictionary
     comprehensive_comparison = {
@@ -2735,7 +2804,8 @@ def print_tas_comparison(
     if sort_by is None:
         print("\nTAS comparison (original order)")
     else:
-        print("\nTAS comparison (sorted by '{}' {})".format(sort_by, "asc" if ascending else "desc"))
+        print("\nTAS comparison (sorted by '{}' {})".format(
+            sort_by, "asc" if ascending else "desc"))
     print(df_display.to_string())
 
     if highlight_best:
@@ -2834,7 +2904,8 @@ def compute_kari_metrics(
 
         # Validate that 'labels' field exists
         if 'labels' not in result:
-            raise ValueError(f"Result for case {case_id} missing 'labels' field")
+            raise ValueError(
+                f"Result for case {case_id} missing 'labels' field")
 
         # Convert numpy array to list of strings to match ground truth format
         labels_array = result['labels']
@@ -2851,7 +2922,8 @@ def compute_kari_metrics(
 
     if length_mismatches:
         raise ValueError(
-            f"Sequence length mismatches found:\n" + "\n".join(length_mismatches)
+            f"Sequence length mismatches found:\n" +
+            "\n".join(length_mismatches)
         )
 
     # Build DataFrame from sequences for ASFormer-compatible metrics
@@ -2920,7 +2992,8 @@ def filter_dataframe_by_case_ids(
     required_cols = {"case:concept:name", "concept:name"}
     missing = required_cols.difference(df.columns)
     if missing:
-        raise ValueError(f"Input DataFrame missing required columns: {missing}")
+        raise ValueError(
+            f"Input DataFrame missing required columns: {missing}")
 
     # Create a categorical with the specified order to preserve case order
     df = df.copy()  # Avoid modifying the original DataFrame
@@ -2931,10 +3004,12 @@ def filter_dataframe_by_case_ids(
     )
 
     # Filter to only the specified case IDs and sort by the categorical order
-    filtered_df = df[df['case:concept:name'].isin(case_ids)].sort_values('case:concept:name')
+    filtered_df = df[df['case:concept:name'].isin(
+        case_ids)].sort_values('case:concept:name')
 
     # Reset the categorical to regular strings to avoid issues downstream
-    filtered_df['case:concept:name'] = filtered_df['case:concept:name'].astype(str)
+    filtered_df['case:concept:name'] = filtered_df['case:concept:name'].astype(
+        str)
 
     return filtered_df
 
@@ -2987,9 +3062,9 @@ def compute_kari_metrics_from_pkl(
     # Default case order for 50salads
     if case_id_order is None:
         case_id_order = ['30', '17', '9', '8', '20', '7', '23', '5', '28', '2', '1', '0',
-                        '13', '36', '33', '3', '14', '10', '31', '22', '34', '38', '37', '6',
-                        '24', '27', '21', '15', '11', '19', '16', '12', '32', '25', '35', '39',
-                        '26', '29', '4', '18']
+                         '13', '36', '33', '3', '14', '10', '31', '22', '34', '38', '37', '6',
+                         '24', '27', '21', '15', '11', '19', '16', '12', '32', '25', '35', '39',
+                         '26', '29', '4', '18']
 
     return compute_kari_metrics(
         pkl_file_path=pkl_file_path,
@@ -3054,13 +3129,14 @@ def attach_column_by_case_and_position(
         (source_value_col, "source_df", source_df),
     ):
         if col_name not in df.columns:
-            raise ValueError(f"Missing required column '{col_name}' in {df_name}")
+            raise ValueError(
+                f"Missing required column '{col_name}' in {df_name}")
 
     # Optimize: extract only needed columns from source_df before copying
     # This reduces memory usage significantly for wide dataframes
     right = source_df[[case_col, source_value_col]].copy()
     right[case_col] = right[case_col].astype(str)
-    
+
     # Optimize: convert case column without copying entire target_df
     left_case_str = target_df[case_col].astype(str)
 
@@ -3088,17 +3164,19 @@ def attach_column_by_case_and_position(
     right["__pos__"] = right.groupby(case_col, sort=False).cumcount()
 
     # Create minimal lookup dataframe
-    right_lookup = right.rename(columns={case_col: "__case__", source_value_col: new_col_name})
-    
+    right_lookup = right.rename(
+        columns={case_col: "__case__", source_value_col: new_col_name})
+
     # Build merge keys without copying target_df
     merge_keys = pd.DataFrame({
         "__case__": left_case_str.values,
         "__pos__": left_pos.values
     })
-    
+
     # Merge to get the values
-    merged_col = merge_keys.merge(right_lookup, on=["__case__", "__pos__"], how="left")[new_col_name]
-    
+    merged_col = merge_keys.merge(
+        right_lookup, on=["__case__", "__pos__"], how="left")[new_col_name]
+
     # Only copy target_df once at the end and add the new column
     result = target_df.copy()
     result[new_col_name] = merged_col.values

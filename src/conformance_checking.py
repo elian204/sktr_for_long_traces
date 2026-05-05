@@ -32,8 +32,10 @@ def process_trace_chunked(
     candidate_top_p: Optional[float] = None,
     candidate_top_k: Optional[int] = None,
     candidate_min_k: int = 1,
-    candidate_source: str = "auto",
+    candidate_source: str = "conditioned",
     candidate_apply_to_sync: bool = True,
+    restrict_log_moves: bool = False,
+    restrict_model_moves_to_tau: bool = False,
 ) -> Tuple[List[str], List[float]]:
     """
     Conformance-based recovery for a single trace processed in chunks.
@@ -78,4 +80,6 @@ def process_trace_chunked(
         candidate_min_k=candidate_min_k,
         candidate_source=candidate_source,
         candidate_apply_to_sync=candidate_apply_to_sync,
+        restrict_log_moves=restrict_log_moves,
+        restrict_model_moves_to_tau=restrict_model_moves_to_tau,
     )
