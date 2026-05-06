@@ -1901,6 +1901,7 @@ class PetriNet:
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
         max_consecutive_tau_moves: Optional[int] = None,
+        progress_log_interval_chunks: int = 0,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1917,6 +1918,8 @@ class PetriNet:
         _, n_ts = softmax_matrix.shape
         if chunk_size <= 0:
             raise ValueError("chunk_size must be positive")
+        if progress_log_interval_chunks < 0:
+            raise ValueError("progress_log_interval_chunks must be non-negative")
 
         current_marking = initial_marking
         # Track last emitted label across chunks to apply switch penalty at boundaries
@@ -1950,6 +1953,32 @@ class PetriNet:
         pending_end_ts: Optional[int] = None
         pending_elapsed: Optional[float] = None
         pending_rate: Optional[float] = None
+
+        def _log_chunk_progress(end_ts: int, chunk_elapsed: float, merged: bool) -> None:
+            if progress_log_interval_chunks <= 0:
+                return
+            completed_chunks = len(chunk_results)
+            if (
+                completed_chunks == 1
+                or completed_chunks % progress_log_interval_chunks == 0
+                or end_ts >= n_ts
+            ):
+                elapsed_total = time.perf_counter() - total_start
+                rate_total = (end_ts / elapsed_total) if elapsed_total > 0 else float("inf")
+                prefix = f"{progress_prefix} " if progress_prefix else ""
+                logger.info(
+                    "%sconformance progress: chunk=%d/%d, frames=%d/%d, "
+                    "elapsed=%.1fs, rate=%.2f frames/s, last_chunk=%.3fs, merged=%s",
+                    prefix,
+                    completed_chunks,
+                    nominal_total_chunks,
+                    end_ts,
+                    n_ts,
+                    elapsed_total,
+                    rate_total,
+                    chunk_elapsed,
+                    merged,
+                )
 
         start_ts = 0
         while start_ts < n_ts:
@@ -2035,6 +2064,7 @@ class PetriNet:
                     'processing_rate_steps_per_s': c1_rate,
                     'merged': False,
                 })
+                _log_chunk_progress(end_ts1, c1_elapsed, False)
                 # Ensure no stale pending cache remains
                 pending_result = None
                 pending_start_ts = None
@@ -2133,6 +2163,7 @@ class PetriNet:
                     'merged': True,
                     'merged_from': [start_ts, end_ts1],
                 })
+                _log_chunk_progress(end_ts2, m_elapsed, True)
 
                 # Advance by two windows and clear any pending cache
                 start_ts = end_ts2
@@ -2159,6 +2190,7 @@ class PetriNet:
                     'processing_rate_steps_per_s': c1_rate,
                     'merged': False,
                 })
+                _log_chunk_progress(end_ts1, c1_elapsed, False)
 
                 # Cache the look-ahead result to avoid recomputing next iteration
                 pending_result = result2
@@ -2221,6 +2253,7 @@ class PetriNet:
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
         max_consecutive_tau_moves: Optional[int] = None,
+        progress_log_interval_chunks: int = 0,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
@@ -2269,6 +2302,7 @@ class PetriNet:
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             max_consecutive_tau_moves=max_consecutive_tau_moves,
+            progress_log_interval_chunks=progress_log_interval_chunks,
             profile_stats=profile_stats,
         )
 

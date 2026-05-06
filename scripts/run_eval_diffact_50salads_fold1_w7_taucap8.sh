@@ -21,6 +21,7 @@ export PYTHONUNBUFFERED=1
     --chunk-size 3 \
     --restrict-model-moves-to-tau \
     --max-consecutive-tau-moves 8 \
+    --progress-log-interval-chunks 100 \
     --enabled-cache-size 100000 \
     --sktr-log-level INFO \
     --data-root "${DATA_ROOT:-/home/dsi/eli-bogdanov/data/data}" \

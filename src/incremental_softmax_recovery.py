@@ -100,6 +100,7 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         restrict_log_moves=_WORKER_SETTINGS.get('restrict_log_moves', False),
         restrict_model_moves_to_tau=_WORKER_SETTINGS.get('restrict_model_moves_to_tau', False),
         max_consecutive_tau_moves=_WORKER_SETTINGS.get('max_consecutive_tau_moves'),
+        progress_log_interval_chunks=_WORKER_SETTINGS.get('progress_log_interval_chunks', 0),
     )
 
     # Compute accuracy
@@ -227,6 +228,7 @@ def _process_single_test_case(
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
+    progress_log_interval_chunks: int,
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
     Process a single test case using conformance checking. Used for parallel processing.
@@ -276,6 +278,7 @@ def _process_single_test_case(
         restrict_log_moves=restrict_log_moves,
         restrict_model_moves_to_tau=restrict_model_moves_to_tau,
         max_consecutive_tau_moves=max_consecutive_tau_moves,
+        progress_log_interval_chunks=progress_log_interval_chunks,
     )
 
     # Compute accuracy
@@ -324,6 +327,7 @@ def _process_test_chunk(
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
+    progress_log_interval_chunks: int,
 ) -> Tuple[List[dict], List[float], List[float]]:
     """
     Process a chunk of test cases using conformance checking. Used for dataset-level parallel processing.
@@ -424,6 +428,7 @@ def _process_test_chunk(
             chunk_size=chunk_size,
             eps=prob_threshold,
             inline_progress=False,
+            progress_prefix=f"case {case_id}",
             prob_dict_uncollapsed=prob_dict_uncollapsed,
             prob_dict_collapsed=prob_dict_collapsed,
             switch_penalty_weight=conformance_switch_penalty_weight,
@@ -443,6 +448,7 @@ def _process_test_chunk(
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             max_consecutive_tau_moves=max_consecutive_tau_moves,
+            progress_log_interval_chunks=progress_log_interval_chunks,
         )
 
         # Compute accuracy
@@ -525,6 +531,7 @@ def incremental_softmax_recovery(
     restrict_log_moves: bool = False,
     restrict_model_moves_to_tau: bool = False,
     max_consecutive_tau_moves: Optional[int] = None,
+    progress_log_interval_chunks: int = 0,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = False,
     max_chunk_size: int = 50,
@@ -607,6 +614,8 @@ def incremental_softmax_recovery(
     tau_move_cost = _TAU_MOVE_COST_FORCED
     if max_consecutive_tau_moves is not None and max_consecutive_tau_moves < 1:
         raise ValueError("max_consecutive_tau_moves must be positive when set")
+    if progress_log_interval_chunks < 0:
+        raise ValueError("progress_log_interval_chunks must be non-negative")
 
     # Prepare default containers
     
@@ -900,6 +909,7 @@ def incremental_softmax_recovery(
                 restrict_log_moves,
                 restrict_model_moves_to_tau,
                 max_consecutive_tau_moves,
+                progress_log_interval_chunks,
             )
             parallel_args.append(args)
 
@@ -960,6 +970,7 @@ def incremental_softmax_recovery(
             'restrict_log_moves': restrict_log_moves,
             'restrict_model_moves_to_tau': restrict_model_moves_to_tau,
             'max_consecutive_tau_moves': max_consecutive_tau_moves,
+            'progress_log_interval_chunks': progress_log_interval_chunks,
         }
 
         tasks = (
@@ -1029,6 +1040,7 @@ def incremental_softmax_recovery(
                 restrict_log_moves=restrict_log_moves,
                 restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                 max_consecutive_tau_moves=max_consecutive_tau_moves,
+                progress_log_interval_chunks=progress_log_interval_chunks,
             )
 
             # Extract ground truth sequence for accuracy computation

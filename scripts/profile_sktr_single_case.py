@@ -209,6 +209,7 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
         max_consecutive_tau_moves=(
             None if args.max_consecutive_tau_moves == 0 else args.max_consecutive_tau_moves
         ),
+        progress_log_interval_chunks=args.progress_log_interval_chunks,
         enabled_cache_size=args.enabled_cache_size,
         use_calibration=args.use_calibration,
         workers=1,
@@ -566,6 +567,7 @@ def _profile_conformance(
             restrict_log_moves=cfg["restrict_log_moves"],
             restrict_model_moves_to_tau=cfg["restrict_model_moves_to_tau"],
             max_consecutive_tau_moves=cfg["max_consecutive_tau_moves"],
+            progress_log_interval_chunks=cfg["progress_log_interval_chunks"],
             profile_stats=search_stats,
         )
 
@@ -705,6 +707,12 @@ def parse_args() -> argparse.Namespace:
         default=8,
         help="Cap consecutive direct tau/model-quiet moves; use 0 to disable.",
     )
+    parser.add_argument(
+        "--progress-log-interval-chunks",
+        type=_parse_nonnegative_int,
+        default=0,
+        help="Log conformance progress every N temporal chunks; 0 disables.",
+    )
     return parser.parse_args()
 
 
@@ -763,6 +771,7 @@ def main() -> None:
             "conditioning_state_mode": cfg["conditioning_state_mode"],
             "conditioning_top_m": cfg["conditioning_top_m"],
             "max_consecutive_tau_moves": cfg["max_consecutive_tau_moves"],
+            "progress_log_interval_chunks": cfg["progress_log_interval_chunks"],
             "max_frames": args.max_frames,
         }
     )
