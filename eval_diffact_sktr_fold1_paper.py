@@ -360,8 +360,13 @@ def main():
     parser.add_argument("--candidate-min-k", type=int, default=1)
     parser.add_argument(
         "--restrict-log-moves",
-        action="store_true",
-        help="Approximate SKTR: restrict log moves to top-1 observed label plus previous label.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Approximate SKTR: restrict log moves to top-1 observed label plus "
+            "previous label. Enabled by default for experiments; use "
+            "--no-restrict-log-moves to disable."
+        ),
     )
     parser.add_argument(
         "--restrict-model-moves-to-tau",
