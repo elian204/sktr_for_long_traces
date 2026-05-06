@@ -1161,6 +1161,8 @@ class PetriNet:
         restrict_log_moves: bool = False,
         # Restricted model moves: only allow tau (silent) transitions
         restrict_model_moves_to_tau: bool = False,
+        # Optional cap on consecutive direct tau/model-quiet moves
+        max_consecutive_tau_moves: Optional[int] = None,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1190,6 +1192,10 @@ class PetriNet:
         raw_top1_by_ts = np.argmax(softmax_matrix, axis=0) if n_ts > 0 else np.array([], dtype=int)
         tau_cost_const = cost_fn(0.0, 'tau')
         model_cost_const = cost_fn(0.0, 'model')
+        use_tau_cap = max_consecutive_tau_moves is not None
+        tau_cap = int(max_consecutive_tau_moves) if use_tau_cap else None
+        if tau_cap is not None and tau_cap < 1:
+            raise ValueError("max_consecutive_tau_moves must be positive when set")
 
         # Memory optimization: bound path_prefix to only store what's needed for conditioning.
         # We need n_prev_labels previous DIFFERENT labels plus the current label.
@@ -1227,15 +1233,35 @@ class PetriNet:
                     raise ValueError("conditioning_top_m must be >= 1")
                 top_m = int(conditioning_top_m)
 
-        def make_key(places: Tuple[int, ...], ts: int, last_label: Optional[str], context: Tuple[str, ...]):
+        def make_key(
+            places: Tuple[int, ...],
+            ts: int,
+            last_label: Optional[str],
+            context: Tuple[str, ...],
+            tau_run_len: int = 0,
+        ):
             if use_conditioning_context:
                 # Include full context for conditioning correctness
-                return (places, ts, last_label, context) if use_last_label_in_state else (places, ts, context)
+                base = (places, ts, last_label, context) if use_last_label_in_state else (places, ts, context)
             else:
-                return (places, ts, last_label) if use_last_label_in_state else (places, ts)
+                base = (places, ts, last_label) if use_last_label_in_state else (places, ts)
+            return (*base, int(tau_run_len)) if use_tau_cap else base
+
+        def make_base_key(
+            places: Tuple[int, ...],
+            ts: int,
+            last_label: Optional[str],
+            tau_run_len: int = 0,
+        ):
+            base = (places, ts, last_label) if use_last_label_in_state else (places, ts)
+            return (*base, int(tau_run_len)) if use_tau_cap else base
+
+        def make_unlabeled_key(places: Tuple[int, ...], ts: int, tau_run_len: int = 0):
+            base = (places, ts)
+            return (*base, int(tau_run_len)) if use_tau_cap else base
 
         # Start state key
-        start_key = make_key(initial_marking.places, 0, initial_last_label, tuple())
+        start_key = make_key(initial_marking.places, 0, initial_last_label, tuple(), 0)
 
         # dist: best-known cost per state key - updated on PUSH (relaxation)
         # This is the key optimization: update dist when we find a better path,
@@ -1255,15 +1281,15 @@ class PetriNet:
         # We store the full keys (which include context) and their current best costs.
         kept_by_base: Dict[Any, Dict[Any, float]] = defaultdict(dict)
         if top_m is not None:
-            base_start = (initial_marking.places, 0, initial_last_label) if use_last_label_in_state else (initial_marking.places, 0)
+            base_start = make_base_key(initial_marking.places, 0, initial_last_label, 0)
             kept_by_base[base_start][start_key] = 0.0
 
         # Additional dominance pruning across last_label for the same (places, timestamp):
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
         # before the next timestamp advance. If a node is already worse than the current best
         # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
-        best_unlabeled: Dict[Tuple[Tuple[int, ...], int], float] = defaultdict(lambda: float('inf'))
-        best_unlabeled[(initial_marking.places, 0)] = 0.0
+        best_unlabeled: Dict[Any, float] = defaultdict(lambda: float('inf'))
+        best_unlabeled[make_unlabeled_key(initial_marking.places, 0, 0)] = 0.0
 
         # Min-heap of (cost, counter, key) - counter for tie-breaking to avoid comparing keys
         counter = 0
@@ -1291,6 +1317,9 @@ class PetriNet:
         candidate_total = 0
         model_edges_considered = 0
         model_moves_skipped_restrict = 0
+        tau_moves_skipped_cap = 0
+        macro_tau_paths_skipped_cap = 0
+        max_tau_run_seen = 0
         model_relaxations = 0
         model_pushes = 0
         log_edges_considered = 0
@@ -1411,23 +1440,31 @@ class PetriNet:
                     continue
 
                 # Extract key components (key structure depends on flags)
+                if use_tau_cap:
+                    key_parts = key[:-1]
+                    tau_run_len = int(key[-1])
+                else:
+                    key_parts = key
+                    tau_run_len = 0
                 if use_conditioning_context:
                     if use_last_label_in_state:
-                        places, timestamp, last_label, path_prefix = key
+                        places, timestamp, last_label, path_prefix = key_parts
                     else:
-                        places, timestamp, path_prefix = key
+                        places, timestamp, path_prefix = key_parts
                         last_label = None
                 else:
                     if use_last_label_in_state:
-                        places, timestamp, last_label = key
+                        places, timestamp, last_label = key_parts
                     else:
-                        places, timestamp = key
+                        places, timestamp = key_parts
                         last_label = None
                     path_prefix = tuple()
                 last_timestamp_seen = max(last_timestamp_seen, int(timestamp))
+                if tau_run_len > max_tau_run_seen:
+                    max_tau_run_seen = tau_run_len
 
-                base_key = (places, timestamp, last_label) if use_last_label_in_state else (places, timestamp)
-                unlabeled_key = (places, timestamp)
+                base_key = make_base_key(places, timestamp, last_label, tau_run_len)
+                unlabeled_key = make_unlabeled_key(places, timestamp, tau_run_len)
 
                 # Dominance prune across different last_label variants
                 if switch_penalty_weight > 0.0:
@@ -1563,7 +1600,12 @@ class PetriNet:
                     if available_transition_map is not None and t in available_transition_map:
                         # This transition requires τ-path firing; include τ costs
                         tau_path = available_transition_map[t]
-                        tau_cost_total = len(tau_path) * tau_cost_const
+                        tau_path_len = len(tau_path)
+                        if tau_cap is not None and tau_path_len > tau_cap:
+                            macro_tau_paths_skipped_cap += 1
+                            continue
+                        tau_cost_total = tau_path_len * tau_cost_const
+                        new_tau_run_len = 0
                         fire_key = (places, t, True)
                         new_mark = fire_cache.get(fire_key)
                         if new_mark is None:
@@ -1575,6 +1617,10 @@ class PetriNet:
                             fire_cache_hits += 1
                     else:
                         # This is a directly enabled transition
+                        if tau_cap is not None and t.label is None and tau_run_len >= tau_cap:
+                            tau_moves_skipped_cap += 1
+                            continue
+                        new_tau_run_len = tau_run_len + 1 if use_tau_cap and t.label is None else 0
                         fire_key = (places, t, False)
                         new_mark = fire_cache.get(fire_key)
                         if new_mark is None:
@@ -1587,8 +1633,10 @@ class PetriNet:
                     move_type = 'tau' if t.label is None else 'model'
                     c = tau_cost_const if t.label is None else model_cost_const
                     new_cost = cost + tau_cost_total + c
-                    new_key = make_key(new_mark.places, timestamp, last_label, path_prefix)
-                    new_base_key = (new_mark.places, timestamp, last_label) if use_last_label_in_state else (new_mark.places, timestamp)
+                    if new_tau_run_len > max_tau_run_seen:
+                        max_tau_run_seen = new_tau_run_len
+                    new_key = make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                    new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
 
                     # Dist-on-push: only push if this is a better path
                     model_relaxations += 1
@@ -1648,8 +1696,8 @@ class PetriNet:
                             if use_conditioning_context
                             else tuple()
                         )
-                        new_key = make_key(places, timestamp + 1, label, new_path_prefix)
-                        new_base_key = (places, timestamp + 1, label) if use_last_label_in_state else (places, timestamp + 1)
+                        new_key = make_key(places, timestamp + 1, label, new_path_prefix, 0)
+                        new_base_key = make_base_key(places, timestamp + 1, label, 0)
 
                         # Dist-on-push: only push if this is a better path
                         log_relaxations += 1
@@ -1692,7 +1740,11 @@ class PetriNet:
                     if available_transition_map is not None and t in available_transition_map:
                         # This transition requires τ-path firing; include τ costs
                         tau_path = available_transition_map[t]
-                        tau_cost_total = len(tau_path) * tau_cost_const
+                        tau_path_len = len(tau_path)
+                        if tau_cap is not None and tau_path_len > tau_cap:
+                            macro_tau_paths_skipped_cap += 1
+                            continue
+                        tau_cost_total = tau_path_len * tau_cost_const
                         fire_key = (places, t, True)
                         new_mark = fire_cache.get(fire_key)
                         if new_mark is None:
@@ -1728,8 +1780,8 @@ class PetriNet:
                         if use_conditioning_context
                         else tuple()
                     )
-                    new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix)
-                    new_base_key = (new_mark.places, timestamp + 1, t.label) if use_last_label_in_state else (new_mark.places, timestamp + 1)
+                    new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix, 0)
+                    new_base_key = make_base_key(new_mark.places, timestamp + 1, t.label, 0)
 
                     # Dist-on-push: only push if this is a better path
                     sync_relaxations += 1
@@ -1783,6 +1835,10 @@ class PetriNet:
                 profile_stats["candidate_total"] = profile_stats.get("candidate_total", 0) + candidate_total
                 profile_stats["model_edges_considered"] = profile_stats.get("model_edges_considered", 0) + model_edges_considered
                 profile_stats["model_moves_skipped_restrict"] = profile_stats.get("model_moves_skipped_restrict", 0) + model_moves_skipped_restrict
+                profile_stats["tau_moves_skipped_cap"] = profile_stats.get("tau_moves_skipped_cap", 0) + tau_moves_skipped_cap
+                profile_stats["macro_tau_paths_skipped_cap"] = profile_stats.get("macro_tau_paths_skipped_cap", 0) + macro_tau_paths_skipped_cap
+                profile_stats["max_tau_run_seen"] = max(profile_stats.get("max_tau_run_seen", 0), max_tau_run_seen)
+                profile_stats["max_consecutive_tau_moves"] = tau_cap
                 profile_stats["model_relaxations"] = profile_stats.get("model_relaxations", 0) + model_relaxations
                 profile_stats["model_pushes"] = profile_stats.get("model_pushes", 0) + model_pushes
                 profile_stats["log_edges_considered"] = profile_stats.get("log_edges_considered", 0) + log_edges_considered
@@ -1844,6 +1900,7 @@ class PetriNet:
         candidate_apply_to_sync: bool = True,
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
+        max_consecutive_tau_moves: Optional[int] = None,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1953,6 +2010,7 @@ class PetriNet:
                     candidate_apply_to_sync=candidate_apply_to_sync,
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                    max_consecutive_tau_moves=max_consecutive_tau_moves,
                     profile_stats=profile_stats,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
@@ -2014,6 +2072,7 @@ class PetriNet:
                 candidate_apply_to_sync=candidate_apply_to_sync,
                 restrict_log_moves=restrict_log_moves,
                 restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                max_consecutive_tau_moves=max_consecutive_tau_moves,
                 profile_stats=profile_stats,
             )
             c2_elapsed = time.perf_counter() - c2_start
@@ -2050,6 +2109,7 @@ class PetriNet:
                     candidate_apply_to_sync=candidate_apply_to_sync,
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+                    max_consecutive_tau_moves=max_consecutive_tau_moves,
                     profile_stats=profile_stats,
                 )
                 m_elapsed = time.perf_counter() - m_start
@@ -2160,6 +2220,7 @@ class PetriNet:
         candidate_apply_to_sync: bool = True,
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
+        max_consecutive_tau_moves: Optional[int] = None,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
@@ -2207,6 +2268,7 @@ class PetriNet:
             candidate_apply_to_sync=candidate_apply_to_sync,
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+            max_consecutive_tau_moves=max_consecutive_tau_moves,
             profile_stats=profile_stats,
         )
 

@@ -62,6 +62,16 @@ def parse_log_level(value: str) -> int:
     return level
 
 
+def parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be non-negative; use 0 to disable")
+    return parsed
+
+
 def resolve_background_label(dataset_name: str) -> None:
     return None
 
@@ -129,6 +139,7 @@ def build_base_config_for_fold(
     candidate_min_k: int,
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
+    max_consecutive_tau_moves: Optional[int],
     enabled_cache_size: int,
     use_calibration: bool,
     workers: int,
@@ -184,6 +195,7 @@ def build_base_config_for_fold(
         "candidate_apply_to_sync": True,
         "restrict_log_moves": restrict_log_moves,
         "restrict_model_moves_to_tau": restrict_model_moves_to_tau,
+        "max_consecutive_tau_moves": max_consecutive_tau_moves,
         "enabled_cache_size": enabled_cache_size,
     }
 
@@ -374,6 +386,12 @@ def main():
         help="Approximate SKTR: allow only tau transitions as model moves.",
     )
     parser.add_argument(
+        "--max-consecutive-tau-moves",
+        type=parse_nonnegative_int,
+        default=8,
+        help="Cap consecutive direct tau/model-quiet moves; use 0 to disable.",
+    )
+    parser.add_argument(
         "--enabled-cache-size",
         type=int,
         default=100000,
@@ -402,6 +420,9 @@ def main():
         help="Run every CV fold per dataset (GTEA: 4 folds, 50 Salads: 5). Ignores single --fold.",
     )
     args = parser.parse_args()
+    max_consecutive_tau_moves = (
+        None if args.max_consecutive_tau_moves == 0 else args.max_consecutive_tau_moves
+    )
 
     diffact_root = workspace_root / "baselines" / "DiffAct"
     out_dir = Path(args.out_dir or workspace_root /
@@ -486,6 +507,7 @@ def main():
                 candidate_min_k=args.candidate_min_k,
                 restrict_log_moves=args.restrict_log_moves,
                 restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
+                max_consecutive_tau_moves=max_consecutive_tau_moves,
                 enabled_cache_size=args.enabled_cache_size,
                 use_calibration=args.use_calibration,
                 workers=args.workers,

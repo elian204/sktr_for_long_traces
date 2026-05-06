@@ -36,6 +36,7 @@ def process_trace_chunked(
     candidate_apply_to_sync: bool = True,
     restrict_log_moves: bool = False,
     restrict_model_moves_to_tau: bool = False,
+    max_consecutive_tau_moves: Optional[int] = None,
     profile_stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], List[float]]:
     """
@@ -83,5 +84,6 @@ def process_trace_chunked(
         candidate_apply_to_sync=candidate_apply_to_sync,
         restrict_log_moves=restrict_log_moves,
         restrict_model_moves_to_tau=restrict_model_moves_to_tau,
+        max_consecutive_tau_moves=max_consecutive_tau_moves,
         profile_stats=profile_stats,
     )

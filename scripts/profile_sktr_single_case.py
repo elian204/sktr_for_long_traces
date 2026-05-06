@@ -69,6 +69,16 @@ def _parse_log_level(value: str) -> int:
     return level
 
 
+def _parse_nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected integer, got {value!r}") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("Value must be non-negative; use 0 to disable")
+    return parsed
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, np.integer):
         return int(value)
@@ -196,6 +206,9 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
         candidate_min_k=args.candidate_min_k,
         restrict_log_moves=args.restrict_log_moves,
         restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
+        max_consecutive_tau_moves=(
+            None if args.max_consecutive_tau_moves == 0 else args.max_consecutive_tau_moves
+        ),
         enabled_cache_size=args.enabled_cache_size,
         use_calibration=args.use_calibration,
         workers=1,
@@ -552,6 +565,7 @@ def _profile_conformance(
             candidate_apply_to_sync=cfg["candidate_apply_to_sync"],
             restrict_log_moves=cfg["restrict_log_moves"],
             restrict_model_moves_to_tau=cfg["restrict_model_moves_to_tau"],
+            max_consecutive_tau_moves=cfg["max_consecutive_tau_moves"],
             profile_stats=search_stats,
         )
 
@@ -685,6 +699,12 @@ def parse_args() -> argparse.Namespace:
         help="Restrict log moves to top-1 observed label plus previous label; enabled by default.",
     )
     parser.add_argument("--restrict-model-moves-to-tau", action="store_true")
+    parser.add_argument(
+        "--max-consecutive-tau-moves",
+        type=_parse_nonnegative_int,
+        default=8,
+        help="Cap consecutive direct tau/model-quiet moves; use 0 to disable.",
+    )
     return parser.parse_args()
 
 
@@ -742,6 +762,7 @@ def main() -> None:
             "candidate_top_k": cfg["candidate_top_k"],
             "conditioning_state_mode": cfg["conditioning_state_mode"],
             "conditioning_top_m": cfg["conditioning_top_m"],
+            "max_consecutive_tau_moves": cfg["max_consecutive_tau_moves"],
             "max_frames": args.max_frames,
         }
     )
