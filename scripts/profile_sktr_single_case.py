@@ -214,6 +214,7 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
         candidate_top_k=args.candidate_top_k,
         candidate_top_p=args.candidate_top_p,
         candidate_min_k=args.candidate_min_k,
+        conformance_switch_penalty_weight=args.conformance_switch_penalty_weight,
         restrict_log_moves=args.restrict_log_moves,
         restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
         max_consecutive_tau_moves=(
@@ -726,6 +727,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-top-k", type=int, default=3)
     parser.add_argument("--candidate-top-p", type=float, default=1.0)
     parser.add_argument("--candidate-min-k", type=int, default=1)
+    parser.add_argument(
+        "--conformance-switch-penalty-weight",
+        type=_parse_nonnegative_float,
+        default=1.0,
+        help="Penalty added when a sync/log move changes label; 0 disables.",
+    )
     parser.add_argument("--use-calibration", action="store_true")
     parser.add_argument(
         "--restrict-log-moves",
@@ -813,6 +820,7 @@ def main() -> None:
             "weights": fold_inputs["weights"],
             "chunk_size": cfg["chunk_size"],
             "candidate_top_k": cfg["candidate_top_k"],
+            "conformance_switch_penalty_weight": cfg["conformance_switch_penalty_weight"],
             "conditioning_state_mode": cfg["conditioning_state_mode"],
             "conditioning_top_m": cfg["conditioning_top_m"],
             "max_consecutive_tau_moves": cfg["max_consecutive_tau_moves"],

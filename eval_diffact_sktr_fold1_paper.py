@@ -147,6 +147,7 @@ def build_base_config_for_fold(
     candidate_top_k: int,
     candidate_top_p: float,
     candidate_min_k: int,
+    conformance_switch_penalty_weight: float,
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
@@ -175,7 +176,7 @@ def build_base_config_for_fold(
         "independent_sampling": True,
         "prob_threshold": prob_threshold,
         "chunk_size": chunk_size,
-        "conformance_switch_penalty_weight": 1.0,
+        "conformance_switch_penalty_weight": conformance_switch_penalty_weight,
         "merge_mismatched_boundaries": False,
         "conditioning_combine_fn": linear_prob_combiner,
         "max_hist_len": 3,
@@ -387,6 +388,12 @@ def main():
     parser.add_argument("--candidate-top-p", type=float, default=1.0)
     parser.add_argument("--candidate-min-k", type=int, default=1)
     parser.add_argument(
+        "--conformance-switch-penalty-weight",
+        type=parse_nonnegative_float,
+        default=1.0,
+        help="Penalty added when a sync/log move changes label; 0 disables.",
+    )
+    parser.add_argument(
         "--restrict-log-moves",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -542,6 +549,7 @@ def main():
                 candidate_top_k=args.candidate_top_k,
                 candidate_top_p=args.candidate_top_p,
                 candidate_min_k=args.candidate_min_k,
+                conformance_switch_penalty_weight=args.conformance_switch_penalty_weight,
                 restrict_log_moves=args.restrict_log_moves,
                 restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
                 max_consecutive_tau_moves=max_consecutive_tau_moves,
