@@ -220,10 +220,6 @@ def _build_base_config(args: argparse.Namespace) -> Dict[str, Any]:
         max_consecutive_tau_moves=(
             None if args.max_consecutive_tau_moves == 0 else args.max_consecutive_tau_moves
         ),
-        dijkstra_beam_width=(
-            None if args.dijkstra_beam_width == 0 else args.dijkstra_beam_width
-        ),
-        dijkstra_beam_cost_delta=args.dijkstra_beam_cost_delta,
         progress_log_interval_chunks=args.progress_log_interval_chunks,
         enabled_cache_size=args.enabled_cache_size,
         use_calibration=args.use_calibration,
@@ -582,8 +578,6 @@ def _profile_conformance(
             restrict_log_moves=cfg["restrict_log_moves"],
             restrict_model_moves_to_tau=cfg["restrict_model_moves_to_tau"],
             max_consecutive_tau_moves=cfg["max_consecutive_tau_moves"],
-            dijkstra_beam_width=cfg["dijkstra_beam_width"],
-            dijkstra_beam_cost_delta=cfg["dijkstra_beam_cost_delta"],
             progress_log_interval_chunks=cfg["progress_log_interval_chunks"],
             profile_stats=search_stats,
         )
@@ -628,27 +622,10 @@ def _profile_conformance(
         return summary
 
     sktr_preds, move_costs = result
-    ground_truth = [str(x) for x in setup["ground_truth"]]
-    argmax_preds = [str(idx) for idx in np.argmax(setup["test_softmax"], axis=0)]
-    n_compare = min(len(ground_truth), len(sktr_preds), len(argmax_preds))
-    sktr_accuracy = (
-        sum(1 for pred, true in zip(sktr_preds[:n_compare], ground_truth[:n_compare]) if pred == true) / n_compare
-        if n_compare
-        else None
-    )
-    argmax_accuracy = (
-        sum(1 for pred, true in zip(argmax_preds[:n_compare], ground_truth[:n_compare]) if pred == true) / n_compare
-        if n_compare
-        else None
-    )
     summary.update(
         {
             "predictions": int(len(sktr_preds)),
             "move_costs": int(len(move_costs)),
-            "total_move_cost": float(sum(move_costs)),
-            "sktr_accuracy": sktr_accuracy,
-            "argmax_accuracy": argmax_accuracy,
-            "accuracy_frames_compared": int(n_compare),
         }
     )
     return summary
@@ -748,18 +725,6 @@ def parse_args() -> argparse.Namespace:
         help="Cap consecutive direct tau/model-quiet moves; use 0 to disable.",
     )
     parser.add_argument(
-        "--dijkstra-beam-width",
-        type=_parse_nonnegative_int,
-        default=0,
-        help="Keep at most this many states per timestamp/label beam bucket; 0 disables.",
-    )
-    parser.add_argument(
-        "--dijkstra-beam-cost-delta",
-        type=_parse_nonnegative_float,
-        default=None,
-        help="Keep states within this cost delta of the best state in each beam bucket.",
-    )
-    parser.add_argument(
         "--progress-log-interval-chunks",
         type=_parse_nonnegative_int,
         default=0,
@@ -824,8 +789,6 @@ def main() -> None:
             "conditioning_state_mode": cfg["conditioning_state_mode"],
             "conditioning_top_m": cfg["conditioning_top_m"],
             "max_consecutive_tau_moves": cfg["max_consecutive_tau_moves"],
-            "dijkstra_beam_width": cfg["dijkstra_beam_width"],
-            "dijkstra_beam_cost_delta": cfg["dijkstra_beam_cost_delta"],
             "progress_log_interval_chunks": cfg["progress_log_interval_chunks"],
             "max_frames": args.max_frames,
         }

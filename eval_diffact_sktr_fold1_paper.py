@@ -151,8 +151,6 @@ def build_base_config_for_fold(
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
-    dijkstra_beam_width: Optional[int],
-    dijkstra_beam_cost_delta: Optional[float],
     progress_log_interval_chunks: int,
     enabled_cache_size: int,
     use_calibration: bool,
@@ -210,8 +208,6 @@ def build_base_config_for_fold(
         "restrict_log_moves": restrict_log_moves,
         "restrict_model_moves_to_tau": restrict_model_moves_to_tau,
         "max_consecutive_tau_moves": max_consecutive_tau_moves,
-        "dijkstra_beam_width": dijkstra_beam_width,
-        "dijkstra_beam_cost_delta": dijkstra_beam_cost_delta,
         "progress_log_interval_chunks": progress_log_interval_chunks,
         "enabled_cache_size": enabled_cache_size,
     }
@@ -415,18 +411,6 @@ def main():
         help="Cap consecutive direct tau/model-quiet moves; use 0 to disable.",
     )
     parser.add_argument(
-        "--dijkstra-beam-width",
-        type=parse_nonnegative_int,
-        default=0,
-        help="Approximate SKTR: keep at most this many states per timestamp/label bucket; 0 disables.",
-    )
-    parser.add_argument(
-        "--dijkstra-beam-cost-delta",
-        type=parse_nonnegative_float,
-        default=None,
-        help="Keep states within this cost delta of the best state in each beam bucket.",
-    )
-    parser.add_argument(
         "--progress-log-interval-chunks",
         type=parse_nonnegative_int,
         default=0,
@@ -463,9 +447,6 @@ def main():
     args = parser.parse_args()
     max_consecutive_tau_moves = (
         None if args.max_consecutive_tau_moves == 0 else args.max_consecutive_tau_moves
-    )
-    dijkstra_beam_width = (
-        None if args.dijkstra_beam_width == 0 else args.dijkstra_beam_width
     )
 
     diffact_root = workspace_root / "baselines" / "DiffAct"
@@ -553,8 +534,6 @@ def main():
                 restrict_log_moves=args.restrict_log_moves,
                 restrict_model_moves_to_tau=args.restrict_model_moves_to_tau,
                 max_consecutive_tau_moves=max_consecutive_tau_moves,
-                dijkstra_beam_width=dijkstra_beam_width,
-                dijkstra_beam_cost_delta=args.dijkstra_beam_cost_delta,
                 progress_log_interval_chunks=args.progress_log_interval_chunks,
                 enabled_cache_size=args.enabled_cache_size,
                 use_calibration=args.use_calibration,

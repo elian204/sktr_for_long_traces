@@ -100,8 +100,6 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         restrict_log_moves=_WORKER_SETTINGS.get('restrict_log_moves', False),
         restrict_model_moves_to_tau=_WORKER_SETTINGS.get('restrict_model_moves_to_tau', False),
         max_consecutive_tau_moves=_WORKER_SETTINGS.get('max_consecutive_tau_moves'),
-        dijkstra_beam_width=_WORKER_SETTINGS.get('dijkstra_beam_width'),
-        dijkstra_beam_cost_delta=_WORKER_SETTINGS.get('dijkstra_beam_cost_delta'),
         progress_log_interval_chunks=_WORKER_SETTINGS.get('progress_log_interval_chunks', 0),
     )
 
@@ -230,8 +228,6 @@ def _process_single_test_case(
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
-    dijkstra_beam_width: Optional[int],
-    dijkstra_beam_cost_delta: Optional[float],
     progress_log_interval_chunks: int,
 ) -> Tuple[str, List[str], List[float], float, float, pd.DataFrame]:
     """
@@ -282,8 +278,6 @@ def _process_single_test_case(
         restrict_log_moves=restrict_log_moves,
         restrict_model_moves_to_tau=restrict_model_moves_to_tau,
         max_consecutive_tau_moves=max_consecutive_tau_moves,
-        dijkstra_beam_width=dijkstra_beam_width,
-        dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
         progress_log_interval_chunks=progress_log_interval_chunks,
     )
 
@@ -333,8 +327,6 @@ def _process_test_chunk(
     restrict_log_moves: bool,
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
-    dijkstra_beam_width: Optional[int],
-    dijkstra_beam_cost_delta: Optional[float],
     progress_log_interval_chunks: int,
 ) -> Tuple[List[dict], List[float], List[float]]:
     """
@@ -456,8 +448,6 @@ def _process_test_chunk(
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             max_consecutive_tau_moves=max_consecutive_tau_moves,
-            dijkstra_beam_width=dijkstra_beam_width,
-            dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
             progress_log_interval_chunks=progress_log_interval_chunks,
         )
 
@@ -541,8 +531,6 @@ def incremental_softmax_recovery(
     restrict_log_moves: bool = False,
     restrict_model_moves_to_tau: bool = False,
     max_consecutive_tau_moves: Optional[int] = None,
-    dijkstra_beam_width: Optional[int] = None,
-    dijkstra_beam_cost_delta: Optional[float] = None,
     progress_log_interval_chunks: int = 0,
     # Performance optimization parameters
     adaptive_chunk_sizing: bool = False,
@@ -626,10 +614,6 @@ def incremental_softmax_recovery(
     tau_move_cost = _TAU_MOVE_COST_FORCED
     if max_consecutive_tau_moves is not None and max_consecutive_tau_moves < 1:
         raise ValueError("max_consecutive_tau_moves must be positive when set")
-    if dijkstra_beam_width is not None and dijkstra_beam_width < 1:
-        raise ValueError("dijkstra_beam_width must be positive when set")
-    if dijkstra_beam_cost_delta is not None and dijkstra_beam_cost_delta < 0:
-        raise ValueError("dijkstra_beam_cost_delta must be non-negative when set")
     if progress_log_interval_chunks < 0:
         raise ValueError("progress_log_interval_chunks must be non-negative")
 
@@ -925,8 +909,6 @@ def incremental_softmax_recovery(
                 restrict_log_moves,
                 restrict_model_moves_to_tau,
                 max_consecutive_tau_moves,
-                dijkstra_beam_width,
-                dijkstra_beam_cost_delta,
                 progress_log_interval_chunks,
             )
             parallel_args.append(args)
@@ -988,8 +970,6 @@ def incremental_softmax_recovery(
             'restrict_log_moves': restrict_log_moves,
             'restrict_model_moves_to_tau': restrict_model_moves_to_tau,
             'max_consecutive_tau_moves': max_consecutive_tau_moves,
-            'dijkstra_beam_width': dijkstra_beam_width,
-            'dijkstra_beam_cost_delta': dijkstra_beam_cost_delta,
             'progress_log_interval_chunks': progress_log_interval_chunks,
         }
 
@@ -1060,8 +1040,6 @@ def incremental_softmax_recovery(
                 restrict_log_moves=restrict_log_moves,
                 restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                 max_consecutive_tau_moves=max_consecutive_tau_moves,
-                dijkstra_beam_width=dijkstra_beam_width,
-                dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
                 progress_log_interval_chunks=progress_log_interval_chunks,
             )
 

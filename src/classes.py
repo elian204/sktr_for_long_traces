@@ -25,7 +25,7 @@ import logging
 import time
 import sys
 from collections import deque, Counter, defaultdict
-from typing import Callable, Dict, List, Optional, Set, Tuple, Any, Union
+from typing import Callable, Dict, List, Optional, Tuple, Any, Union
 import heapq
 from .utils import adjust_probs_with_sequence_context
 
@@ -1163,9 +1163,6 @@ class PetriNet:
         restrict_model_moves_to_tau: bool = False,
         # Optional cap on consecutive direct tau/model-quiet moves
         max_consecutive_tau_moves: Optional[int] = None,
-        # Optional approximate beam over Dijkstra states, bucketed by timestamp/last label.
-        dijkstra_beam_width: Optional[int] = None,
-        dijkstra_beam_cost_delta: Optional[float] = None,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -1199,17 +1196,6 @@ class PetriNet:
         tau_cap = int(max_consecutive_tau_moves) if use_tau_cap else None
         if tau_cap is not None and tau_cap < 1:
             raise ValueError("max_consecutive_tau_moves must be positive when set")
-        beam_width = int(dijkstra_beam_width) if dijkstra_beam_width is not None else None
-        if beam_width is not None and beam_width < 1:
-            raise ValueError("dijkstra_beam_width must be positive when set")
-        beam_cost_delta = (
-            float(dijkstra_beam_cost_delta)
-            if dijkstra_beam_cost_delta is not None
-            else None
-        )
-        if beam_cost_delta is not None and beam_cost_delta < 0:
-            raise ValueError("dijkstra_beam_cost_delta must be non-negative when set")
-        use_dijkstra_beam = beam_width is not None or beam_cost_delta is not None
 
         # Memory optimization: bound path_prefix to only store what's needed for conditioning.
         # We need n_prev_labels previous DIFFERENT labels plus the current label.
@@ -1294,37 +1280,9 @@ class PetriNet:
         # For top-M / merged modes: keep only the best M history variants per merged base state.
         # We store the full keys (which include context) and their current best costs.
         kept_by_base: Dict[Any, Dict[Any, float]] = defaultdict(dict)
-        topm_base_by_state: Dict[Any, Any] = {}
         if top_m is not None:
             base_start = make_base_key(initial_marking.places, 0, initial_last_label, 0)
             kept_by_base[base_start][start_key] = 0.0
-            topm_base_by_state[start_key] = base_start
-
-        # Approximate beam pruning: keep only the best states per
-        # (timestamp, last emitted label) bucket, with optional cost slack.
-        beam_by_bucket: Dict[Any, Dict[Any, float]] = defaultdict(dict)
-        beam_bucket_by_state: Dict[Any, Any] = {}
-        beam_worst_by_bucket: Dict[Any, List[Tuple[float, int, Any]]] = defaultdict(list)
-        beam_best_by_bucket: Dict[Any, float] = defaultdict(lambda: float('inf'))
-        beam_heap_counter = 0
-
-        def make_beam_bucket(
-            ts: int,
-            last_label: Optional[str],
-            context: Tuple[str, ...],
-        ) -> Tuple[int, Optional[str]]:
-            bucket_label = last_label
-            if bucket_label is None and context:
-                bucket_label = context[-1]
-            return (int(ts), bucket_label)
-
-        start_beam_bucket = make_beam_bucket(0, initial_last_label, tuple())
-        if use_dijkstra_beam:
-            beam_by_bucket[start_beam_bucket][start_key] = 0.0
-            beam_bucket_by_state[start_key] = start_beam_bucket
-            beam_best_by_bucket[start_beam_bucket] = 0.0
-            heapq.heappush(beam_worst_by_bucket[start_beam_bucket], (0.0, beam_heap_counter, start_key))
-            beam_heap_counter += 1
 
         # Additional dominance pruning across last_label for the same (places, timestamp):
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
@@ -1377,11 +1335,6 @@ class PetriNet:
         macro_fire_calls = 0
         topm_rejects = 0
         topm_evictions = 0
-        beam_rejects = 0
-        beam_evictions = 0
-        beam_delta_accepts = 0
-        beam_updates = 0
-        max_beam_bucket_size = 1 if use_dijkstra_beam else 0
         heap_compactions = 0
         max_heap_size = len(open_set)
         max_dist_size = len(dist)
@@ -1437,169 +1390,39 @@ class PetriNet:
             m = min(m, topk_idx.size)
             return topk_idx[:m]
 
-        def _remove_from_top_m(state_key: Any) -> None:
-            base_key = topm_base_by_state.pop(state_key, None)
-            if base_key is None:
-                return
-            variants = kept_by_base.get(base_key)
-            if variants is None:
-                return
-            variants.pop(state_key, None)
-            if not variants:
-                kept_by_base.pop(base_key, None)
-
-        def _remove_from_beam(state_key: Any) -> None:
-            bucket = beam_bucket_by_state.pop(state_key, None)
-            if bucket is None:
-                return
-            variants = beam_by_bucket.get(bucket)
-            if variants is None:
-                return
-            variants.pop(state_key, None)
-            if not variants:
-                beam_by_bucket.pop(bucket, None)
-                beam_best_by_bucket.pop(bucket, None)
-
-        def _drop_search_state(state_key: Any) -> None:
-            # Leave came_from intact: reconstructed paths may reference an already
-            # expanded parent, while dropped unexpanded states simply become stale.
-            dist.pop(state_key, None)
-            marking_by_key.pop(state_key, None)
-            _remove_from_top_m(state_key)
-            _remove_from_beam(state_key)
-
-        def _plan_top_m(base_key: Any, state_key: Any, new_cost: float) -> Tuple[bool, Optional[Any]]:
+        def _apply_top_m(base_key: Any, state_key: Any, new_cost: float) -> bool:
+            """
+            Return True if this (base_key, state_key) variant is allowed under the top-M cap.
+            May evict a worse variant from the same base_key to make room.
+            """
+            nonlocal topm_rejects, topm_evictions
             if top_m is None:
-                return True, None
+                return True
 
-            variants = kept_by_base.get(base_key)
-            if not variants:
-                return True, None
-
+            variants = kept_by_base[base_key]
             existing = variants.get(state_key)
             if existing is not None:
-                return True, None
+                if new_cost < existing - 1e-12:
+                    variants[state_key] = new_cost
+                return True
 
             if len(variants) < top_m:
-                return True, None
+                variants[state_key] = new_cost
+                return True
 
+            # Evict the current worst variant for this base state if this one is better.
             worst_key, worst_cost = max(variants.items(), key=lambda kv: kv[1])
             if new_cost < worst_cost - 1e-12:
-                return True, worst_key
-
-            return False, None
-
-        def _peek_beam_worst(bucket: Any) -> Tuple[Optional[Any], float]:
-            heap = beam_worst_by_bucket.get(bucket)
-            variants = beam_by_bucket.get(bucket)
-            if not heap or not variants:
-                return None, float('inf')
-            while heap:
-                neg_cost, _, state_key = heap[0]
-                cost_value = -neg_cost
-                if variants.get(state_key) == cost_value:
-                    return state_key, cost_value
-                heapq.heappop(heap)
-            return None, float('inf')
-
-        def _plan_beam(
-            bucket: Any,
-            state_key: Any,
-            new_cost: float,
-        ) -> Tuple[bool, Optional[Any], bool]:
-            if not use_dijkstra_beam:
-                return True, None, False
-
-            variants = beam_by_bucket.get(bucket)
-            existing = variants.get(state_key) if variants is not None else None
-            if existing is not None:
-                return True, None, False
-
-            best_cost = min(beam_best_by_bucket.get(bucket, float('inf')), new_cost)
-            within_delta = (
-                beam_cost_delta is not None
-                and new_cost <= best_cost + beam_cost_delta + 1e-12
-            )
-
-            if beam_width is None:
-                return (True, None, within_delta) if within_delta else (False, None, False)
-
-            current_size = len(variants) if variants is not None else 0
-            if current_size < beam_width:
-                return True, None, False
-
-            if within_delta:
-                return True, None, True
-
-            worst_key, worst_cost = _peek_beam_worst(bucket)
-            if worst_key is not None and new_cost < worst_cost - 1e-12:
-                return True, worst_key, False
-
-            return False, None, False
-
-        def _commit_top_m(
-            base_key: Any,
-            state_key: Any,
-            new_cost: float,
-            evict_key: Optional[Any],
-        ) -> None:
-            nonlocal topm_evictions
-            if top_m is None:
-                return
-            if evict_key is not None:
+                del variants[worst_key]
                 topm_evictions += 1
-                _drop_search_state(evict_key)
-            variants = kept_by_base[base_key]
-            variants[state_key] = new_cost
-            topm_base_by_state[state_key] = base_key
+                # Remove heavy per-state data to free memory; leave came_from for reconstruction
+                dist.pop(worst_key, None)
+                marking_by_key.pop(worst_key, None)
+                variants[state_key] = new_cost
+                return True
 
-        def _commit_beam(
-            bucket: Any,
-            state_key: Any,
-            new_cost: float,
-            evict_key: Optional[Any],
-            accepted_by_delta: bool,
-        ) -> None:
-            nonlocal beam_heap_counter, beam_evictions, beam_delta_accepts, beam_updates, max_beam_bucket_size
-            if not use_dijkstra_beam:
-                return
-            if evict_key is not None:
-                beam_evictions += 1
-                _drop_search_state(evict_key)
-            variants = beam_by_bucket[bucket]
-            if state_key in variants:
-                beam_updates += 1
-            variants[state_key] = new_cost
-            beam_bucket_by_state[state_key] = bucket
-            if new_cost < beam_best_by_bucket[bucket]:
-                beam_best_by_bucket[bucket] = new_cost
-            heapq.heappush(beam_worst_by_bucket[bucket], (-new_cost, beam_heap_counter, state_key))
-            beam_heap_counter += 1
-            if accepted_by_delta:
-                beam_delta_accepts += 1
-            if len(variants) > max_beam_bucket_size:
-                max_beam_bucket_size = len(variants)
-
-        def _accept_state(
-            base_key: Any,
-            beam_bucket: Any,
-            state_key: Any,
-            new_cost: float,
-        ) -> bool:
-            nonlocal topm_rejects, beam_rejects
-            topm_ok, topm_evict = _plan_top_m(base_key, state_key, new_cost)
-            if not topm_ok:
-                topm_rejects += 1
-                return False
-
-            beam_ok, beam_evict, accepted_by_delta = _plan_beam(beam_bucket, state_key, new_cost)
-            if not beam_ok:
-                beam_rejects += 1
-                return False
-
-            _commit_top_m(base_key, state_key, new_cost, topm_evict)
-            _commit_beam(beam_bucket, state_key, new_cost, beam_evict, accepted_by_delta)
-            return True
+            topm_rejects += 1
+            return False
 
         try:
             while open_set:
@@ -1818,8 +1641,7 @@ class PetriNet:
                     # Dist-on-push: only push if this is a better path
                     model_relaxations += 1
                     if new_cost < dist.get(new_key, float('inf')):
-                        new_beam_bucket = make_beam_bucket(timestamp, last_label, path_prefix)
-                        if not _accept_state(new_base_key, new_beam_bucket, new_key, new_cost):
+                        if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
                         came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
@@ -1880,8 +1702,7 @@ class PetriNet:
                         # Dist-on-push: only push if this is a better path
                         log_relaxations += 1
                         if new_cost < dist.get(new_key, float('inf')):
-                            new_beam_bucket = make_beam_bucket(timestamp + 1, label, new_path_prefix)
-                            if not _accept_state(new_base_key, new_beam_bucket, new_key, new_cost):
+                            if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
                             came_from[new_key] = (key, 'log', label, c + add_switch)
@@ -1965,8 +1786,7 @@ class PetriNet:
                     # Dist-on-push: only push if this is a better path
                     sync_relaxations += 1
                     if new_cost < dist.get(new_key, float('inf')):
-                        new_beam_bucket = make_beam_bucket(timestamp + 1, t.label, new_path_prefix)
-                        if not _accept_state(new_base_key, new_beam_bucket, new_key, new_cost):
+                        if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
                         came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
@@ -2034,14 +1854,6 @@ class PetriNet:
                 profile_stats["macro_fire_calls"] = profile_stats.get("macro_fire_calls", 0) + macro_fire_calls
                 profile_stats["topm_rejects"] = profile_stats.get("topm_rejects", 0) + topm_rejects
                 profile_stats["topm_evictions"] = profile_stats.get("topm_evictions", 0) + topm_evictions
-                profile_stats["beam_rejects"] = profile_stats.get("beam_rejects", 0) + beam_rejects
-                profile_stats["beam_evictions"] = profile_stats.get("beam_evictions", 0) + beam_evictions
-                profile_stats["beam_delta_accepts"] = profile_stats.get("beam_delta_accepts", 0) + beam_delta_accepts
-                profile_stats["beam_updates"] = profile_stats.get("beam_updates", 0) + beam_updates
-                profile_stats["max_beam_bucket_size"] = max(profile_stats.get("max_beam_bucket_size", 0), max_beam_bucket_size)
-                profile_stats["last_beam_bucket_count"] = len(beam_by_bucket)
-                profile_stats["dijkstra_beam_width"] = beam_width
-                profile_stats["dijkstra_beam_cost_delta"] = beam_cost_delta
                 profile_stats["heap_compactions"] = profile_stats.get("heap_compactions", 0) + heap_compactions
                 profile_stats["prob_vec_cache_hits"] = profile_stats.get("prob_vec_cache_hits", 0) + prob_vec_cache_hits
                 profile_stats["prob_vec_cache_misses"] = profile_stats.get("prob_vec_cache_misses", 0) + prob_vec_cache_misses
@@ -2089,8 +1901,6 @@ class PetriNet:
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
         max_consecutive_tau_moves: Optional[int] = None,
-        dijkstra_beam_width: Optional[int] = None,
-        dijkstra_beam_cost_delta: Optional[float] = None,
         progress_log_interval_chunks: int = 0,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -2230,8 +2040,6 @@ class PetriNet:
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                     max_consecutive_tau_moves=max_consecutive_tau_moves,
-                    dijkstra_beam_width=dijkstra_beam_width,
-                    dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
                     profile_stats=profile_stats,
                 )
                 c1_elapsed = time.perf_counter() - c1_start
@@ -2295,8 +2103,6 @@ class PetriNet:
                 restrict_log_moves=restrict_log_moves,
                 restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                 max_consecutive_tau_moves=max_consecutive_tau_moves,
-                dijkstra_beam_width=dijkstra_beam_width,
-                dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
                 profile_stats=profile_stats,
             )
             c2_elapsed = time.perf_counter() - c2_start
@@ -2334,8 +2140,6 @@ class PetriNet:
                     restrict_log_moves=restrict_log_moves,
                     restrict_model_moves_to_tau=restrict_model_moves_to_tau,
                     max_consecutive_tau_moves=max_consecutive_tau_moves,
-                    dijkstra_beam_width=dijkstra_beam_width,
-                    dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
                     profile_stats=profile_stats,
                 )
                 m_elapsed = time.perf_counter() - m_start
@@ -2449,8 +2253,6 @@ class PetriNet:
         restrict_log_moves: bool = False,
         restrict_model_moves_to_tau: bool = False,
         max_consecutive_tau_moves: Optional[int] = None,
-        dijkstra_beam_width: Optional[int] = None,
-        dijkstra_beam_cost_delta: Optional[float] = None,
         progress_log_interval_chunks: int = 0,
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[float]]:
@@ -2500,8 +2302,6 @@ class PetriNet:
             restrict_log_moves=restrict_log_moves,
             restrict_model_moves_to_tau=restrict_model_moves_to_tau,
             max_consecutive_tau_moves=max_consecutive_tau_moves,
-            dijkstra_beam_width=dijkstra_beam_width,
-            dijkstra_beam_cost_delta=dijkstra_beam_cost_delta,
             progress_log_interval_chunks=progress_log_interval_chunks,
             profile_stats=profile_stats,
         )
