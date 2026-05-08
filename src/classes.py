@@ -1248,6 +1248,64 @@ class PetriNet:
             and use_last_label_in_state
             and use_tau_cap
         )
+        use_compact_state_keys = (
+            use_specialized_key_layout
+            and (state_cache is None or len(state_cache) == 0)
+        )
+
+        label_none_id = -1
+        marking_id_by_places: Dict[Tuple[int, ...], int] = {initial_marking.places: 0}
+        next_marking_id = 1
+        prefix_id_by_tuple: Dict[Tuple[str, ...], int] = {tuple(): 0}
+        prefix_by_id: List[Tuple[str, ...]] = [tuple()]
+        prefix_extend_cache: Dict[Tuple[int, int], int] = {}
+
+        def _label_to_key_id(label: Optional[str]) -> int:
+            return label_none_id if label is None else label2idx.get(label, label_none_id)
+
+        def _get_marking_id(marking: 'Marking') -> int:
+            nonlocal next_marking_id
+            places_key = marking.places
+            marking_id = marking_id_by_places.get(places_key)
+            if marking_id is None:
+                marking_id = next_marking_id
+                next_marking_id += 1
+                marking_id_by_places[places_key] = marking_id
+            return marking_id
+
+        def _get_marking_id_from_places(places: Tuple[int, ...]) -> int:
+            nonlocal next_marking_id
+            marking_id = marking_id_by_places.get(places)
+            if marking_id is None:
+                marking_id = next_marking_id
+                next_marking_id += 1
+                marking_id_by_places[places] = marking_id
+            return marking_id
+
+        def _get_prefix_id(prefix: Tuple[str, ...]) -> int:
+            prefix_id = prefix_id_by_tuple.get(prefix)
+            if prefix_id is None:
+                prefix_id = len(prefix_by_id)
+                prefix_id_by_tuple[prefix] = prefix_id
+                prefix_by_id.append(prefix)
+            return prefix_id
+
+        def _extend_prefix_id(prefix_id: int, label_idx: int) -> int:
+            cache_key = (prefix_id, label_idx)
+            cached_prefix_id = prefix_extend_cache.get(cache_key)
+            if cached_prefix_id is not None:
+                return cached_prefix_id
+
+            prefix = prefix_by_id[prefix_id]
+            label = idx2label[label_idx]
+            if prefix and prefix[-1] == label:
+                new_prefix_id = prefix_id
+            elif len(prefix) >= max_prefix_distinct_labels:
+                new_prefix_id = _get_prefix_id(prefix[1:] + (label,))
+            else:
+                new_prefix_id = _get_prefix_id(prefix + (label,))
+            prefix_extend_cache[cache_key] = new_prefix_id
+            return new_prefix_id
 
         def make_key(
             places: Tuple[int, ...],
@@ -1256,6 +1314,14 @@ class PetriNet:
             context: Tuple[str, ...],
             tau_run_len: int = 0,
         ):
+            if use_compact_state_keys:
+                return (
+                    _get_marking_id_from_places(places),
+                    ts,
+                    _label_to_key_id(last_label),
+                    _get_prefix_id(context),
+                    tau_run_len,
+                )
             if use_specialized_key_layout:
                 return (places, ts, last_label, context, tau_run_len)
             if use_conditioning_context:
@@ -1271,12 +1337,21 @@ class PetriNet:
             last_label: Optional[str],
             tau_run_len: int = 0,
         ):
+            if use_compact_state_keys:
+                return (
+                    _get_marking_id_from_places(places),
+                    ts,
+                    _label_to_key_id(last_label),
+                    tau_run_len,
+                )
             if use_specialized_key_layout:
                 return (places, ts, last_label, tau_run_len)
             base = (places, ts, last_label) if use_last_label_in_state else (places, ts)
             return (*base, int(tau_run_len)) if use_tau_cap else base
 
         def make_unlabeled_key(places: Tuple[int, ...], ts: int, tau_run_len: int = 0):
+            if use_compact_state_keys:
+                return (_get_marking_id_from_places(places), ts, tau_run_len)
             if use_specialized_key_layout:
                 return (places, ts, tau_run_len)
             base = (places, ts)
@@ -1370,15 +1445,15 @@ class PetriNet:
         max_dist_size = len(dist)
         max_marking_by_key_size = len(marking_by_key)
         last_timestamp_seen = 0
-        prob_vec_cache: Dict[Tuple[int, Tuple[str, ...]], np.ndarray] = {}
-        candidate_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[Optional[np.ndarray], Optional[Set[int]]]] = {}
-        cost_vec_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[np.ndarray, np.ndarray]] = {}
+        prob_vec_cache: Dict[Any, np.ndarray] = {}
+        candidate_cache: Dict[Any, Tuple[Optional[np.ndarray], Optional[Set[int]]]] = {}
+        cost_vec_cache: Dict[Any, Tuple[np.ndarray, np.ndarray]] = {}
         enabled_info_cache: Dict[
-            Tuple[int, ...],
+            Any,
             Tuple[List[Transition], List[Transition], List[Tuple[Transition, int, str]]],
         ] = {}
-        direct_fire_cache: Dict[Tuple[Tuple[int, ...], Transition], 'Marking'] = {}
-        macro_fire_cache: Dict[Tuple[Tuple[int, ...], Transition], 'Marking'] = {}
+        direct_fire_cache: Dict[Tuple[Any, Transition], Any] = {}
+        macro_fire_cache: Dict[Tuple[Any, Transition], Any] = {}
         prob_vec_cache_hits = 0
         prob_vec_cache_misses = 0
         candidate_cache_hits = 0
@@ -1389,14 +1464,18 @@ class PetriNet:
         fire_cache_misses = 0
         switch_penalty_active = switch_penalty_weight > 0.0 and prob_dict_uncollapsed is not None
         switch_penalty_by_label: Dict[str, float] = {}
+        switch_penalty_by_label_idx = [0.0] * n_acts
         if switch_penalty_active:
-            for label in class_labels:
+            for label_idx, label in enumerate(class_labels):
                 bigram_prefix = (label,)
                 p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(label, 0.0))
                 p_stay = max(min(p_stay, 1.0), 0.0)
-                switch_penalty_by_label[label] = switch_penalty_weight * p_stay
+                penalty = switch_penalty_weight * p_stay
+                switch_penalty_by_label[label] = penalty
+                switch_penalty_by_label_idx[label_idx] = penalty
 
         def _build_enabled_transition_info(
+            cache_key: Any,
             places_key: Tuple[int, ...],
         ) -> Tuple[List[Transition], List[Transition], List[Tuple[Transition, int, str]]]:
             enabled_transitions = self._find_available_transitions(places_key)
@@ -1410,7 +1489,7 @@ class PetriNet:
                     tau_transitions.append(transition)
 
             cached = (enabled_transitions, tau_transitions, visible_transitions)
-            enabled_info_cache[places_key] = cached
+            enabled_info_cache[cache_key] = cached
             return cached
 
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
@@ -1527,8 +1606,16 @@ class PetriNet:
                     continue
 
                 # Extract key components (key structure depends on flags)
-                if use_specialized_key_layout:
+                if use_compact_state_keys:
+                    marking_id, timestamp, last_label_id, prefix_id, tau_run_len = key
+                    places = marking.places
+                    last_label = idx2label[last_label_id] if last_label_id >= 0 else None
+                    path_prefix = None
+                elif use_specialized_key_layout:
                     places, timestamp, last_label, path_prefix, tau_run_len = key
+                    marking_id = None
+                    last_label_id = _label_to_key_id(last_label)
+                    prefix_id = None
                 else:
                     if use_tau_cap:
                         key_parts = key[:-1]
@@ -1549,13 +1636,18 @@ class PetriNet:
                             places, timestamp = key_parts
                             last_label = None
                         path_prefix = tuple()
+                    marking_id = None
+                    last_label_id = _label_to_key_id(last_label)
+                    prefix_id = None
                 if timestamp > last_timestamp_seen:
                     last_timestamp_seen = int(timestamp)
                 if tau_run_len > max_tau_run_seen:
                     max_tau_run_seen = tau_run_len
 
                 unlabeled_key = (
-                    (places, timestamp, tau_run_len)
+                    (marking_id, timestamp, tau_run_len)
+                    if use_compact_state_keys
+                    else (places, timestamp, tau_run_len)
                     if use_specialized_key_layout
                     else make_unlabeled_key(places, timestamp, tau_run_len)
                 )
@@ -1594,9 +1686,10 @@ class PetriNet:
 
                 enabled_calls += 1
                 enabled_scanned_transitions += n_transitions_total
-                enabled_info = enabled_info_cache.get(places)
+                enabled_cache_key = marking_id if use_compact_state_keys else places
+                enabled_info = enabled_info_cache.get(enabled_cache_key)
                 if enabled_info is None:
-                    enabled_info = _build_enabled_transition_info(places)
+                    enabled_info = _build_enabled_transition_info(enabled_cache_key, places)
                 enabled, tau_enabled, sync_enabled = enabled_info
                 enabled_len = len(enabled)
                 enabled_total += enabled_len
@@ -1605,20 +1698,29 @@ class PetriNet:
                 raw_vec = softmax_matrix[:, timestamp]
                 if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
                     conditioning_calls += 1
-                    prob_cache_key = (timestamp, path_prefix)
+                    prob_cache_key = (
+                        (timestamp, prefix_id)
+                        if use_compact_state_keys
+                        else (timestamp, path_prefix)
+                    )
                     cached_prob_vec = prob_vec_cache.get(prob_cache_key)
                     if cached_prob_vec is not None:
                         prob_vec_cache_hits += 1
                         prob_vec = cached_prob_vec
                     else:
                         prob_vec_cache_misses += 1
+                        conditioning_prefix = (
+                            prefix_by_id[prefix_id]
+                            if use_compact_state_keys
+                            else path_prefix
+                        )
                         # Determine which mode to use based on conditioning_n_prev_labels
                         if conditioning_n_prev_labels == 1 and bigram_map:
                             # Legacy mode: single previous label with bigram_map
                             prob_vec = adjust_probs_with_sequence_context(
                                 observed_probs=raw_vec,
                                 class_labels=class_labels,
-                                predicted_sequence=list(path_prefix),
+                                predicted_sequence=list(conditioning_prefix),
                                 cond_prob_bigram=bigram_map,
                                 alpha=conditioning_alpha,
                                 combine_fn=conditioning_combine_fn,
@@ -1630,7 +1732,7 @@ class PetriNet:
                             prob_vec = adjust_probs_with_sequence_context(
                                 observed_probs=raw_vec,
                                 class_labels=class_labels,
-                                predicted_sequence=list(path_prefix),
+                                predicted_sequence=list(conditioning_prefix),
                                 prob_dict_uncollapsed=prob_dict_uncollapsed,
                                 prob_dict_collapsed=prob_dict_collapsed,
                                 alpha=conditioning_alpha,
@@ -1647,7 +1749,11 @@ class PetriNet:
                 # Candidate pruning: always use conditioned probabilities (prob_vec).
                 # When conditioning is disabled, prob_vec == raw_vec.
                 candidate_selection_calls += 1
-                candidate_cache_key = (timestamp, path_prefix)
+                candidate_cache_key = (
+                    (timestamp, prefix_id)
+                    if use_compact_state_keys
+                    else (timestamp, path_prefix)
+                )
                 cached_candidates = candidate_cache.get(candidate_cache_key)
                 if cached_candidates is not None:
                     candidate_cache_hits += 1
@@ -1685,6 +1791,7 @@ class PetriNet:
                     if marking_transition_entry is not None
                     else None
                 )
+                fire_cache_marking_key = marking_id if use_compact_state_keys else places
                 next_timestamp = timestamp + 1
 
                 # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
@@ -1708,48 +1815,70 @@ class PetriNet:
                                 continue
                             tau_cost_total = tau_path_len * tau_cost_const
                             new_tau_run_len = 0
-                            fire_key = (places, t)
-                            new_mark = macro_fire_cache.get(fire_key)
-                            if new_mark is None:
+                            fire_key = (fire_cache_marking_key, t)
+                            cached_fire = macro_fire_cache.get(fire_key)
+                            if cached_fire is None:
                                 fire_cache_misses += 1
                                 new_mark = self._fire_macro_transition(marking, t)
-                                macro_fire_cache[fire_key] = new_mark
+                                if use_compact_state_keys:
+                                    new_marking_id = _get_marking_id(new_mark)
+                                    macro_fire_cache[fire_key] = (new_mark, new_marking_id)
+                                else:
+                                    new_marking_id = None
+                                    macro_fire_cache[fire_key] = new_mark
                                 macro_fire_calls += 1
                             else:
                                 fire_cache_hits += 1
+                                if use_compact_state_keys:
+                                    new_mark, new_marking_id = cached_fire
+                                else:
+                                    new_mark = cached_fire
+                                    new_marking_id = None
                         else:
                             # This is a directly enabled tau transition
                             if tau_cap is not None and tau_run_len >= tau_cap:
                                 tau_moves_skipped_cap += 1
                                 continue
                             new_tau_run_len = tau_run_len + 1 if use_tau_cap else 0
-                            fire_key = (places, t)
-                            new_mark = direct_fire_cache.get(fire_key)
-                            if new_mark is None:
+                            fire_key = (fire_cache_marking_key, t)
+                            cached_fire = direct_fire_cache.get(fire_key)
+                            if cached_fire is None:
                                 fire_cache_misses += 1
                                 new_mark = self._fire_transition(marking, t)
-                                direct_fire_cache[fire_key] = new_mark
+                                if use_compact_state_keys:
+                                    new_marking_id = _get_marking_id(new_mark)
+                                    direct_fire_cache[fire_key] = (new_mark, new_marking_id)
+                                else:
+                                    new_marking_id = None
+                                    direct_fire_cache[fire_key] = new_mark
                                 fire_transition_calls += 1
                             else:
                                 fire_cache_hits += 1
+                                if use_compact_state_keys:
+                                    new_mark, new_marking_id = cached_fire
+                                else:
+                                    new_mark = cached_fire
+                                    new_marking_id = None
 
                         new_cost = cost + tau_cost_total + tau_cost_const
                         if new_tau_run_len > max_tau_run_seen:
                             max_tau_run_seen = new_tau_run_len
-                        new_key = (
-                            (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
-                            if use_specialized_key_layout
-                            else make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
-                        )
+                        if use_compact_state_keys:
+                            new_key = (new_marking_id, timestamp, last_label_id, prefix_id, new_tau_run_len)
+                        elif use_specialized_key_layout:
+                            new_key = (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                        else:
+                            new_key = make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
 
                         # Dist-on-push: only push if this is a better path
                         model_relaxations += 1
                         if new_cost < dist.get(new_key, INF):
-                            new_base_key = (
-                                (new_mark.places, timestamp, last_label, new_tau_run_len)
-                                if use_specialized_key_layout
-                                else make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
-                            )
+                            if use_compact_state_keys:
+                                new_base_key = (new_marking_id, timestamp, last_label_id, new_tau_run_len)
+                            elif use_specialized_key_layout:
+                                new_base_key = (new_mark.places, timestamp, last_label, new_tau_run_len)
+                            else:
+                                new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
                             if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
@@ -1775,49 +1904,71 @@ class PetriNet:
                                 continue
                             tau_cost_total = tau_path_len * tau_cost_const
                             new_tau_run_len = 0
-                            fire_key = (places, t)
-                            new_mark = macro_fire_cache.get(fire_key)
-                            if new_mark is None:
+                            fire_key = (fire_cache_marking_key, t)
+                            cached_fire = macro_fire_cache.get(fire_key)
+                            if cached_fire is None:
                                 fire_cache_misses += 1
                                 new_mark = self._fire_macro_transition(marking, t)
-                                macro_fire_cache[fire_key] = new_mark
+                                if use_compact_state_keys:
+                                    new_marking_id = _get_marking_id(new_mark)
+                                    macro_fire_cache[fire_key] = (new_mark, new_marking_id)
+                                else:
+                                    new_marking_id = None
+                                    macro_fire_cache[fire_key] = new_mark
                                 macro_fire_calls += 1
                             else:
                                 fire_cache_hits += 1
+                                if use_compact_state_keys:
+                                    new_mark, new_marking_id = cached_fire
+                                else:
+                                    new_mark = cached_fire
+                                    new_marking_id = None
                         else:
                             # This is a directly enabled transition
                             if tau_cap is not None and t_is_tau and tau_run_len >= tau_cap:
                                 tau_moves_skipped_cap += 1
                                 continue
                             new_tau_run_len = tau_run_len + 1 if use_tau_cap and t_is_tau else 0
-                            fire_key = (places, t)
-                            new_mark = direct_fire_cache.get(fire_key)
-                            if new_mark is None:
+                            fire_key = (fire_cache_marking_key, t)
+                            cached_fire = direct_fire_cache.get(fire_key)
+                            if cached_fire is None:
                                 fire_cache_misses += 1
                                 new_mark = self._fire_transition(marking, t)
-                                direct_fire_cache[fire_key] = new_mark
+                                if use_compact_state_keys:
+                                    new_marking_id = _get_marking_id(new_mark)
+                                    direct_fire_cache[fire_key] = (new_mark, new_marking_id)
+                                else:
+                                    new_marking_id = None
+                                    direct_fire_cache[fire_key] = new_mark
                                 fire_transition_calls += 1
                             else:
                                 fire_cache_hits += 1
+                                if use_compact_state_keys:
+                                    new_mark, new_marking_id = cached_fire
+                                else:
+                                    new_mark = cached_fire
+                                    new_marking_id = None
                         move_type = 'tau' if t_is_tau else 'model'
                         c = tau_cost_const if t_is_tau else model_cost_const
                         new_cost = cost + tau_cost_total + c
                         if new_tau_run_len > max_tau_run_seen:
                             max_tau_run_seen = new_tau_run_len
-                        new_key = (
-                            (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
-                            if use_specialized_key_layout
-                            else make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
-                        )
+                        if use_compact_state_keys:
+                            new_key = (new_marking_id, timestamp, last_label_id, prefix_id, new_tau_run_len)
+                        elif use_specialized_key_layout:
+                            new_key = (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                        else:
+                            new_key = make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
 
                         # Dist-on-push: only push if this is a better path
                         model_relaxations += 1
                         if new_cost < dist.get(new_key, INF):
-                            new_base_key = (
-                                (new_mark.places, timestamp, last_label, new_tau_run_len)
-                                if use_specialized_key_layout
-                                else make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
-                            )
+                            if use_compact_state_keys:
+                                new_base_key = (new_marking_id, timestamp, last_label_id, new_tau_run_len)
+                            elif use_specialized_key_layout:
+                                new_base_key = (new_mark.places, timestamp, last_label, new_tau_run_len)
+                            else:
+                                new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
                             if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
@@ -1839,8 +1990,13 @@ class PetriNet:
                         # Use raw (observed) probabilities for top-1.
                         top1_idx = int(raw_top1_by_ts[timestamp])
                         restricted_indices = [top1_idx]
-                        if last_label is not None and last_label in label2idx:
+                        if use_compact_state_keys:
+                            last_idx = last_label_id
+                        elif last_label is not None and last_label in label2idx:
                             last_idx = label2idx[last_label]
+                        else:
+                            last_idx = label_none_id
+                        if last_idx >= 0:
                             if last_idx not in restricted_indices:
                                 restricted_indices.append(last_idx)
                         iter_indices = restricted_indices
@@ -1860,11 +2016,17 @@ class PetriNet:
                         c = float(log_cost_vec[int(idx)])
                         # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                         add_switch = 0.0
-                        if switch_penalty_active and last_label is not None and label != last_label:
+                        if use_compact_state_keys:
+                            if switch_penalty_active and last_label_id >= 0 and int(idx) != last_label_id:
+                                add_switch = switch_penalty_by_label_idx[last_label_id]
+                        elif switch_penalty_active and last_label is not None and label != last_label:
                             add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                         new_cost = cost + c + add_switch
-                        if use_conditioning_context:
+                        if use_compact_state_keys:
+                            new_prefix_id = _extend_prefix_id(prefix_id, int(idx))
+                            new_path_prefix = None
+                        elif use_conditioning_context:
                             if path_prefix and path_prefix[-1] == label:
                                 new_path_prefix = path_prefix
                             elif len(path_prefix) >= max_prefix_distinct_labels:
@@ -1873,20 +2035,22 @@ class PetriNet:
                                 new_path_prefix = path_prefix + (label,)
                         else:
                             new_path_prefix = tuple()
-                        new_key = (
-                            (places, next_timestamp, label, new_path_prefix, 0)
-                            if use_specialized_key_layout
-                            else make_key(places, next_timestamp, label, new_path_prefix, 0)
-                        )
+                        if use_compact_state_keys:
+                            new_key = (marking_id, next_timestamp, int(idx), new_prefix_id, 0)
+                        elif use_specialized_key_layout:
+                            new_key = (places, next_timestamp, label, new_path_prefix, 0)
+                        else:
+                            new_key = make_key(places, next_timestamp, label, new_path_prefix, 0)
 
                         # Dist-on-push: only push if this is a better path
                         log_relaxations += 1
                         if new_cost < dist.get(new_key, INF):
-                            new_base_key = (
-                                (places, next_timestamp, label, 0)
-                                if use_specialized_key_layout
-                                else make_base_key(places, next_timestamp, label, 0)
-                            )
+                            if use_compact_state_keys:
+                                new_base_key = (marking_id, next_timestamp, int(idx), 0)
+                            elif use_specialized_key_layout:
+                                new_base_key = (places, next_timestamp, label, 0)
+                            else:
+                                new_base_key = make_base_key(places, next_timestamp, label, 0)
                             if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
@@ -1904,7 +2068,11 @@ class PetriNet:
                 for t, idx, t_label in sync_enabled:
                     # Allow parent's last_label for sync moves even if not in top-k
                     if cand_idx_set is not None and idx not in cand_idx_set:
-                        if last_label is None or t_label != last_label:
+                        if (
+                            (last_label_id < 0 or idx != last_label_id)
+                            if use_compact_state_keys
+                            else (last_label is None or t_label != last_label)
+                        ):
                             sync_edges_skipped_candidate += 1
                             continue
                     p_adj = float(prob_vec[idx])
@@ -1926,34 +2094,60 @@ class PetriNet:
                             macro_tau_paths_skipped_cap += 1
                             continue
                         tau_cost_total = tau_path_len * tau_cost_const
-                        fire_key = (places, t)
-                        new_mark = macro_fire_cache.get(fire_key)
-                        if new_mark is None:
+                        fire_key = (fire_cache_marking_key, t)
+                        cached_fire = macro_fire_cache.get(fire_key)
+                        if cached_fire is None:
                             fire_cache_misses += 1
                             new_mark = self._fire_macro_transition(marking, t)
-                            macro_fire_cache[fire_key] = new_mark
+                            if use_compact_state_keys:
+                                new_marking_id = _get_marking_id(new_mark)
+                                macro_fire_cache[fire_key] = (new_mark, new_marking_id)
+                            else:
+                                new_marking_id = None
+                                macro_fire_cache[fire_key] = new_mark
                             macro_fire_calls += 1
                         else:
                             fire_cache_hits += 1
+                            if use_compact_state_keys:
+                                new_mark, new_marking_id = cached_fire
+                            else:
+                                new_mark = cached_fire
+                                new_marking_id = None
                     else:
                         # This is a directly enabled transition
-                        fire_key = (places, t)
-                        new_mark = direct_fire_cache.get(fire_key)
-                        if new_mark is None:
+                        fire_key = (fire_cache_marking_key, t)
+                        cached_fire = direct_fire_cache.get(fire_key)
+                        if cached_fire is None:
                             fire_cache_misses += 1
                             new_mark = self._fire_transition(marking, t)
-                            direct_fire_cache[fire_key] = new_mark
+                            if use_compact_state_keys:
+                                new_marking_id = _get_marking_id(new_mark)
+                                direct_fire_cache[fire_key] = (new_mark, new_marking_id)
+                            else:
+                                new_marking_id = None
+                                direct_fire_cache[fire_key] = new_mark
                             fire_transition_calls += 1
                         else:
                             fire_cache_hits += 1
+                            if use_compact_state_keys:
+                                new_mark, new_marking_id = cached_fire
+                            else:
+                                new_mark = cached_fire
+                                new_marking_id = None
 
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
-                    if switch_penalty_active and last_label is not None and t_label != last_label:
+                    if use_compact_state_keys:
+                        if switch_penalty_active and last_label_id >= 0 and idx != last_label_id:
+                            add_switch = switch_penalty_by_label_idx[last_label_id]
+                    elif switch_penalty_active and last_label is not None and t_label != last_label:
                         add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                     new_cost = cost + tau_cost_total + c + add_switch
-                    if use_conditioning_context:
+                    if use_compact_state_keys:
+                        new_prefix_id = _extend_prefix_id(prefix_id, idx)
+                        new_path_prefix = None
+                    elif use_conditioning_context:
                         if path_prefix and path_prefix[-1] == t_label:
                             new_path_prefix = path_prefix
                         elif len(path_prefix) >= max_prefix_distinct_labels:
@@ -1962,20 +2156,22 @@ class PetriNet:
                             new_path_prefix = path_prefix + (t_label,)
                     else:
                         new_path_prefix = tuple()
-                    new_key = (
-                        (new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
-                        if use_specialized_key_layout
-                        else make_key(new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
-                    )
+                    if use_compact_state_keys:
+                        new_key = (new_marking_id, next_timestamp, idx, new_prefix_id, 0)
+                    elif use_specialized_key_layout:
+                        new_key = (new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
+                    else:
+                        new_key = make_key(new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
 
                     # Dist-on-push: only push if this is a better path
                     sync_relaxations += 1
                     if new_cost < dist.get(new_key, INF):
-                        new_base_key = (
-                            (new_mark.places, next_timestamp, t_label, 0)
-                            if use_specialized_key_layout
-                            else make_base_key(new_mark.places, next_timestamp, t_label, 0)
-                        )
+                        if use_compact_state_keys:
+                            new_base_key = (new_marking_id, next_timestamp, idx, 0)
+                        elif use_specialized_key_layout:
+                            new_base_key = (new_mark.places, next_timestamp, t_label, 0)
+                        else:
+                            new_base_key = make_base_key(new_mark.places, next_timestamp, t_label, 0)
                         if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
