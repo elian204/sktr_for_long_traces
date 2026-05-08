@@ -1287,7 +1287,9 @@ class PetriNet:
         # For top-M / merged modes: keep only the best M history variants per merged base state.
         # We store the full keys (which include context) and their current best costs.
         kept_single_by_base: Dict[Any, Tuple[Any, float]] = {}
-        kept_by_base: Dict[Any, Dict[Any, float]] = defaultdict(dict)
+        kept_by_base: Dict[Any, Dict[Any, float]] = (
+            {} if top_m == 1 else defaultdict(dict)
+        )
         if top_m == 1:
             base_start = make_base_key(initial_marking.places, 0, initial_last_label, 0)
             kept_single_by_base[base_start] = (start_key, 0.0)
@@ -1356,6 +1358,10 @@ class PetriNet:
         prob_vec_cache: Dict[Tuple[int, Tuple[str, ...]], np.ndarray] = {}
         candidate_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[Optional[np.ndarray], Optional[Set[int]]]] = {}
         cost_vec_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[np.ndarray, np.ndarray]] = {}
+        enabled_split_cache: Dict[
+            Tuple[int, ...],
+            Tuple[List[Transition], List[Tuple[Transition, int, str]]],
+        ] = {}
         fire_cache: Dict[Tuple[Tuple[int, ...], Transition, bool], 'Marking'] = {}
         prob_vec_cache_hits = 0
         prob_vec_cache_misses = 0
@@ -1366,18 +1372,34 @@ class PetriNet:
         fire_cache_hits = 0
         fire_cache_misses = 0
         switch_penalty_active = switch_penalty_weight > 0.0 and prob_dict_uncollapsed is not None
-        switch_penalty_cache: Dict[str, float] = {}
+        switch_penalty_by_label: Dict[str, float] = {}
+        if switch_penalty_active:
+            for label in class_labels:
+                bigram_prefix = (label,)
+                p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(label, 0.0))
+                p_stay = max(min(p_stay, 1.0), 0.0)
+                switch_penalty_by_label[label] = switch_penalty_weight * p_stay
 
-        def _switch_penalty_for_previous_label(previous_label: str) -> float:
-            cached = switch_penalty_cache.get(previous_label)
+        def _split_enabled_transitions(
+            places_key: Tuple[int, ...],
+            enabled_transitions: List[Transition],
+        ) -> Tuple[List[Transition], List[Tuple[Transition, int, str]]]:
+            cached = enabled_split_cache.get(places_key)
             if cached is not None:
                 return cached
-            bigram_prefix = (previous_label,)
-            p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(previous_label, 0.0))
-            p_stay = max(min(p_stay, 1.0), 0.0)
-            penalty = switch_penalty_weight * p_stay
-            switch_penalty_cache[previous_label] = penalty
-            return penalty
+
+            tau_transitions: List[Transition] = []
+            visible_transitions: List[Tuple[Transition, int, str]] = []
+            for transition in enabled_transitions:
+                label_idx = transition_label_idx[transition]
+                if label_idx >= 0:
+                    visible_transitions.append((transition, label_idx, transition.label))
+                elif transition_is_tau[transition]:
+                    tau_transitions.append(transition)
+
+            cached = (tau_transitions, visible_transitions)
+            enabled_split_cache[places_key] = cached
+            return cached
 
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
             """
@@ -1554,6 +1576,7 @@ class PetriNet:
                 enabled_scanned_transitions += len(self.transitions)
                 enabled = self._find_available_transitions(places)
                 enabled_total += len(enabled)
+                tau_enabled, sync_enabled = _split_enabled_transitions(places, enabled)
 
                 # Prepare per-timestamp probability vector (optionally conditioned)
                 raw_vec = softmax_matrix[:, timestamp]
@@ -1642,12 +1665,14 @@ class PetriNet:
 
                 # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
                 model_edges_considered += len(enabled)
-                for t in enabled:
+                if restrict_model_moves_to_tau:
+                    model_moves_skipped_restrict += len(enabled) - len(tau_enabled)
+                    model_iter = tau_enabled
+                else:
+                    model_iter = enabled
+
+                for t in model_iter:
                     t_is_tau = transition_is_tau[t]
-                    # Skip labeled transitions if restricted to tau-only model moves
-                    if restrict_model_moves_to_tau and not t_is_tau:
-                        model_moves_skipped_restrict += 1
-                        continue
                     tau_cost_total = 0.0
                     # Use macro transition if this transition comes from marking_transition_map
                     if available_transition_map is not None and t in available_transition_map:
@@ -1737,7 +1762,7 @@ class PetriNet:
                         # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                         add_switch = 0.0
                         if switch_penalty_active and last_label is not None and label != last_label:
-                            add_switch = _switch_penalty_for_previous_label(last_label)
+                            add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                         new_cost = cost + c + add_switch
                         new_path_prefix = (
@@ -1764,12 +1789,8 @@ class PetriNet:
                                 max_heap_size = len(open_set)
 
                 # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
-                for t in enabled:
-                    sync_edges_considered += 1
-                    idx = transition_label_idx[t]
-                    if idx < 0:
-                        continue
-                    t_label = t.label
+                sync_edges_considered += len(enabled)
+                for t, idx, t_label in sync_enabled:
                     # Allow parent's last_label for sync moves even if not in top-k
                     if cand_idx_set is not None and int(idx) not in cand_idx_set:
                         if last_label is None or t_label != last_label:
@@ -1818,7 +1839,7 @@ class PetriNet:
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
                     if switch_penalty_active and last_label is not None and t_label != last_label:
-                        add_switch = _switch_penalty_for_previous_label(last_label)
+                        add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                     new_cost = cost + tau_cost_total + c + add_switch
                     new_path_prefix = (
