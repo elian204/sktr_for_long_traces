@@ -642,8 +642,10 @@ class PetriNet:
 
     def _find_available_transitions(self, mark_tuple: Tuple[int, ...], max_tau_depth: int = 100) -> List[Transition]:
         # Use cache if enabled
-        if self._use_cache and mark_tuple in self._enabled_cache:
-            return self._enabled_cache[mark_tuple]
+        if self._use_cache:
+            cached_enabled = self._enabled_cache.get(mark_tuple)
+            if cached_enabled is not None:
+                return cached_enabled
         
         # Use lazy caching for marking transition map only if allowed. Unlike the previous
         # "lazy" behavior (which built the *entire* map), this caches per-marking entries
@@ -710,7 +712,7 @@ class PetriNet:
         Returns:
             bool: True if the transition is enabled (all input places have enough tokens), False otherwise.
         """
-        if self._finalized and hasattr(transition, 'is_enabled_optimized'):
+        if self._finalized:
             return transition.is_enabled_optimized(mark_tuple)
         else:
             # Fallback to original implementation
@@ -1199,6 +1201,7 @@ class PetriNet:
             is_tau = transition.label is None
             transition_is_tau[transition] = is_tau
             transition_label_idx[transition] = -1 if is_tau else label2idx.get(transition.label, -1)
+        n_transitions_total = len(self.transitions)
         use_tau_cap = max_consecutive_tau_moves is not None
         tau_cap = int(max_consecutive_tau_moves) if use_tau_cap else None
         if tau_cap is not None and tau_cap < 1:
@@ -1240,6 +1243,12 @@ class PetriNet:
                     raise ValueError("conditioning_top_m must be >= 1")
                 top_m = int(conditioning_top_m)
 
+        use_specialized_key_layout = (
+            use_conditioning_context
+            and use_last_label_in_state
+            and use_tau_cap
+        )
+
         def make_key(
             places: Tuple[int, ...],
             ts: int,
@@ -1247,6 +1256,8 @@ class PetriNet:
             context: Tuple[str, ...],
             tau_run_len: int = 0,
         ):
+            if use_specialized_key_layout:
+                return (places, ts, last_label, context, tau_run_len)
             if use_conditioning_context:
                 # Include full context for conditioning correctness
                 base = (places, ts, last_label, context) if use_last_label_in_state else (places, ts, context)
@@ -1260,10 +1271,14 @@ class PetriNet:
             last_label: Optional[str],
             tau_run_len: int = 0,
         ):
+            if use_specialized_key_layout:
+                return (places, ts, last_label, tau_run_len)
             base = (places, ts, last_label) if use_last_label_in_state else (places, ts)
             return (*base, int(tau_run_len)) if use_tau_cap else base
 
         def make_unlabeled_key(places: Tuple[int, ...], ts: int, tau_run_len: int = 0):
+            if use_specialized_key_layout:
+                return (places, ts, tau_run_len)
             base = (places, ts)
             return (*base, int(tau_run_len)) if use_tau_cap else base
 
@@ -1358,11 +1373,12 @@ class PetriNet:
         prob_vec_cache: Dict[Tuple[int, Tuple[str, ...]], np.ndarray] = {}
         candidate_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[Optional[np.ndarray], Optional[Set[int]]]] = {}
         cost_vec_cache: Dict[Tuple[int, Tuple[str, ...]], Tuple[np.ndarray, np.ndarray]] = {}
-        enabled_split_cache: Dict[
+        enabled_info_cache: Dict[
             Tuple[int, ...],
-            Tuple[List[Transition], List[Tuple[Transition, int, str]]],
+            Tuple[List[Transition], List[Transition], List[Tuple[Transition, int, str]]],
         ] = {}
-        fire_cache: Dict[Tuple[Tuple[int, ...], Transition, bool], 'Marking'] = {}
+        direct_fire_cache: Dict[Tuple[Tuple[int, ...], Transition], 'Marking'] = {}
+        macro_fire_cache: Dict[Tuple[Tuple[int, ...], Transition], 'Marking'] = {}
         prob_vec_cache_hits = 0
         prob_vec_cache_misses = 0
         candidate_cache_hits = 0
@@ -1380,25 +1396,21 @@ class PetriNet:
                 p_stay = max(min(p_stay, 1.0), 0.0)
                 switch_penalty_by_label[label] = switch_penalty_weight * p_stay
 
-        def _split_enabled_transitions(
+        def _build_enabled_transition_info(
             places_key: Tuple[int, ...],
-            enabled_transitions: List[Transition],
-        ) -> Tuple[List[Transition], List[Tuple[Transition, int, str]]]:
-            cached = enabled_split_cache.get(places_key)
-            if cached is not None:
-                return cached
-
+        ) -> Tuple[List[Transition], List[Transition], List[Tuple[Transition, int, str]]]:
+            enabled_transitions = self._find_available_transitions(places_key)
             tau_transitions: List[Transition] = []
             visible_transitions: List[Tuple[Transition, int, str]] = []
             for transition in enabled_transitions:
                 label_idx = transition_label_idx[transition]
                 if label_idx >= 0:
-                    visible_transitions.append((transition, label_idx, transition.label))
+                    visible_transitions.append((transition, label_idx, idx2label[label_idx]))
                 elif transition_is_tau[transition]:
                     tau_transitions.append(transition)
 
-            cached = (tau_transitions, visible_transitions)
-            enabled_split_cache[places_key] = cached
+            cached = (enabled_transitions, tau_transitions, visible_transitions)
+            enabled_info_cache[places_key] = cached
             return cached
 
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
@@ -1515,30 +1527,38 @@ class PetriNet:
                     continue
 
                 # Extract key components (key structure depends on flags)
-                if use_tau_cap:
-                    key_parts = key[:-1]
-                    tau_run_len = int(key[-1])
+                if use_specialized_key_layout:
+                    places, timestamp, last_label, path_prefix, tau_run_len = key
                 else:
-                    key_parts = key
-                    tau_run_len = 0
-                if use_conditioning_context:
-                    if use_last_label_in_state:
-                        places, timestamp, last_label, path_prefix = key_parts
+                    if use_tau_cap:
+                        key_parts = key[:-1]
+                        tau_run_len = int(key[-1])
                     else:
-                        places, timestamp, path_prefix = key_parts
-                        last_label = None
-                else:
-                    if use_last_label_in_state:
-                        places, timestamp, last_label = key_parts
+                        key_parts = key
+                        tau_run_len = 0
+                    if use_conditioning_context:
+                        if use_last_label_in_state:
+                            places, timestamp, last_label, path_prefix = key_parts
+                        else:
+                            places, timestamp, path_prefix = key_parts
+                            last_label = None
                     else:
-                        places, timestamp = key_parts
-                        last_label = None
-                    path_prefix = tuple()
-                last_timestamp_seen = max(last_timestamp_seen, int(timestamp))
+                        if use_last_label_in_state:
+                            places, timestamp, last_label = key_parts
+                        else:
+                            places, timestamp = key_parts
+                            last_label = None
+                        path_prefix = tuple()
+                if timestamp > last_timestamp_seen:
+                    last_timestamp_seen = int(timestamp)
                 if tau_run_len > max_tau_run_seen:
                     max_tau_run_seen = tau_run_len
 
-                unlabeled_key = make_unlabeled_key(places, timestamp, tau_run_len)
+                unlabeled_key = (
+                    (places, timestamp, tau_run_len)
+                    if use_specialized_key_layout
+                    else make_unlabeled_key(places, timestamp, tau_run_len)
+                )
 
                 # Dominance prune across different last_label variants
                 if switch_penalty_weight > 0.0:
@@ -1573,10 +1593,13 @@ class PetriNet:
                     return result
 
                 enabled_calls += 1
-                enabled_scanned_transitions += len(self.transitions)
-                enabled = self._find_available_transitions(places)
-                enabled_total += len(enabled)
-                tau_enabled, sync_enabled = _split_enabled_transitions(places, enabled)
+                enabled_scanned_transitions += n_transitions_total
+                enabled_info = enabled_info_cache.get(places)
+                if enabled_info is None:
+                    enabled_info = _build_enabled_transition_info(places)
+                enabled, tau_enabled, sync_enabled = enabled_info
+                enabled_len = len(enabled)
+                enabled_total += enabled_len
 
                 # Prepare per-timestamp probability vector (optionally conditioned)
                 raw_vec = softmax_matrix[:, timestamp]
@@ -1662,74 +1685,150 @@ class PetriNet:
                     if marking_transition_entry is not None
                     else None
                 )
+                next_timestamp = timestamp + 1
 
                 # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
-                model_edges_considered += len(enabled)
+                model_edges_considered += enabled_len
                 if restrict_model_moves_to_tau:
-                    model_moves_skipped_restrict += len(enabled) - len(tau_enabled)
+                    model_moves_skipped_restrict += enabled_len - len(tau_enabled)
                     model_iter = tau_enabled
                 else:
                     model_iter = enabled
 
-                for t in model_iter:
-                    t_is_tau = transition_is_tau[t]
-                    tau_cost_total = 0.0
-                    # Use macro transition if this transition comes from marking_transition_map
-                    if available_transition_map is not None and t in available_transition_map:
-                        # This transition requires τ-path firing; include τ costs
-                        tau_path = available_transition_map[t]
-                        tau_path_len = len(tau_path)
-                        if tau_cap is not None and tau_path_len > tau_cap:
-                            macro_tau_paths_skipped_cap += 1
-                            continue
-                        tau_cost_total = tau_path_len * tau_cost_const
-                        new_tau_run_len = 0
-                        fire_key = (places, t, True)
-                        new_mark = fire_cache.get(fire_key)
-                        if new_mark is None:
-                            fire_cache_misses += 1
-                            new_mark = self._fire_macro_transition(marking, t)
-                            fire_cache[fire_key] = new_mark
-                            macro_fire_calls += 1
+                if restrict_model_moves_to_tau:
+                    for t in model_iter:
+                        tau_cost_total = 0.0
+                        # Use macro transition if this transition comes from marking_transition_map
+                        if available_transition_map is not None and t in available_transition_map:
+                            # This transition requires τ-path firing; include τ costs
+                            tau_path = available_transition_map[t]
+                            tau_path_len = len(tau_path)
+                            if tau_cap is not None and tau_path_len > tau_cap:
+                                macro_tau_paths_skipped_cap += 1
+                                continue
+                            tau_cost_total = tau_path_len * tau_cost_const
+                            new_tau_run_len = 0
+                            fire_key = (places, t)
+                            new_mark = macro_fire_cache.get(fire_key)
+                            if new_mark is None:
+                                fire_cache_misses += 1
+                                new_mark = self._fire_macro_transition(marking, t)
+                                macro_fire_cache[fire_key] = new_mark
+                                macro_fire_calls += 1
+                            else:
+                                fire_cache_hits += 1
                         else:
-                            fire_cache_hits += 1
-                    else:
-                        # This is a directly enabled transition
-                        if tau_cap is not None and t_is_tau and tau_run_len >= tau_cap:
-                            tau_moves_skipped_cap += 1
-                            continue
-                        new_tau_run_len = tau_run_len + 1 if use_tau_cap and t_is_tau else 0
-                        fire_key = (places, t, False)
-                        new_mark = fire_cache.get(fire_key)
-                        if new_mark is None:
-                            fire_cache_misses += 1
-                            new_mark = self._fire_transition(marking, t)
-                            fire_cache[fire_key] = new_mark
-                            fire_transition_calls += 1
-                        else:
-                            fire_cache_hits += 1
-                    move_type = 'tau' if t_is_tau else 'model'
-                    c = tau_cost_const if t_is_tau else model_cost_const
-                    new_cost = cost + tau_cost_total + c
-                    if new_tau_run_len > max_tau_run_seen:
-                        max_tau_run_seen = new_tau_run_len
-                    new_key = make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                            # This is a directly enabled tau transition
+                            if tau_cap is not None and tau_run_len >= tau_cap:
+                                tau_moves_skipped_cap += 1
+                                continue
+                            new_tau_run_len = tau_run_len + 1 if use_tau_cap else 0
+                            fire_key = (places, t)
+                            new_mark = direct_fire_cache.get(fire_key)
+                            if new_mark is None:
+                                fire_cache_misses += 1
+                                new_mark = self._fire_transition(marking, t)
+                                direct_fire_cache[fire_key] = new_mark
+                                fire_transition_calls += 1
+                            else:
+                                fire_cache_hits += 1
 
-                    # Dist-on-push: only push if this is a better path
-                    model_relaxations += 1
-                    if new_cost < dist.get(new_key, INF):
-                        new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
-                        if not _apply_top_m(new_base_key, new_key, new_cost):
-                            continue
-                        dist[new_key] = new_cost
-                        came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
-                        marking_by_key[new_key] = new_mark
-                        heapq.heappush(open_set, (new_cost, counter, new_key))
-                        heap_pushes += 1
-                        model_pushes += 1
-                        counter += 1
-                        if len(open_set) > max_heap_size:
-                            max_heap_size = len(open_set)
+                        new_cost = cost + tau_cost_total + tau_cost_const
+                        if new_tau_run_len > max_tau_run_seen:
+                            max_tau_run_seen = new_tau_run_len
+                        new_key = (
+                            (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                            if use_specialized_key_layout
+                            else make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                        )
+
+                        # Dist-on-push: only push if this is a better path
+                        model_relaxations += 1
+                        if new_cost < dist.get(new_key, INF):
+                            new_base_key = (
+                                (new_mark.places, timestamp, last_label, new_tau_run_len)
+                                if use_specialized_key_layout
+                                else make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
+                            )
+                            if not _apply_top_m(new_base_key, new_key, new_cost):
+                                continue
+                            dist[new_key] = new_cost
+                            came_from[new_key] = (key, 'tau', 'τ', tau_cost_const + tau_cost_total)
+                            marking_by_key[new_key] = new_mark
+                            heapq.heappush(open_set, (new_cost, counter, new_key))
+                            heap_pushes += 1
+                            model_pushes += 1
+                            counter += 1
+                            if len(open_set) > max_heap_size:
+                                max_heap_size = len(open_set)
+                else:
+                    for t in model_iter:
+                        t_is_tau = transition_is_tau[t]
+                        tau_cost_total = 0.0
+                        # Use macro transition if this transition comes from marking_transition_map
+                        if available_transition_map is not None and t in available_transition_map:
+                            # This transition requires τ-path firing; include τ costs
+                            tau_path = available_transition_map[t]
+                            tau_path_len = len(tau_path)
+                            if tau_cap is not None and tau_path_len > tau_cap:
+                                macro_tau_paths_skipped_cap += 1
+                                continue
+                            tau_cost_total = tau_path_len * tau_cost_const
+                            new_tau_run_len = 0
+                            fire_key = (places, t)
+                            new_mark = macro_fire_cache.get(fire_key)
+                            if new_mark is None:
+                                fire_cache_misses += 1
+                                new_mark = self._fire_macro_transition(marking, t)
+                                macro_fire_cache[fire_key] = new_mark
+                                macro_fire_calls += 1
+                            else:
+                                fire_cache_hits += 1
+                        else:
+                            # This is a directly enabled transition
+                            if tau_cap is not None and t_is_tau and tau_run_len >= tau_cap:
+                                tau_moves_skipped_cap += 1
+                                continue
+                            new_tau_run_len = tau_run_len + 1 if use_tau_cap and t_is_tau else 0
+                            fire_key = (places, t)
+                            new_mark = direct_fire_cache.get(fire_key)
+                            if new_mark is None:
+                                fire_cache_misses += 1
+                                new_mark = self._fire_transition(marking, t)
+                                direct_fire_cache[fire_key] = new_mark
+                                fire_transition_calls += 1
+                            else:
+                                fire_cache_hits += 1
+                        move_type = 'tau' if t_is_tau else 'model'
+                        c = tau_cost_const if t_is_tau else model_cost_const
+                        new_cost = cost + tau_cost_total + c
+                        if new_tau_run_len > max_tau_run_seen:
+                            max_tau_run_seen = new_tau_run_len
+                        new_key = (
+                            (new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                            if use_specialized_key_layout
+                            else make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
+                        )
+
+                        # Dist-on-push: only push if this is a better path
+                        model_relaxations += 1
+                        if new_cost < dist.get(new_key, INF):
+                            new_base_key = (
+                                (new_mark.places, timestamp, last_label, new_tau_run_len)
+                                if use_specialized_key_layout
+                                else make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
+                            )
+                            if not _apply_top_m(new_base_key, new_key, new_cost):
+                                continue
+                            dist[new_key] = new_cost
+                            came_from[new_key] = (key, move_type, t.label or 'τ', c + tau_cost_total)
+                            marking_by_key[new_key] = new_mark
+                            heapq.heappush(open_set, (new_cost, counter, new_key))
+                            heap_pushes += 1
+                            model_pushes += 1
+                            counter += 1
+                            if len(open_set) > max_heap_size:
+                                max_heap_size = len(open_set)
 
                 # 2) Log moves (advance timestamp without firing any transition)
                 if timestamp < n_ts:
@@ -1765,17 +1864,29 @@ class PetriNet:
                             add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                         new_cost = cost + c + add_switch
-                        new_path_prefix = (
-                            _extend_path_prefix_bounded(path_prefix, label, max_prefix_distinct_labels)
-                            if use_conditioning_context
-                            else tuple()
+                        if use_conditioning_context:
+                            if path_prefix and path_prefix[-1] == label:
+                                new_path_prefix = path_prefix
+                            elif len(path_prefix) >= max_prefix_distinct_labels:
+                                new_path_prefix = path_prefix[1:] + (label,)
+                            else:
+                                new_path_prefix = path_prefix + (label,)
+                        else:
+                            new_path_prefix = tuple()
+                        new_key = (
+                            (places, next_timestamp, label, new_path_prefix, 0)
+                            if use_specialized_key_layout
+                            else make_key(places, next_timestamp, label, new_path_prefix, 0)
                         )
-                        new_key = make_key(places, timestamp + 1, label, new_path_prefix, 0)
 
                         # Dist-on-push: only push if this is a better path
                         log_relaxations += 1
                         if new_cost < dist.get(new_key, INF):
-                            new_base_key = make_base_key(places, timestamp + 1, label, 0)
+                            new_base_key = (
+                                (places, next_timestamp, label, 0)
+                                if use_specialized_key_layout
+                                else make_base_key(places, next_timestamp, label, 0)
+                            )
                             if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
@@ -1789,10 +1900,10 @@ class PetriNet:
                                 max_heap_size = len(open_set)
 
                 # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
-                sync_edges_considered += len(enabled)
+                sync_edges_considered += enabled_len
                 for t, idx, t_label in sync_enabled:
                     # Allow parent's last_label for sync moves even if not in top-k
-                    if cand_idx_set is not None and int(idx) not in cand_idx_set:
+                    if cand_idx_set is not None and idx not in cand_idx_set:
                         if last_label is None or t_label != last_label:
                             sync_edges_skipped_candidate += 1
                             continue
@@ -1815,23 +1926,23 @@ class PetriNet:
                             macro_tau_paths_skipped_cap += 1
                             continue
                         tau_cost_total = tau_path_len * tau_cost_const
-                        fire_key = (places, t, True)
-                        new_mark = fire_cache.get(fire_key)
+                        fire_key = (places, t)
+                        new_mark = macro_fire_cache.get(fire_key)
                         if new_mark is None:
                             fire_cache_misses += 1
                             new_mark = self._fire_macro_transition(marking, t)
-                            fire_cache[fire_key] = new_mark
+                            macro_fire_cache[fire_key] = new_mark
                             macro_fire_calls += 1
                         else:
                             fire_cache_hits += 1
                     else:
                         # This is a directly enabled transition
-                        fire_key = (places, t, False)
-                        new_mark = fire_cache.get(fire_key)
+                        fire_key = (places, t)
+                        new_mark = direct_fire_cache.get(fire_key)
                         if new_mark is None:
                             fire_cache_misses += 1
                             new_mark = self._fire_transition(marking, t)
-                            fire_cache[fire_key] = new_mark
+                            direct_fire_cache[fire_key] = new_mark
                             fire_transition_calls += 1
                         else:
                             fire_cache_hits += 1
@@ -1842,17 +1953,29 @@ class PetriNet:
                         add_switch = switch_penalty_by_label.get(last_label, 0.0)
 
                     new_cost = cost + tau_cost_total + c + add_switch
-                    new_path_prefix = (
-                        _extend_path_prefix_bounded(path_prefix, t_label, max_prefix_distinct_labels)
-                        if use_conditioning_context
-                        else tuple()
+                    if use_conditioning_context:
+                        if path_prefix and path_prefix[-1] == t_label:
+                            new_path_prefix = path_prefix
+                        elif len(path_prefix) >= max_prefix_distinct_labels:
+                            new_path_prefix = path_prefix[1:] + (t_label,)
+                        else:
+                            new_path_prefix = path_prefix + (t_label,)
+                    else:
+                        new_path_prefix = tuple()
+                    new_key = (
+                        (new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
+                        if use_specialized_key_layout
+                        else make_key(new_mark.places, next_timestamp, t_label, new_path_prefix, 0)
                     )
-                    new_key = make_key(new_mark.places, timestamp + 1, t_label, new_path_prefix, 0)
 
                     # Dist-on-push: only push if this is a better path
                     sync_relaxations += 1
                     if new_cost < dist.get(new_key, INF):
-                        new_base_key = make_base_key(new_mark.places, timestamp + 1, t_label, 0)
+                        new_base_key = (
+                            (new_mark.places, next_timestamp, t_label, 0)
+                            if use_specialized_key_layout
+                            else make_base_key(new_mark.places, next_timestamp, t_label, 0)
+                        )
                         if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
@@ -1865,8 +1988,12 @@ class PetriNet:
                         if len(open_set) > max_heap_size:
                             max_heap_size = len(open_set)
 
-                max_dist_size = max(max_dist_size, len(dist))
-                max_marking_by_key_size = max(max_marking_by_key_size, len(marking_by_key))
+                dist_len = len(dist)
+                if dist_len > max_dist_size:
+                    max_dist_size = dist_len
+                marking_by_key_len = len(marking_by_key)
+                if marking_by_key_len > max_marking_by_key_size:
+                    max_marking_by_key_size = marking_by_key_len
 
                 # Periodic heap compaction: remove stale entries
                 iterations_since_compact += 1
