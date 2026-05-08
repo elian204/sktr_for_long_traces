@@ -1192,6 +1192,13 @@ class PetriNet:
         raw_top1_by_ts = np.argmax(softmax_matrix, axis=0) if n_ts > 0 else np.array([], dtype=int)
         tau_cost_const = cost_fn(0.0, 'tau')
         model_cost_const = cost_fn(0.0, 'model')
+        INF = float('inf')
+        transition_is_tau: Dict[Transition, bool] = {}
+        transition_label_idx: Dict[Transition, int] = {}
+        for transition in self.transitions:
+            is_tau = transition.label is None
+            transition_is_tau[transition] = is_tau
+            transition_label_idx[transition] = -1 if is_tau else label2idx.get(transition.label, -1)
         use_tau_cap = max_consecutive_tau_moves is not None
         tau_cap = int(max_consecutive_tau_moves) if use_tau_cap else None
         if tau_cap is not None and tau_cap < 1:
@@ -1279,8 +1286,12 @@ class PetriNet:
 
         # For top-M / merged modes: keep only the best M history variants per merged base state.
         # We store the full keys (which include context) and their current best costs.
+        kept_single_by_base: Dict[Any, Tuple[Any, float]] = {}
         kept_by_base: Dict[Any, Dict[Any, float]] = defaultdict(dict)
-        if top_m is not None:
+        if top_m == 1:
+            base_start = make_base_key(initial_marking.places, 0, initial_last_label, 0)
+            kept_single_by_base[base_start] = (start_key, 0.0)
+        elif top_m is not None:
             base_start = make_base_key(initial_marking.places, 0, initial_last_label, 0)
             kept_by_base[base_start][start_key] = 0.0
 
@@ -1288,7 +1299,7 @@ class PetriNet:
         # Any two nodes that only differ in last_label can differ at most by one switch penalty
         # before the next timestamp advance. If a node is already worse than the current best
         # for (places, ts) by more than `switch_penalty_weight`, it can never catch up.
-        best_unlabeled: Dict[Any, float] = defaultdict(lambda: float('inf'))
+        best_unlabeled: Dict[Any, float] = defaultdict(lambda: INF)
         best_unlabeled[make_unlabeled_key(initial_marking.places, 0, 0)] = 0.0
 
         # Min-heap of (cost, counter, key) - counter for tie-breaking to avoid comparing keys
@@ -1299,7 +1310,9 @@ class PetriNet:
 
         # For periodic heap compaction
         COMPACT_THRESHOLD = 100000
+        COMPACT_MIN_REMOVED = 10000
         iterations_since_compact = 0
+        removed_since_compact = 0
 
         profile_completed = False
         profile_no_path = False
@@ -1352,6 +1365,19 @@ class PetriNet:
         cost_vec_cache_misses = 0
         fire_cache_hits = 0
         fire_cache_misses = 0
+        switch_penalty_active = switch_penalty_weight > 0.0 and prob_dict_uncollapsed is not None
+        switch_penalty_cache: Dict[str, float] = {}
+
+        def _switch_penalty_for_previous_label(previous_label: str) -> float:
+            cached = switch_penalty_cache.get(previous_label)
+            if cached is not None:
+                return cached
+            bigram_prefix = (previous_label,)
+            p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(previous_label, 0.0))
+            p_stay = max(min(p_stay, 1.0), 0.0)
+            penalty = switch_penalty_weight * p_stay
+            switch_penalty_cache[previous_label] = penalty
+            return penalty
 
         def _select_candidate_indices(probabilities: np.ndarray) -> Optional[np.ndarray]:
             """
@@ -1395,9 +1421,33 @@ class PetriNet:
             Return True if this (base_key, state_key) variant is allowed under the top-M cap.
             May evict a worse variant from the same base_key to make room.
             """
-            nonlocal topm_rejects, topm_evictions
+            nonlocal topm_rejects, topm_evictions, removed_since_compact
             if top_m is None:
                 return True
+
+            if top_m == 1:
+                existing = kept_single_by_base.get(base_key)
+                if existing is None:
+                    kept_single_by_base[base_key] = (state_key, new_cost)
+                    return True
+
+                existing_key, existing_cost = existing
+                if existing_key == state_key:
+                    if new_cost < existing_cost - 1e-12:
+                        kept_single_by_base[base_key] = (state_key, new_cost)
+                    return True
+
+                if new_cost < existing_cost - 1e-12:
+                    topm_evictions += 1
+                    removed_since_compact += 1
+                    # Remove heavy per-state data to free memory; leave came_from for reconstruction.
+                    dist.pop(existing_key, None)
+                    marking_by_key.pop(existing_key, None)
+                    kept_single_by_base[base_key] = (state_key, new_cost)
+                    return True
+
+                topm_rejects += 1
+                return False
 
             variants = kept_by_base[base_key]
             existing = variants.get(state_key)
@@ -1415,6 +1465,7 @@ class PetriNet:
             if new_cost < worst_cost - 1e-12:
                 del variants[worst_key]
                 topm_evictions += 1
+                removed_since_compact += 1
                 # Remove heavy per-state data to free memory; leave came_from for reconstruction
                 dist.pop(worst_key, None)
                 marking_by_key.pop(worst_key, None)
@@ -1430,13 +1481,15 @@ class PetriNet:
                 cost, _, key = heapq.heappop(open_set)
 
                 # Skip stale entries: if we've already found a better path to this state
-                if cost > dist.get(key, float('inf')):
+                if cost > dist.get(key, INF):
                     stale_pops += 1
+                    removed_since_compact += 1
                     continue
 
                 marking = marking_by_key.get(key)
                 if marking is None:
                     missing_marking_pops += 1
+                    removed_since_compact += 1
                     continue
 
                 # Extract key components (key structure depends on flags)
@@ -1463,7 +1516,6 @@ class PetriNet:
                 if tau_run_len > max_tau_run_seen:
                     max_tau_run_seen = tau_run_len
 
-                base_key = make_base_key(places, timestamp, last_label, tau_run_len)
                 unlabeled_key = make_unlabeled_key(places, timestamp, tau_run_len)
 
                 # Dominance prune across different last_label variants
@@ -1507,7 +1559,7 @@ class PetriNet:
                 raw_vec = softmax_matrix[:, timestamp]
                 if conditioning_alpha is not None and (bigram_map or prob_dict_uncollapsed):
                     conditioning_calls += 1
-                    prob_cache_key = (int(timestamp), path_prefix)
+                    prob_cache_key = (timestamp, path_prefix)
                     cached_prob_vec = prob_vec_cache.get(prob_cache_key)
                     if cached_prob_vec is not None:
                         prob_vec_cache_hits += 1
@@ -1549,7 +1601,7 @@ class PetriNet:
                 # Candidate pruning: always use conditioned probabilities (prob_vec).
                 # When conditioning is disabled, prob_vec == raw_vec.
                 candidate_selection_calls += 1
-                candidate_cache_key = (int(timestamp), path_prefix)
+                candidate_cache_key = (timestamp, path_prefix)
                 cached_candidates = candidate_cache.get(candidate_cache_key)
                 if cached_candidates is not None:
                     candidate_cache_hits += 1
@@ -1591,8 +1643,9 @@ class PetriNet:
                 # 1) Model moves (silent τ or labeled model moves; timestamp unchanged)
                 model_edges_considered += len(enabled)
                 for t in enabled:
+                    t_is_tau = transition_is_tau[t]
                     # Skip labeled transitions if restricted to tau-only model moves
-                    if restrict_model_moves_to_tau and t.label is not None:
+                    if restrict_model_moves_to_tau and not t_is_tau:
                         model_moves_skipped_restrict += 1
                         continue
                     tau_cost_total = 0.0
@@ -1617,10 +1670,10 @@ class PetriNet:
                             fire_cache_hits += 1
                     else:
                         # This is a directly enabled transition
-                        if tau_cap is not None and t.label is None and tau_run_len >= tau_cap:
+                        if tau_cap is not None and t_is_tau and tau_run_len >= tau_cap:
                             tau_moves_skipped_cap += 1
                             continue
-                        new_tau_run_len = tau_run_len + 1 if use_tau_cap and t.label is None else 0
+                        new_tau_run_len = tau_run_len + 1 if use_tau_cap and t_is_tau else 0
                         fire_key = (places, t, False)
                         new_mark = fire_cache.get(fire_key)
                         if new_mark is None:
@@ -1630,17 +1683,17 @@ class PetriNet:
                             fire_transition_calls += 1
                         else:
                             fire_cache_hits += 1
-                    move_type = 'tau' if t.label is None else 'model'
-                    c = tau_cost_const if t.label is None else model_cost_const
+                    move_type = 'tau' if t_is_tau else 'model'
+                    c = tau_cost_const if t_is_tau else model_cost_const
                     new_cost = cost + tau_cost_total + c
                     if new_tau_run_len > max_tau_run_seen:
                         max_tau_run_seen = new_tau_run_len
                     new_key = make_key(new_mark.places, timestamp, last_label, path_prefix, new_tau_run_len)
-                    new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
 
                     # Dist-on-push: only push if this is a better path
                     model_relaxations += 1
-                    if new_cost < dist.get(new_key, float('inf')):
+                    if new_cost < dist.get(new_key, INF):
+                        new_base_key = make_base_key(new_mark.places, timestamp, last_label, new_tau_run_len)
                         if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
@@ -1680,15 +1733,11 @@ class PetriNet:
                             log_edges_below_eps += 1
                             continue
                         label = idx2label[int(idx)]
-                        p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                         c = float(log_cost_vec[int(idx)])
                         # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                         add_switch = 0.0
-                        if switch_penalty_weight > 0.0 and last_label is not None and label != last_label and prob_dict_uncollapsed is not None:
-                            bigram_prefix = (last_label,)
-                            p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
-                            p_stay = max(min(p_stay, 1.0), 0.0)
-                            add_switch = switch_penalty_weight * p_stay
+                        if switch_penalty_active and last_label is not None and label != last_label:
+                            add_switch = _switch_penalty_for_previous_label(last_label)
 
                         new_cost = cost + c + add_switch
                         new_path_prefix = (
@@ -1697,11 +1746,11 @@ class PetriNet:
                             else tuple()
                         )
                         new_key = make_key(places, timestamp + 1, label, new_path_prefix, 0)
-                        new_base_key = make_base_key(places, timestamp + 1, label, 0)
 
                         # Dist-on-push: only push if this is a better path
                         log_relaxations += 1
-                        if new_cost < dist.get(new_key, float('inf')):
+                        if new_cost < dist.get(new_key, INF):
+                            new_base_key = make_base_key(places, timestamp + 1, label, 0)
                             if not _apply_top_m(new_base_key, new_key, new_cost):
                                 continue
                             dist[new_key] = new_cost
@@ -1717,12 +1766,13 @@ class PetriNet:
                 # 3) Synchronous moves (labeled transitions that match softmax label; advance timestamp)
                 for t in enabled:
                     sync_edges_considered += 1
-                    if t.label is None or t.label not in label2idx:
+                    idx = transition_label_idx[t]
+                    if idx < 0:
                         continue
-                    idx = label2idx[t.label]
+                    t_label = t.label
                     # Allow parent's last_label for sync moves even if not in top-k
                     if cand_idx_set is not None and int(idx) not in cand_idx_set:
-                        if last_label is None or t.label != last_label:
+                        if last_label is None or t_label != last_label:
                             sync_edges_skipped_candidate += 1
                             continue
                     p_adj = float(prob_vec[idx])
@@ -1731,7 +1781,6 @@ class PetriNet:
                         sync_edges_below_eps += 1
                         continue
                     # no observed-move restriction
-                    p = max(p_adj, 1e-12)  # Small epsilon for numerical stability
                     c = float(sync_cost_vec[idx])
 
                     tau_cost_total = 0.0
@@ -1768,28 +1817,25 @@ class PetriNet:
 
                     # Switch penalty using bigram p(x_n | x_{n-1}) - use uncollapsed for within-run continuity
                     add_switch = 0.0
-                    if switch_penalty_weight > 0.0 and last_label is not None and t.label != last_label and prob_dict_uncollapsed is not None:
-                        bigram_prefix = (last_label,)
-                        p_stay = float(prob_dict_uncollapsed.get(bigram_prefix, {}).get(last_label, 0.0))
-                        p_stay = max(min(p_stay, 1.0), 0.0)
-                        add_switch = switch_penalty_weight * p_stay
+                    if switch_penalty_active and last_label is not None and t_label != last_label:
+                        add_switch = _switch_penalty_for_previous_label(last_label)
 
                     new_cost = cost + tau_cost_total + c + add_switch
                     new_path_prefix = (
-                        _extend_path_prefix_bounded(path_prefix, t.label, max_prefix_distinct_labels)
+                        _extend_path_prefix_bounded(path_prefix, t_label, max_prefix_distinct_labels)
                         if use_conditioning_context
                         else tuple()
                     )
-                    new_key = make_key(new_mark.places, timestamp + 1, t.label, new_path_prefix, 0)
-                    new_base_key = make_base_key(new_mark.places, timestamp + 1, t.label, 0)
+                    new_key = make_key(new_mark.places, timestamp + 1, t_label, new_path_prefix, 0)
 
                     # Dist-on-push: only push if this is a better path
                     sync_relaxations += 1
-                    if new_cost < dist.get(new_key, float('inf')):
+                    if new_cost < dist.get(new_key, INF):
+                        new_base_key = make_base_key(new_mark.places, timestamp + 1, t_label, 0)
                         if not _apply_top_m(new_base_key, new_key, new_cost):
                             continue
                         dist[new_key] = new_cost
-                        came_from[new_key] = (key, 'sync', t.label, c + tau_cost_total + add_switch)
+                        came_from[new_key] = (key, 'sync', t_label, c + tau_cost_total + add_switch)
                         marking_by_key[new_key] = new_mark
                         heapq.heappush(open_set, (new_cost, counter, new_key))
                         heap_pushes += 1
@@ -1804,10 +1850,12 @@ class PetriNet:
                 # Periodic heap compaction: remove stale entries
                 iterations_since_compact += 1
                 if iterations_since_compact >= COMPACT_THRESHOLD and len(open_set) > COMPACT_THRESHOLD:
-                    # Filter out stale entries (where heap cost != dist[key])
-                    open_set = [(c, cnt, k) for c, cnt, k in open_set if dist.get(k, float('inf')) == c]
-                    heapq.heapify(open_set)
-                    heap_compactions += 1
+                    if removed_since_compact >= COMPACT_MIN_REMOVED:
+                        # Filter out stale entries (where heap cost != dist[key])
+                        open_set = [(c, cnt, k) for c, cnt, k in open_set if dist.get(k, INF) == c]
+                        heapq.heapify(open_set)
+                        heap_compactions += 1
+                        removed_since_compact = 0
                     iterations_since_compact = 0
 
             profile_no_path = True
