@@ -114,6 +114,7 @@ cython_debug/
 # IDEs
 .vscode/
 .idea/
+.cursor/
 *.swp
 *.swo
 
@@ -133,6 +134,7 @@ Thumbs.db
 # Tracked legacy datasets are kept in git, but generated experiment outputs
 # and local third-party baseline checkouts should stay out of future commits.
 !datasets/
+baselines
 results/
 baselines/
 
