@@ -130,9 +130,11 @@ Thumbs.db
 *.hdf5
 *.npz
 
-# Allow datasets and results directories
+# Tracked legacy datasets are kept in git, but generated experiment outputs
+# and local third-party baseline checkouts should stay out of future commits.
 !datasets/
-!results/
+results/
+baselines/
 
 # Model files
 *.model
@@ -142,8 +144,9 @@ Thumbs.db
 
 # Logs
 *.log
+*.out
 # Slurm / batch stderr (e.g. kfold_learning_curve_experiment job output)
 kfold*.err
-logs/ discovered_petri_net.pdf
+logs/
 discovered_petri_net.png
 discovered_petri_net.pdf
