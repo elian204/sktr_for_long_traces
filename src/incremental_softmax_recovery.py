@@ -12,8 +12,10 @@ import pandas as pd
 import numpy as np
 import concurrent.futures
 import multiprocessing
+import os
 import pickle
 import time
+from pathlib import Path
 from .utils import validate_input_parameters, make_cost_function, visualize_petri_net
 from .data_processing import prepare_softmax, filter_indices, split_train_test, select_softmax_matrices, validate_sequential_case_ids, _extract_cases
 from .petri_model import discover_petri_net, build_probability_dict
@@ -33,6 +35,104 @@ _WORKER_PROB_UNCOLLAPSED = None
 _WORKER_PROB_COLLAPSED = None
 _WORKER_SETTINGS: Dict[str, Any] = {}
 _TAU_MOVE_COST_FORCED = 1e-6
+
+
+def _safe_case_filename(case_id: Any) -> str:
+    """Filesystem-safe, stable file name for a case-level checkpoint."""
+    text = str(case_id)
+    safe = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text)
+    return safe or "case"
+
+
+def _case_output_path(case_output_dir: Union[str, Path], case_id: Any) -> Path:
+    return Path(case_output_dir) / f"{_safe_case_filename(case_id)}.csv"
+
+
+def _write_case_output_atomic(records_df: pd.DataFrame, path: Union[str, Path]) -> None:
+    """Write a completed case checkpoint atomically so crashes do not leave partial CSVs."""
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(
+        f".{out_path.name}.tmp.{os.getpid()}.{time.time_ns()}"
+    )
+    try:
+        records_df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, out_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _load_completed_case_output(
+    case_output_dir: Union[str, Path],
+    case_id: Any,
+    expected_len: int,
+) -> Optional[pd.DataFrame]:
+    """Return a validated completed case checkpoint, or None if it should be recomputed."""
+    path = _case_output_path(case_output_dir, case_id)
+    if not path.is_file():
+        return None
+
+    try:
+        records_df = pd.read_csv(path)
+    except Exception as exc:
+        logger.warning("Ignoring unreadable case checkpoint %s: %s", path, exc)
+        return None
+
+    required_cols = {
+        "case:concept:name",
+        "step",
+        "sktr_activity",
+        "argmax_activity",
+        "ground_truth",
+        "is_correct",
+        "sktr_move_cost",
+    }
+    missing = required_cols.difference(records_df.columns)
+    if missing:
+        logger.warning(
+            "Ignoring incomplete case checkpoint %s: missing %s",
+            path,
+            sorted(missing),
+        )
+        return None
+    if len(records_df) != expected_len:
+        logger.warning(
+            "Ignoring stale case checkpoint %s: rows=%d expected=%d",
+            path,
+            len(records_df),
+            expected_len,
+        )
+        return None
+    case_values = records_df["case:concept:name"].astype(str)
+    if not case_values.eq(str(case_id)).all():
+        logger.warning("Ignoring case checkpoint %s: case id mismatch", path)
+        return None
+    if records_df["sktr_activity"].isna().any():
+        logger.warning("Ignoring case checkpoint %s: missing SKTR predictions", path)
+        return None
+    return records_df
+
+
+def _accuracy_from_case_records(records_df: pd.DataFrame) -> Tuple[float, float]:
+    sktr_acc = float(
+        records_df["sktr_activity"].astype(str).eq(
+            records_df["ground_truth"].astype(str)
+        ).mean()
+    )
+    argmax_acc = float(
+        records_df["argmax_activity"].astype(str).eq(
+            records_df["ground_truth"].astype(str)
+        ).mean()
+    )
+    return sktr_acc, argmax_acc
+
+
+def _records_by_case(records: List[dict]) -> Dict[str, List[dict]]:
+    grouped: Dict[str, List[dict]] = {}
+    for record in records:
+        grouped.setdefault(str(record["case:concept:name"]), []).append(record)
+    return grouped
 
 
 def _init_trace_worker(
@@ -114,6 +214,12 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         sktr_move_costs=sktr_move_costs,
         chunk_size=_WORKER_SETTINGS['chunk_size'],
     )
+    case_output_dir = _WORKER_SETTINGS.get("case_output_dir")
+    if case_output_dir:
+        _write_case_output_atomic(
+            records_df,
+            _case_output_path(case_output_dir, case_id),
+        )
 
     records = records_df.to_dict('records')
     return case_id, records, sktr_acc, argmax_acc
@@ -328,6 +434,7 @@ def _process_test_chunk(
     restrict_model_moves_to_tau: bool,
     max_consecutive_tau_moves: Optional[int],
     progress_log_interval_chunks: int,
+    case_output_dir: Optional[str] = None,
 ) -> Tuple[List[dict], List[float], List[float]]:
     """
     Process a chunk of test cases using conformance checking. Used for dataset-level parallel processing.
@@ -462,6 +569,11 @@ def _process_test_chunk(
             sktr_move_costs=sktr_move_costs,
             chunk_size=chunk_size,
         )
+        if case_output_dir:
+            _write_case_output_atomic(
+                records_df,
+                _case_output_path(case_output_dir, case_id),
+            )
         recovery_records.extend(records_df.to_dict('records'))
         sktr_accs.append(sktr_acc)
         argmax_accs.append(argmax_acc)
@@ -542,6 +654,8 @@ def incremental_softmax_recovery(
     dataset_parallelization_context: Optional[str] = None,
     max_workers: Optional[int] = None,
     merge_mismatched_boundaries: bool = True,
+    case_output_dir: Optional[Union[str, Path]] = None,
+    resume_case_outputs: bool = False,
     # removed: restrict_to_observed_moves
     compute_marking_transition_map: bool = True,
     precompute_marking_transition_map: bool = False,
@@ -593,6 +707,11 @@ def incremental_softmax_recovery(
         Optional multiprocessing start method to use for dataset parallelization.
         Common values: "spawn", "fork", "forkserver". When set, the specified
         context is used to create the ProcessPoolExecutor.
+    case_output_dir : str or Path, optional
+        Directory where each completed test case is written as ``{case_id}.csv``.
+        Writes are atomic so interrupted runs do not leave valid-looking partial files.
+    resume_case_outputs : bool, default=False
+        If True, validated per-case CSVs in ``case_output_dir`` are loaded and skipped.
 
     Notes
     -----
@@ -832,9 +951,54 @@ def incremental_softmax_recovery(
     test_ground_truth_sequences: List[List[str]] = [test_ground_truth_by_case[case] for case in test_case_ids]
     
     # 11. Incremental recovery with optional parallel processing
-    recovery_records: List[dict] = []
-    sktr_accs: List[float] = []
-    argmax_accs: List[float] = []
+    case_records_by_id: Dict[str, List[dict]] = {}
+    sktr_acc_by_case: Dict[str, float] = {}
+    argmax_acc_by_case: Dict[str, float] = {}
+
+    pending_case_ids: List[str] = []
+    pending_softmax_matrices: List[np.ndarray] = []
+    pending_ground_truth_sequences: List[List[str]] = []
+
+    case_output_root: Optional[Path] = Path(case_output_dir) if case_output_dir else None
+    if case_output_root is not None:
+        case_output_root.mkdir(parents=True, exist_ok=True)
+
+    for case, softmax_matrix, ground_truth_sequence in zip(
+        test_case_ids, test_softmax_matrices, test_ground_truth_sequences
+    ):
+        case_key = str(case)
+        completed_df = None
+        if resume_case_outputs and case_output_root is not None:
+            completed_df = _load_completed_case_output(
+                case_output_root,
+                case,
+                expected_len=len(ground_truth_sequence),
+            )
+        if completed_df is not None:
+            sktr_acc, argmax_acc = _accuracy_from_case_records(completed_df)
+            case_records_by_id[case_key] = completed_df.to_dict("records")
+            sktr_acc_by_case[case_key] = sktr_acc
+            argmax_acc_by_case[case_key] = argmax_acc
+            logger.info(
+                "Loaded completed case checkpoint %s: records=%d, SKTR=%.3f, Argmax=%.3f",
+                _case_output_path(case_output_root, case),
+                len(completed_df),
+                sktr_acc,
+                argmax_acc,
+            )
+        else:
+            pending_case_ids.append(case)
+            pending_softmax_matrices.append(softmax_matrix)
+            pending_ground_truth_sequences.append(ground_truth_sequence)
+
+    if case_output_root is not None:
+        logger.info(
+            "Case checkpointing enabled at %s: %d/%d loaded, %d pending",
+            case_output_root,
+            len(case_records_by_id),
+            len(test_case_ids),
+            len(pending_case_ids),
+        )
 
     # Adaptive chunk sizing based on model complexity (for sequential processing)
     effective_chunk_size = chunk_size
@@ -859,17 +1023,17 @@ def incremental_softmax_recovery(
         if effective_chunk_size != chunk_size:
             logger.debug(f"Using adaptive chunk size: {effective_chunk_size} (base: {chunk_size}, complexity: {model_complexity})")
 
-    if dataset_parallelization and len(test_case_ids) > 1:
+    if dataset_parallelization and len(pending_case_ids) > 1:
         # Dataset-level parallelization: split test dataset into chunks
-        logger.info(f"Processing {len(test_case_ids)} test cases using dataset-level parallelization")
+        logger.info(f"Processing {len(pending_case_ids)} pending test cases using dataset-level parallelization")
 
         # Determine number of workers
-        n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
+        n_workers = max_workers or min(len(pending_case_ids), multiprocessing.cpu_count())
         logger.info(f"Using {n_workers} workers for dataset parallelization")
 
         # Split test traces into more chunks than workers for better load balancing
-        n_chunks = min(len(test_case_ids), n_workers * 4)
-        chunks = _split_test_traces(test_case_ids, test_softmax_matrices, test_ground_truth_sequences, n_chunks)
+        n_chunks = min(len(pending_case_ids), n_workers * 4)
+        chunks = _split_test_traces(pending_case_ids, pending_softmax_matrices, pending_ground_truth_sequences, n_chunks)
         logger.info(f"Split test dataset into {len(chunks)} chunks (target={n_chunks})")
 
         # Pickle model for sharing across workers
@@ -910,6 +1074,7 @@ def incremental_softmax_recovery(
                 restrict_model_moves_to_tau,
                 max_consecutive_tau_moves,
                 progress_log_interval_chunks,
+                str(case_output_root) if case_output_root is not None else None,
             )
             parallel_args.append(args)
 
@@ -926,26 +1091,36 @@ def incremental_softmax_recovery(
             for idx, future in enumerate(futures, start=1):
                 try:
                     chunk_records, chunk_sktr_accs, chunk_argmax_accs = future.result()
-                    recovery_records.extend(chunk_records)
-                    sktr_accs.extend(chunk_sktr_accs)
-                    argmax_accs.extend(chunk_argmax_accs)
+                    chunk_case_ids = chunks[idx - 1][0]
+                    records_by_case = _records_by_case(chunk_records)
+                    for case_id, sktr_acc, argmax_acc in zip(
+                        chunk_case_ids, chunk_sktr_accs, chunk_argmax_accs
+                    ):
+                        case_key = str(case_id)
+                        case_records_by_id[case_key] = records_by_case[case_key]
+                        sktr_acc_by_case[case_key] = sktr_acc
+                        argmax_acc_by_case[case_key] = argmax_acc
                     logger.info(f"Collected chunk {idx}/{len(chunks)}: {len(chunk_records)} records, {len(chunk_sktr_accs)} accuracies")
                 except Exception as exc:
                     logger.error(f"Dataset parallelization failed for chunk {idx}: {exc}")
                     raise
 
-        logger.info(f"Completed dataset parallelization: {len(recovery_records)} total records, {len(sktr_accs)} total accuracies")
+        logger.info(
+            "Completed dataset parallelization: %d/%d cases available",
+            len(case_records_by_id),
+            len(test_case_ids),
+        )
 
-    elif parallel_processing and len(test_case_ids) > 1:
+    elif parallel_processing and len(pending_case_ids) > 1:
         # Trace-level parallel processing (memory-safe variant)
-        logger.info(f"Processing {len(test_case_ids)} test cases in parallel (trace-level)")
+        logger.info(f"Processing {len(pending_case_ids)} pending test cases in parallel (trace-level)")
 
         # Determine number of workers
-        n_workers = max_workers or min(len(test_case_ids), multiprocessing.cpu_count())
+        n_workers = max_workers or min(len(pending_case_ids), multiprocessing.cpu_count())
         logger.info(f"Using {n_workers} trace-level workers (spawn, maxtasksperchild=5)")
 
         # Precompute ground truth sequences per case to avoid sending full test_df to workers
-        ground_truth_sequences = test_ground_truth_sequences
+        ground_truth_sequences = pending_ground_truth_sequences
 
         # Prepare shared objects for workers
         model_pickled = pickle.dumps(model)
@@ -971,11 +1146,12 @@ def incremental_softmax_recovery(
             'restrict_model_moves_to_tau': restrict_model_moves_to_tau,
             'max_consecutive_tau_moves': max_consecutive_tau_moves,
             'progress_log_interval_chunks': progress_log_interval_chunks,
+            'case_output_dir': str(case_output_root) if case_output_root is not None else None,
         }
 
         tasks = (
             (case, softmax_matrix, gt_seq)
-            for case, softmax_matrix, gt_seq in zip(test_case_ids, test_softmax_matrices, ground_truth_sequences)
+            for case, softmax_matrix, gt_seq in zip(pending_case_ids, pending_softmax_matrices, ground_truth_sequences)
         )
 
         ctx = multiprocessing.get_context("spawn")
@@ -986,31 +1162,38 @@ def incremental_softmax_recovery(
             maxtasksperchild=5,
         ) as pool:
             for idx, (case_id, records, sktr_acc, argmax_acc) in enumerate(pool.imap_unordered(_process_single_test_case_worker, tasks, chunksize=1), start=1):
-                recovery_records.extend(records)
-                sktr_accs.append(sktr_acc)
-                argmax_accs.append(argmax_acc)
-                logger.debug(f"Case {idx}/{len(test_case_ids)} ({case_id}) [parallel conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, records={len(records)}")
+                case_key = str(case_id)
+                case_records_by_id[case_key] = records
+                sktr_acc_by_case[case_key] = sktr_acc
+                argmax_acc_by_case[case_key] = argmax_acc
+                logger.debug(f"Case {idx}/{len(pending_case_ids)} ({case_id}) [parallel conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, records={len(records)}")
 
-        logger.info(f"Completed trace-level parallelization: {len(recovery_records)} records, {len(sktr_accs)} accuracies")
+        logger.info(
+            "Completed trace-level parallelization: %d/%d cases available",
+            len(case_records_by_id),
+            len(test_case_ids),
+        )
 
     # Sequential processing (also handles disabled parallel case)
-    if not (dataset_parallelization and len(test_case_ids) > 1) and not (parallel_processing and len(test_case_ids) > 1):
-        if dataset_parallelization and len(test_case_ids) <= 1:
-            logger.info(f"Dataset parallelization skipped: only {len(test_case_ids)} test case(s), using sequential processing")
+    if not (dataset_parallelization and len(pending_case_ids) > 1) and not (parallel_processing and len(pending_case_ids) > 1):
+        if not pending_case_ids:
+            logger.info("No pending cases: all test cases loaded from checkpoints.")
+        elif dataset_parallelization and len(pending_case_ids) <= 1:
+            logger.info(f"Dataset parallelization skipped: only {len(pending_case_ids)} pending test case(s), using sequential processing")
 
         # Sequential processing
         for idx, (case, softmax_matrix) in enumerate(
-            zip(test_case_ids, test_softmax_matrices), start=1
+            zip(pending_case_ids, pending_softmax_matrices), start=1
         ):
             # In-place progress update for traces (single updating line)
             try:
-                sys.stdout.write(f"\rcase {idx}/{len(test_case_ids)} — conformance")
+                sys.stdout.write(f"\rcase {idx}/{len(pending_case_ids)} — conformance")
                 sys.stdout.flush()
             except Exception:
                 pass
             # Avoid extra per-trace INFO logs when using inline progress
             logger.debug(
-                f"Processing test case {idx}/{len(test_case_ids)} ({case}) using 'conformance'"
+                f"Processing pending test case {idx}/{len(pending_case_ids)} ({case}) using 'conformance'"
             )
 
             sktr_preds, sktr_move_costs = process_trace_chunked(
@@ -1061,12 +1244,31 @@ def incremental_softmax_recovery(
                 sktr_move_costs=sktr_move_costs,
                 chunk_size=effective_chunk_size
             )
-            recovery_records.extend(records_df.to_dict('records'))
-            sktr_accs.append(sktr_acc)
-            argmax_accs.append(argmax_acc)
-            logger.debug(f"Case {idx}/{len(test_case_ids)} ({case}) [conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
+            if case_output_root is not None:
+                _write_case_output_atomic(
+                    records_df,
+                    _case_output_path(case_output_root, case),
+                )
+            case_key = str(case)
+            case_records_by_id[case_key] = records_df.to_dict('records')
+            sktr_acc_by_case[case_key] = sktr_acc
+            argmax_acc_by_case[case_key] = argmax_acc
+            logger.debug(f"Case {idx}/{len(pending_case_ids)} ({case}) [conformance]: SKTR={sktr_acc:.3f}, Argmax={argmax_acc:.3f}, Sequence length={len(sktr_preds)}")
 
     # 12. Build and return results
+    missing_cases = [str(case) for case in test_case_ids if str(case) not in case_records_by_id]
+    if missing_cases:
+        raise RuntimeError(f"Missing recovery records for case(s): {missing_cases}")
+
+    recovery_records: List[dict] = []
+    sktr_accs: List[float] = []
+    argmax_accs: List[float] = []
+    for case in test_case_ids:
+        case_key = str(case)
+        recovery_records.extend(case_records_by_id[case_key])
+        sktr_accs.append(sktr_acc_by_case[case_key])
+        argmax_accs.append(argmax_acc_by_case[case_key])
+
     results_df = pd.DataFrame(recovery_records)
     accuracy_dict = {
         'sktr_accuracy': sktr_accs,

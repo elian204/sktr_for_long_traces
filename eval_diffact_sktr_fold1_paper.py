@@ -433,6 +433,25 @@ def main():
     )
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument(
+        "--resume-case-outputs",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write one atomic CSV per completed test case and reuse valid case "
+            "CSVs on restart. Enabled by default; use --no-resume-case-outputs "
+            "for the old single-shot behavior."
+        ),
+    )
+    parser.add_argument(
+        "--case-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Root directory for resumable per-case CSVs "
+            "(default: <out-dir>/case_outputs/<dataset>_fold<k>)."
+        ),
+    )
+    parser.add_argument(
         "--datasets",
         nargs="+",
         default=["50salads", "gtea"],
@@ -550,6 +569,18 @@ def main():
                 "conditioning_alpha": hp["alpha"],
                 "conditioning_interpolation_weights": weights,
             }
+            if args.resume_case_outputs:
+                case_output_root = (
+                    Path(args.case_output_dir) / f"{ds}_fold{fold}"
+                    if args.case_output_dir
+                    else out_dir / "case_outputs" / f"{ds}_fold{fold}"
+                )
+                cfg["case_output_dir"] = case_output_root
+                cfg["resume_case_outputs"] = True
+                print(
+                    f"Resumable case outputs: {case_output_root}",
+                    flush=True,
+                )
 
             results_csv = out_dir / f"{ds}_diffact_fold{fold}_sktr.csv"
             results_df, _, _ = incremental_softmax_recovery(
