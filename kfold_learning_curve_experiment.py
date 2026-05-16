@@ -18,6 +18,7 @@ Usage:
 from src.cv_utils import (
     build_video_to_case_mapping,
     get_dataset_cv_config,
+    get_unique_representatives,
     load_fold_case_ids,
     stratified_sample_k_traces,
 )
@@ -280,61 +281,6 @@ def parse_args():
              'with many duplicate traces (e.g., breakfast).'
     )
     return parser.parse_args()
-
-
-# =============================================================================
-# HELPER FUNCTIONS
-# =============================================================================
-
-def get_unique_representatives(
-    case_ids: List[str],
-    variant_df: pd.DataFrame,
-    seed: int = 42
-) -> List[str]:
-    """
-    Filter case_ids to keep only one representative per unique variant.
-
-    Parameters
-    ----------
-    case_ids : List[str]
-        List of case IDs to filter.
-    variant_df : pd.DataFrame
-        DataFrame with 'variant_id' and 'case_ids' columns from get_variant_info().
-    seed : int
-        Random seed for reproducible selection.
-
-    Returns
-    -------
-    List[str]
-        Filtered list with one representative per variant.
-    """
-    import random
-    rng = random.Random(seed)
-
-    # Build case_id -> variant_id mapping
-    case_to_variant = {}
-    for _, row in variant_df.iterrows():
-        for cid in row['case_ids']:
-            case_to_variant[str(cid)] = row['variant_id']
-
-    # Group input case_ids by variant
-    variant_to_cases = {}
-    for cid in case_ids:
-        cid_str = str(cid)
-        # Use case_id as variant if not found
-        vid = case_to_variant.get(cid_str, cid_str)
-        if vid not in variant_to_cases:
-            variant_to_cases[vid] = []
-        variant_to_cases[vid].append(cid_str)
-
-    # Pick one representative per variant (first one after shuffle for reproducibility)
-    representatives = []
-    for vid in sorted(variant_to_cases.keys()):
-        cases = variant_to_cases[vid]
-        rng.shuffle(cases)
-        representatives.append(cases[0])
-
-    return representatives
 
 
 def load_dataset(dataset_name: str, model_source: str):

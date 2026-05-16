@@ -20,6 +20,8 @@ from src.cv_utils import (
     load_fold_case_ids,
     DEFAULT_DATA_ROOT,
     get_dataset_cv_config,
+    get_unique_representatives,
+    stratified_sample_k_traces,
 )
 from src.utils import linear_prob_combiner, map_to_string_numbers
 
@@ -50,6 +52,7 @@ HP_STRATEGIES = {
 DATASET_HP_DEFAULTS = {
     ("50salads", "diffact"): {"alpha": 0.3, "strategy": "unigram_super_heavy"},
     ("gtea", "diffact"): {"alpha": 0.95, "strategy": "trigram_heavy"},
+    ("breakfast", "diffact"): {"alpha": 0.7, "strategy": "trigram_heavy"},
 }
 
 
@@ -301,6 +304,148 @@ def softmax_map_from_entries(
     return {str(e[0]): softmax_lst[i] for i, e in enumerate(entries)}
 
 
+def get_variant_info_fast(df: pd.DataFrame, use_collapsed: bool = True) -> pd.DataFrame:
+    """
+    Equivalent to ``src.utils.get_variant_info`` but avoids per-case dataframe scans.
+
+    The ordering semantics are kept the same: cases are visited in dataframe order,
+    variants are initially ordered by first occurrence, then sorted by descending
+    frequency and re-numbered from zero.
+    """
+
+    def _collapse_runs(seq: List[Any]) -> Tuple[Any, ...]:
+        collapsed: List[Any] = []
+        prev = object()
+        for item in seq:
+            if item != prev:
+                collapsed.append(item)
+                prev = item
+        return tuple(collapsed)
+
+    trace_variants: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    for case_id, group in df.groupby("case:concept:name", sort=False):
+        trace = group["concept:name"].tolist()
+        signature = _collapse_runs(trace) if use_collapsed else tuple(trace)
+        if signature not in trace_variants:
+            trace_variants[signature] = {"case_ids": [], "length": len(signature)}
+        trace_variants[signature]["case_ids"].append(str(case_id))
+
+    data = [
+        {
+            "variant_id": i,
+            "trace_signature": sig,
+            "case_ids": info["case_ids"],
+            "frequency": len(info["case_ids"]),
+            "trace_length": info["length"],
+        }
+        for i, (sig, info) in enumerate(trace_variants.items())
+    ]
+    variant_df = pd.DataFrame(data).sort_values("frequency", ascending=False).reset_index(
+        drop=True
+    )
+    variant_df["variant_id"] = range(len(variant_df))
+    return variant_df
+
+
+def select_train_test_cases(
+    *,
+    train_cases: List[str],
+    test_cases: List[str],
+    variant_df: Optional[pd.DataFrame],
+    unique_only: bool,
+    train_k: Optional[int],
+    seed: int,
+    fold: int,
+) -> Tuple[List[str], List[str], Dict[str, Any]]:
+    """Apply optional Breakfast-style unique filtering and seeded train sampling."""
+    full_train_cases = [str(c) for c in train_cases]
+    full_test_cases = [str(c) for c in test_cases]
+    selected_train = list(full_train_cases)
+    selected_test = list(full_test_cases)
+
+    unique_seed = seed + fold
+    sample_seed: Optional[int] = None
+
+    if unique_only:
+        if variant_df is None:
+            raise ValueError("--unique-only requires variant information")
+        selected_train = get_unique_representatives(
+            selected_train, variant_df, seed=unique_seed
+        )
+        selected_test = get_unique_representatives(
+            selected_test, variant_df, seed=unique_seed
+        )
+
+    if train_k is not None:
+        if variant_df is None:
+            raise ValueError("--train-k requires variant information")
+        if train_k < 1:
+            raise ValueError(f"--train-k must be positive, got {train_k}")
+        if train_k > len(selected_train):
+            raise ValueError(
+                f"--train-k={train_k} exceeds train pool size {len(selected_train)} "
+                f"after unique filtering"
+            )
+        sample_seed = seed + fold * 1000 + train_k
+        selected_train = stratified_sample_k_traces(
+            selected_train,
+            train_k,
+            variant_df,
+            seed=sample_seed,
+        )
+
+    selection_meta = {
+        "seed": seed,
+        "unique_seed": unique_seed,
+        "train_sample_seed": sample_seed,
+        "unique_only": unique_only,
+        "train_k": train_k,
+        "full_train_count": len(full_train_cases),
+        "full_test_count": len(full_test_cases),
+        "selected_train_count": len(selected_train),
+        "selected_test_count": len(selected_test),
+    }
+    return selected_train, selected_test, selection_meta
+
+
+def write_case_manifest(
+    *,
+    manifest_dir: Path,
+    dataset_name: str,
+    fold: int,
+    softmax_dir: Path,
+    full_train_cases: List[str],
+    full_test_cases: List[str],
+    train_cases: List[str],
+    test_cases: List[str],
+    selection_meta: Dict[str, Any],
+) -> Path:
+    """Write exact case ids used by this fold before running SKTR."""
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{dataset_name}_fold{fold}"
+    train_txt = manifest_dir / f"{stem}_train_cases.txt"
+    test_txt = manifest_dir / f"{stem}_test_cases.txt"
+    manifest_json = manifest_dir / f"{stem}_case_manifest.json"
+
+    train_txt.write_text("\n".join(map(str, train_cases)) + "\n")
+    test_txt.write_text("\n".join(map(str, test_cases)) + "\n")
+
+    payload = {
+        "dataset": dataset_name,
+        "fold": fold,
+        "diffact_softmax_dir": str(softmax_dir),
+        **selection_meta,
+        "full_train_cases": [str(c) for c in full_train_cases],
+        "full_test_cases": [str(c) for c in full_test_cases],
+        "train_cases": [str(c) for c in train_cases],
+        "test_cases": [str(c) for c in test_cases],
+        "train_cases_txt": str(train_txt),
+        "test_cases_txt": str(test_txt),
+    }
+    manifest_json.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return manifest_json
+
+
 def build_argmax_test_dataframe(
     df: pd.DataFrame,
     case_to_mat: Dict[str, np.ndarray],
@@ -452,16 +597,51 @@ def main():
         ),
     )
     parser.add_argument(
+        "--unique-only",
+        action="store_true",
+        help=(
+            "Breakfast-style reduction: keep one representative per collapsed "
+            "variant in both train and test pools before any train sampling. "
+            "This mirrors kfold_learning_curve_experiment.py --unique-only."
+        ),
+    )
+    parser.add_argument(
+        "--train-k",
+        type=int,
+        default=None,
+        help=(
+            "Sample exactly K training traces from the selected train pool using "
+            "stratified variant sampling. Intended for Breakfast, where the full "
+            "train split is too large. Uses seed + fold * 1000 + K, matching "
+            "kfold_learning_curve_experiment.py."
+        ),
+    )
+    parser.add_argument(
+        "--train-sample-seed",
+        type=int,
+        default=None,
+        help="Base seed for --unique-only and --train-k selection (default: --seed).",
+    )
+    parser.add_argument(
+        "--case-manifest-dir",
+        type=str,
+        default=None,
+        help=(
+            "Directory for per-fold JSON/TXT manifests of exact train/test case ids "
+            "(default: <out-dir>/case_manifests)."
+        ),
+    )
+    parser.add_argument(
         "--datasets",
         nargs="+",
         default=["50salads", "gtea"],
-        choices=["50salads", "gtea"],
+        choices=["50salads", "gtea", "breakfast"],
         help="Which datasets to run (default: both)",
     )
     parser.add_argument(
         "--all-folds",
         action="store_true",
-        help="Run every CV fold per dataset (GTEA: 4 folds, 50 Salads: 5). Ignores single --fold.",
+        help="Run every CV fold per dataset (GTEA/Breakfast: 4 folds, 50 Salads: 5). Ignores single --fold.",
     )
     args = parser.parse_args()
     max_consecutive_tau_moves = (
@@ -475,6 +655,13 @@ def main():
 
     datasets = list(args.datasets)
     table_rows = []
+    variant_info_cache: Dict[str, pd.DataFrame] = {}
+    train_selection_seed = (
+        args.seed if args.train_sample_seed is None else args.train_sample_seed
+    )
+    manifest_root = Path(args.case_manifest_dir) if args.case_manifest_dir else (
+        out_dir / "case_manifests"
+    )
 
     official_note = find_official_diffact_predictions(diffact_root)
     if official_note:
@@ -528,11 +715,51 @@ def main():
             splits = load_fold_case_ids(
                 ds, fold, video_map, data_root=args.data_root
             )
-            train_cases = splits["train"]
-            test_cases = splits["test"]
+            full_train_cases = [str(c) for c in splits["train"]]
+            full_test_cases = [str(c) for c in splits["test"]]
+            variant_df: Optional[pd.DataFrame] = None
+            if args.unique_only or args.train_k is not None:
+                if ds not in variant_info_cache:
+                    print(
+                        f"Computing collapsed trace variants for {ds} case selection...",
+                        flush=True,
+                    )
+                    variant_info_cache[ds] = get_variant_info_fast(
+                        df, use_collapsed=True
+                    )
+                    print(
+                        f"Found {len(variant_info_cache[ds])} collapsed variants for {ds}.",
+                        flush=True,
+                    )
+                variant_df = variant_info_cache[ds]
+
+            train_cases, test_cases, selection_meta = select_train_test_cases(
+                train_cases=full_train_cases,
+                test_cases=full_test_cases,
+                variant_df=variant_df,
+                unique_only=args.unique_only,
+                train_k=args.train_k,
+                seed=train_selection_seed,
+                fold=fold,
+            )
+            manifest_path = write_case_manifest(
+                manifest_dir=manifest_root,
+                dataset_name=ds,
+                fold=fold,
+                softmax_dir=softmax_dir,
+                full_train_cases=full_train_cases,
+                full_test_cases=full_test_cases,
+                train_cases=train_cases,
+                test_cases=test_cases,
+                selection_meta=selection_meta,
+            )
             print(
-                f"Fold {fold}: {len(train_cases)} train cases, "
-                f"{len(test_cases)} test cases",
+                f"Fold {fold}: train {len(full_train_cases)} -> {len(train_cases)}, "
+                f"test {len(full_test_cases)} -> {len(test_cases)}",
+                flush=True,
+            )
+            print(
+                f"Case manifest: {manifest_path}",
                 flush=True,
             )
 
@@ -650,6 +877,10 @@ def main():
                         "hp": hp,
                         "train_cases": len(train_cases),
                         "test_cases": len(test_cases),
+                        "full_train_cases": len(full_train_cases),
+                        "full_test_cases": len(full_test_cases),
+                        "case_selection": selection_meta,
+                        "case_manifest": str(manifest_path),
                         "diffact_softmax_dir": str(softmax_dir),
                         "diffact_checkpoint_naming": f"<Dataset>-Trained-S{fold} (see baselines/DiffAct/configs/)",
                     },
