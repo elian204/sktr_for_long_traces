@@ -152,3 +152,6 @@ kfold*.err
 logs/
 discovered_petri_net.png
 discovered_petri_net.pdf
+
+# Local rendered previews and scratch artifacts.
+tmp/
