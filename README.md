@@ -77,6 +77,11 @@ must be reproduced from a historical revision. The current top-M state and
 top-K candidate bounds are conformance-search optimizations, not either legacy
 beam implementation.
 
+## Research utilities
+
+- `scripts/low_data_petri_diffact/README.md` documents the reproducible
+  low-data DiffAct training and Petri-net postprocessing pipeline.
+
 ## 🧪 Testing
 
 Run the comprehensive test notebook:

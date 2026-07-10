@@ -110,6 +110,8 @@ def _load_completed_case_output(
     if records_df["sktr_activity"].isna().any():
         logger.warning("Ignoring case checkpoint %s: missing SKTR predictions", path)
         return None
+    if "postprocess_seconds" not in records_df.columns:
+        records_df["postprocess_seconds"] = np.nan
     return records_df
 
 
@@ -167,6 +169,7 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
     global _WORKER_MODEL, _WORKER_COST_FN, _WORKER_PROB_UNCOLLAPSED, _WORKER_PROB_COLLAPSED, _WORKER_SETTINGS
 
     case_id, softmax_matrix, ground_truth_sequence = task_args
+    case_start = time.perf_counter()
 
     # Argmax predictions
     argmax_indices = np.argmax(softmax_matrix, axis=0)
@@ -213,6 +216,7 @@ def _process_single_test_case_worker(task_args: Tuple[str, np.ndarray, List[str]
         sktr_move_costs=sktr_move_costs,
         chunk_size=_WORKER_SETTINGS['chunk_size'],
     )
+    records_df["postprocess_seconds"] = time.perf_counter() - case_start
     case_output_dir = _WORKER_SETTINGS.get("case_output_dir")
     if case_output_dir:
         _write_case_output_atomic(
@@ -342,6 +346,7 @@ def _process_single_test_case(
         Tuple of (case_id, predictions, move_costs, sktr_accuracy, argmax_accuracy, records_df)
     """
     tau_move_cost = _TAU_MOVE_COST_FORCED
+    case_start = time.perf_counter()
     # Unpickle model and recreate cost function (needed for multiprocessing compatibility)
     model = pickle.loads(model_pickled)
     cost_fn = make_cost_function(
@@ -397,6 +402,7 @@ def _process_single_test_case(
         sktr_move_costs=sktr_move_costs,
         chunk_size=chunk_size
     )
+    records_df["postprocess_seconds"] = time.perf_counter() - case_start
 
     return case_id, sktr_preds, sktr_move_costs, sktr_acc, argmax_acc, records_df
 
@@ -568,6 +574,7 @@ def _process_test_chunk(
             sktr_move_costs=sktr_move_costs,
             chunk_size=chunk_size,
         )
+        records_df["postprocess_seconds"] = time.perf_counter() - case_start
         if case_output_dir:
             _write_case_output_atomic(
                 records_df,
@@ -1195,6 +1202,7 @@ def incremental_softmax_recovery(
                 f"Processing pending test case {idx}/{len(pending_case_ids)} ({case}) using 'conformance'"
             )
 
+            case_start = time.perf_counter()
             sktr_preds, sktr_move_costs = process_trace_chunked(
                 softmax_matrix=softmax_matrix,
                 model=model,
@@ -1243,6 +1251,7 @@ def incremental_softmax_recovery(
                 sktr_move_costs=sktr_move_costs,
                 chunk_size=effective_chunk_size
             )
+            records_df["postprocess_seconds"] = time.perf_counter() - case_start
             if case_output_root is not None:
                 _write_case_output_atomic(
                     records_df,
