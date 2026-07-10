@@ -81,6 +81,8 @@ beam implementation.
 
 - `scripts/low_data_petri_diffact/README.md` documents the reproducible
   low-data DiffAct training and Petri-net postprocessing pipeline.
+- `scripts/standalone_conditioned_probability_dict.py` provides a dependency-light
+  conditional probability dictionary builder for use outside the SKTR package.
 
 ## 🧪 Testing
 
