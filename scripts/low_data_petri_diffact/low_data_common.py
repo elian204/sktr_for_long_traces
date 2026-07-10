@@ -24,6 +24,11 @@ DEFAULT_DATA_ROOT = Path(os.environ.get("DATA_ROOT", Path.home() / "data" / "dat
 DEFAULT_DIFFACT_ROOT = WORKSPACE_ROOT / "baselines" / "DiffAct"
 FRACTIONS = (25, 50, 75, 100)
 SEEDS = (0, 1, 2, 3, 4)
+LOW_DATA_PROTOCOL_VERSION = "official-train-nested-v2"
+EXPECTED_SUBSET_CASE_COUNTS = {
+    "gtea": {25: 5, 50: 10, 75: 16, 100: 21},
+    "50salads": {25: 10, 50: 20, 75: 30, 100: 40},
+}
 
 
 def normalize_case_id(value: str) -> str:
@@ -53,6 +58,14 @@ def read_bundle(path: Path) -> List[str]:
 
 def write_bundle(path: Path, case_ids: Sequence[str]) -> None:
     write_lines(path, [bundle_name(c) for c in case_ids])
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def load_mapping(mapping_path: Path) -> Tuple[Dict[str, int], List[str]]:
@@ -183,6 +196,21 @@ def fraction_size(n_cases: int, fraction: int) -> int:
     return max(1, int(round(n_cases * float(fraction) / 100.0)))
 
 
+def expected_fraction_size(dataset: str, n_cases: int, fraction: int) -> int:
+    """Return the protocol's pre-specified case count for a data fraction."""
+    expected_counts = EXPECTED_SUBSET_CASE_COUNTS.get(dataset)
+    if expected_counts is None or fraction not in expected_counts:
+        return fraction_size(n_cases, fraction)
+
+    expected_total = expected_counts[100]
+    if n_cases != expected_total:
+        raise ValueError(
+            f"{dataset} official training fold has {n_cases} cases; "
+            f"the {LOW_DATA_PROTOCOL_VERSION} protocol requires {expected_total}"
+        )
+    return expected_counts[fraction]
+
+
 def split_validation_from_train(
     case_table: pd.DataFrame,
     official_train_cases: Sequence[str],
@@ -257,8 +285,9 @@ def create_dataset_view(
     dataset: str,
     view_root: Path,
     train_cases: Sequence[str],
-    validation_cases: Sequence[str],
+    validation_cases: Optional[Sequence[str]] = None,
 ) -> None:
+    """Create a DiffAct data view, optionally with a non-training evaluation split."""
     dataset_root = view_root / dataset
     dataset_root.mkdir(parents=True, exist_ok=True)
     for name in ("features", "groundTruth"):
@@ -267,7 +296,11 @@ def create_dataset_view(
     splits = dataset_root / "splits"
     splits.mkdir(parents=True, exist_ok=True)
     write_bundle(splits / "train.split1.bundle", train_cases)
-    write_bundle(splits / "test.split1.bundle", validation_cases)
+    test_bundle = splits / "test.split1.bundle"
+    if validation_cases is not None:
+        write_bundle(test_bundle, validation_cases)
+    elif test_bundle.exists() or test_bundle.is_symlink():
+        test_bundle.unlink()
 
 
 def write_alignment_dir(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -14,17 +15,18 @@ from low_data_common import (
     DEFAULT_DATA_ROOT,
     DEFAULT_DIFFACT_ROOT,
     DEFAULT_EXPERIMENT_DIR,
+    EXPECTED_SUBSET_CASE_COUNTS,
     FRACTIONS,
+    LOW_DATA_PROTOCOL_VERSION,
     SEEDS,
     WORKSPACE_ROOT,
     build_case_table,
     create_dataset_view,
     ensure_report_stub,
-    fraction_size,
+    expected_fraction_size,
+    file_sha256,
     load_mapping,
     load_official_split,
-    read_lines,
-    split_validation_from_train,
     stratified_order_by_variant,
     summarize_subset,
     write_alignment_dir,
@@ -80,7 +82,7 @@ def write_repro_commands(
         "cd \"$ROOT\"\n\n"
         f"python {script_dir / 'create_low_data_splits.py'} "
         f"--dataset {dataset} --fold {fold} --data-root \"$DATA_ROOT\" "
-        "--experiment-dir \"$EXP\" --val-ratio 0.2\n"
+        "--experiment-dir \"$EXP\"\n"
         f"python {script_dir / 'verify_low_data_manifests.py'} --experiment-dir \"$EXP\"\n\n"
         "# Full training is intentionally explicit because it is expensive. The pipeline\n"
         "# waits for a preferred GPU if requested and skips already completed artifacts.\n"
@@ -109,8 +111,18 @@ def main() -> None:
     parser.add_argument("--experiment-dir", type=Path, default=DEFAULT_EXPERIMENT_DIR)
     parser.add_argument("--seeds", nargs="+", default=[str(x) for x in SEEDS])
     parser.add_argument("--fractions", nargs="+", default=[str(x) for x in FRACTIONS])
-    parser.add_argument("--val-ratio", type=float, default=0.2)
-    parser.add_argument("--split-seed", type=int, default=1729)
+    parser.add_argument(
+        "--val-ratio",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--split-seed",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     experiment_dir = args.experiment_dir.resolve()
@@ -119,24 +131,26 @@ def main() -> None:
     diffact_root = args.diffact_root.resolve()
     seeds = parse_ints(args.seeds)
     fractions = parse_ints(args.fractions)
+    if len(seeds) != len(set(seeds)):
+        raise ValueError(f"Seeds must be unique: {seeds}")
+    if len(fractions) != len(set(fractions)) or any(f not in FRACTIONS for f in fractions):
+        raise ValueError(f"Fractions must be unique values drawn from {list(FRACTIONS)}: {fractions}")
 
     experiment_dir.mkdir(parents=True, exist_ok=True)
     manifests_dir.mkdir(parents=True, exist_ok=True)
 
+    official_train_path = data_root / args.dataset / "splits" / f"train.split{args.fold}.bundle"
+    official_test_path = data_root / args.dataset / "splits" / f"test.split{args.fold}.bundle"
+    official_train_sha256 = file_sha256(official_train_path)
+    official_test_sha256 = file_sha256(official_test_path)
     official_train, official_test = load_official_split(data_root, args.dataset, args.fold)
     all_split_cases = list(dict.fromkeys(official_train + official_test))
     case_table = build_case_table(data_root, args.dataset, all_split_cases)
-    train_pool, val_cases = split_validation_from_train(
-        case_table=case_table,
-        official_train_cases=official_train,
-        val_ratio=args.val_ratio,
-        split_seed=args.split_seed,
-    )
+    train_pool = list(official_train)
+    val_cases: List[str] = []
 
     overlap = {
-        "train_val": sorted(set(train_pool).intersection(val_cases)),
         "train_test": sorted(set(train_pool).intersection(official_test)),
-        "val_test": sorted(set(val_cases).intersection(official_test)),
     }
     if any(overlap.values()):
         raise ValueError(f"Split overlap detected: {overlap}")
@@ -144,8 +158,6 @@ def main() -> None:
     split_rows: List[Dict[str, Any]] = []
     for case_id in train_pool:
         split_rows.append({"case_id": case_id, "split": "train_pool"})
-    for case_id in val_cases:
-        split_rows.append({"case_id": case_id, "split": "val"})
     for case_id in official_test:
         split_rows.append({"case_id": case_id, "split": "test"})
     pd.DataFrame(split_rows).to_csv(manifests_dir / "split_manifest.csv", index=False)
@@ -165,7 +177,7 @@ def main() -> None:
         write_lines(seed_dir / "train_pool_stratified_order.txt", order)
 
         for fraction in fractions:
-            n = fraction_size(len(train_pool), fraction)
+            n = expected_fraction_size(args.dataset, len(train_pool), fraction)
             subset = order[:n]
             write_lines(seed_dir / f"train_cases_frac_{fraction}.txt", subset)
 
@@ -188,7 +200,6 @@ def main() -> None:
                 dataset=args.dataset,
                 view_root=view_root,
                 train_cases=subset,
-                validation_cases=val_cases,
             )
 
     pd.DataFrame(subset_summary_rows).to_csv(
@@ -197,11 +208,24 @@ def main() -> None:
     )
 
     align_root = experiment_dir / "align"
-    write_alignment_dir(data_root, args.dataset, align_root / "val", "val", val_cases)
+    legacy_val_alignment = align_root / "val"
+    if legacy_val_alignment.is_symlink() or legacy_val_alignment.is_file():
+        legacy_val_alignment.unlink()
+    elif legacy_val_alignment.is_dir():
+        shutil.rmtree(legacy_val_alignment)
     write_alignment_dir(data_root, args.dataset, align_root / "test", "test", official_test)
 
-    previous_result = WORKSPACE_ROOT / "results" / "paper_diffact_50salads_w7_topm1_topk3"
+    if file_sha256(official_train_path) != official_train_sha256:
+        raise RuntimeError(f"Official training bundle changed during generation: {official_train_path}")
+    if file_sha256(official_test_path) != official_test_sha256:
+        raise RuntimeError(f"Official test bundle changed during generation: {official_test_path}")
+
+    expected_counts = {
+        str(fraction): expected_fraction_size(args.dataset, len(train_pool), fraction)
+        for fraction in fractions
+    }
     metadata = {
+        "protocol_version": LOW_DATA_PROTOCOL_VERSION,
         "goal": "Low-data DiffAct training-case ablation for Petri-net/SKTR postprocessing.",
         "dataset": args.dataset,
         "fold": args.fold,
@@ -211,28 +235,39 @@ def main() -> None:
         "data_root": str(data_root),
         "baseline_config_path": str(baseline_config_path(diffact_root, args.dataset, args.fold)),
         "previous_checkpoint_path": str(checkpoint_path(diffact_root, args.dataset, args.fold)),
-        "previous_result_path": str(previous_result if previous_result.exists() else ""),
+        "previous_checkpoint_usage": "Reference only; low-data runs must initialize randomly.",
+        "previous_result_path": "",
         "previous_softmax_output_dirs": find_existing_softmax_dirs(diffact_root),
-        "official_train_split_path": str(data_root / args.dataset / "splits" / f"train.split{args.fold}.bundle"),
-        "official_test_split_path": str(data_root / args.dataset / "splits" / f"test.split{args.fold}.bundle"),
+        "official_train_split_path": str(official_train_path),
+        "official_test_split_path": str(official_test_path),
+        "official_train_split_sha256": official_train_sha256,
+        "official_test_split_sha256": official_test_sha256,
         "generated_split_manifest_path": str(manifests_dir / "split_manifest.csv"),
         "generated_train_pool_cases_path": str(manifests_dir / "train_pool_cases.txt"),
         "generated_val_cases_path": str(manifests_dir / "val_cases.txt"),
         "generated_test_cases_path": str(manifests_dir / "test_cases.txt"),
-        "validation_alignment_dir": str(align_root / "val"),
+        "validation_alignment_dir": None,
         "test_alignment_dir": str(align_root / "test"),
         "validation_policy": (
-            "No official validation split was found; validation was carved once from the "
-            "official training split at case/video level using run-collapsed variants."
+            "No validation cases are carved out. Every fraction is a nested prefix of a "
+            "variant-stratified ordering of the complete official training fold."
         ),
-        "split_seed": args.split_seed,
-        "val_ratio": args.val_ratio,
+        "periodic_evaluation_policy": (
+            "Disabled during low-data training; official test inference occurs only after training."
+        ),
+        "checkpoint_policy": (
+            "Fresh random initialization per seed/fraction, except resuming that run's own "
+            "latest.pt; use the pre-specified final epoch checkpoint without test-based selection."
+        ),
+        "subset_source": "complete_official_training_fold",
         "n_official_train": len(official_train),
         "n_train_pool": len(train_pool),
         "n_val": len(val_cases),
         "n_test": len(official_test),
         "fractions": fractions,
         "seeds": seeds,
+        "expected_subset_case_counts": expected_counts,
+        "canonical_expected_subset_case_counts": EXPECTED_SUBSET_CASE_COUNTS.get(args.dataset),
         "methodological_rule": "Fractions sample whole training cases/videos/traces; traces are not shortened.",
         "previous_train_command_pattern": "cd baselines/DiffAct && python -u main.py --config configs/<dataset>-Trained-S<fold>.json --device <gpu>",
         "previous_infer_command_pattern": "cd baselines/DiffAct && python -u export_softmax.py --config configs/<dataset>-Trained-S<fold>.json --output_dir results/<dataset>/softmax_fold<fold> --root_data_dir <DATA_ROOT> --device <gpu>",
@@ -247,8 +282,8 @@ def main() -> None:
     print(f"Output directory: {experiment_dir}")
     print(f"Dataset: {args.dataset}, fold: {args.fold}")
     print(f"Official train cases: {len(official_train)}")
-    print(f"Fixed train pool cases: {len(train_pool)}")
-    print(f"Fixed validation cases: {len(val_cases)}")
+    print(f"Training pool cases (complete official train): {len(train_pool)}")
+    print("Validation cases: 0 (no-validation protocol)")
     print(f"Fixed test cases: {len(official_test)}")
     print(f"Subset coverage summary: {experiment_dir / 'subset_coverage_summary.csv'}")
     print(f"Reproduction commands: {experiment_dir / 'commands_to_reproduce.sh'}")

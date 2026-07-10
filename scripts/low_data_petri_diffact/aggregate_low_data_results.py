@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from low_data_common import DEFAULT_EXPERIMENT_DIR, write_csv_header
+from study_aggregation import aggregate_study
 
 
 SUMMARY_BY_SEED_COLS = [
@@ -123,6 +124,7 @@ RUN_STATUS_COLS = [
     "honest_test_petri_metrics_exists",
     "honest_test_calibrated_petri_metrics_exists",
     "structural_prior_test_petri_metrics_exists",
+    "oracle_test_petri_metrics_exists",
     "status",
 ]
 
@@ -525,9 +527,35 @@ def petri_metrics_exists(
     seed: int,
     fraction: int,
     split_dir: str,
+    *,
+    petri_fraction: int | None = None,
+    oracle: bool = False,
 ) -> bool:
-    root = experiment_dir / "petri" / condition / f"seed_{seed}" / f"frac_{fraction}"
-    return any(path.is_file() for path in root.glob(f"**/{split_dir}/metrics.csv"))
+    if oracle:
+        roots = [
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"diffact_frac_{fraction}"
+            / "petri_source_test"
+        ]
+    else:
+        petri_frac = fraction if petri_fraction is None else petri_fraction
+        roots = [
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"diffact_frac_{fraction}"
+            / f"petri_frac_{petri_frac}",
+            experiment_dir / "petri" / condition / f"seed_{seed}" / f"frac_{fraction}",
+        ]
+    return any(
+        path.is_file()
+        for root in roots
+        for path in root.glob(f"**/{split_dir}/metrics.csv")
+    )
 
 
 def build_run_status_inventory(experiment_dir: Path, metadata: Dict[str, Any]) -> pd.DataFrame:
@@ -560,12 +588,25 @@ def build_run_status_inventory(experiment_dir: Path, metadata: Dict[str, Any]) -
                 fraction,
                 "test_calibrated",
             )
-            structural_metrics_ok = petri_metrics_exists(
+            structural_metrics_ok = (
+                True
+                if fraction >= 100
+                else petri_metrics_exists(
+                    experiment_dir,
+                    "structural_prior_full_train_petri",
+                    seed,
+                    fraction,
+                    "test",
+                    petri_fraction=100,
+                )
+            )
+            oracle_metrics_ok = petri_metrics_exists(
                 experiment_dir,
-                "structural_prior_full_train_petri",
+                "oracle_test_fold_petri",
                 seed,
                 fraction,
                 "test",
+                oracle=True,
             )
             if honest_metrics_ok:
                 status = "complete_honest_test"
@@ -590,6 +631,7 @@ def build_run_status_inventory(experiment_dir: Path, metadata: Dict[str, Any]) -
                     "honest_test_petri_metrics_exists": honest_metrics_ok,
                     "honest_test_calibrated_petri_metrics_exists": honest_calibrated_metrics_ok,
                     "structural_prior_test_petri_metrics_exists": structural_metrics_ok,
+                    "oracle_test_petri_metrics_exists": oracle_metrics_ok,
                     "status": status,
                 }
             )
@@ -945,7 +987,49 @@ def write_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-dir", type=Path, default=DEFAULT_EXPERIMENT_DIR)
+    parser.add_argument(
+        "--study-dir",
+        type=Path,
+        default=None,
+        help="Aggregate every experiment listed in study_metadata.json.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Study-wide output directory (default: <study-dir>/aggregation or experiment dir).",
+    )
+    parser.add_argument("--bootstrap-replicates", type=int, default=2000)
     args = parser.parse_args()
+
+    if args.bootstrap_replicates < 0:
+        raise ValueError("--bootstrap-replicates must be non-negative")
+    if args.study_dir is not None:
+        study_dir = args.study_dir.resolve()
+        study_metadata_path = study_dir / "study_metadata.json"
+        if not study_metadata_path.is_file():
+            raise FileNotFoundError(f"Missing study metadata: {study_metadata_path}")
+        study_metadata = json.loads(study_metadata_path.read_text())
+        experiment_dirs = [
+            Path(item["experiment_dir"]).resolve()
+            for item in study_metadata.get("experiments", [])
+        ]
+        if not experiment_dirs:
+            raise ValueError(f"No experiments listed in {study_metadata_path}")
+        output_dir = (
+            args.output_dir.resolve()
+            if args.output_dir is not None
+            else study_dir / "aggregation"
+        )
+        study_paths = aggregate_study(
+            experiment_dirs,
+            output_dir,
+            n_bootstrap=args.bootstrap_replicates,
+        )
+        print(f"Study experiments: {len(experiment_dirs)}")
+        for name, path in study_paths.items():
+            print(f"{name}: {path}")
+        return
 
     experiment_dir = args.experiment_dir.resolve()
     metadata_path = experiment_dir / "experiment_metadata.json"
@@ -987,6 +1071,16 @@ def main() -> None:
         print("Plots:")
         for path in plots:
             print(f"  {path}")
+    study_output_dir = (
+        args.output_dir.resolve() if args.output_dir is not None else experiment_dir
+    )
+    study_paths = aggregate_study(
+        [experiment_dir],
+        study_output_dir,
+        n_bootstrap=args.bootstrap_replicates,
+    )
+    for name, path in study_paths.items():
+        print(f"{name}: {path}")
 
 
 if __name__ == "__main__":

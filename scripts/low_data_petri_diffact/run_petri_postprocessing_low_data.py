@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Run honest low-data Petri-net postprocessing on exported DiffAct softmax."""
+"""Run factorized low-data Petri postprocessing on exported DiffAct streams."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -52,6 +53,268 @@ PAPER_DIFFACT_SKTR_CHUNK_SIZE = 11
 PAPER_DIFFACT_SKTR_WORKERS = 7
 PAPER_DIFFACT_SKTR_PROGRESS_CHUNKS = 20
 PAPER_DIFFACT_SKTR_DISCOVERY_REPRESENTATION = "frame_events"
+COUPLED_CONDITION = "honest_low_data_petri"
+DIFFACT_LOW_PETRI_FULL_CONDITION = "structural_prior_full_train_petri"
+DIFFACT_FULL_PETRI_LOW_CONDITION = "full_diffact_low_data_petri"
+ORACLE_TEST_FOLD_CONDITION = "oracle_test_fold_petri"
+CONDITIONS = (
+    COUPLED_CONDITION,
+    DIFFACT_LOW_PETRI_FULL_CONDITION,
+    DIFFACT_FULL_PETRI_LOW_CONDITION,
+    ORACLE_TEST_FOLD_CONDITION,
+)
+PETRI_DISCOVERY_NESTED = "nested_train_fraction"
+PETRI_DISCOVERY_FULL_TRAIN = "full_train"
+PETRI_DISCOVERY_OFFICIAL_TEST = "official_test_fold"
+PETRI_DISCOVERY_SOURCES = (
+    PETRI_DISCOVERY_NESTED,
+    PETRI_DISCOVERY_FULL_TRAIN,
+    PETRI_DISCOVERY_OFFICIAL_TEST,
+)
+PRIMARY_PROTOCOL = "primary_no_validation"
+LEGACY_PROTOCOL = "legacy_pilot"
+PROTOCOL_CHOICES = ("auto", PRIMARY_PROTOCOL, LEGACY_PROTOCOL)
+
+
+def resolve_protocol(metadata: Mapping[str, Any], requested: str = "auto") -> str:
+    """Resolve new no-validation studies while treating unversioned metadata as legacy."""
+    if requested != "auto":
+        return requested
+    if metadata.get("primary_no_validation") is True or metadata.get("validation_enabled") is False:
+        return PRIMARY_PROTOCOL
+    raw_version = metadata.get("protocol_version", metadata.get("protocol", ""))
+    normalized = str(raw_version).strip().lower().replace("-", "_")
+    try:
+        if float(normalized.lstrip("v")) >= 2:
+            return PRIMARY_PROTOCOL
+    except ValueError:
+        pass
+    if (
+        normalized.endswith("_v2")
+        or normalized.startswith("v2_")
+        or any(
+            token in normalized
+            for token in ("no_validation", "approved", "primary_curve")
+        )
+    ):
+        return PRIMARY_PROTOCOL
+    return LEGACY_PROTOCOL
+
+
+def condition_for_fractions(diffact_fraction: int, petri_fraction: int) -> str:
+    if diffact_fraction == petri_fraction:
+        return COUPLED_CONDITION
+    if petri_fraction == 100:
+        return DIFFACT_LOW_PETRI_FULL_CONDITION
+    if diffact_fraction == 100:
+        return DIFFACT_FULL_PETRI_LOW_CONDITION
+    raise ValueError(
+        "Only the coupled curve, full-train bounds, and 25% process-scarcity "
+        f"control are approved; got DiffAct={diffact_fraction}, Petri={petri_fraction}"
+    )
+
+
+def default_petri_discovery_source(condition: str) -> str:
+    if condition == COUPLED_CONDITION:
+        return PETRI_DISCOVERY_NESTED
+    if condition == DIFFACT_LOW_PETRI_FULL_CONDITION:
+        return PETRI_DISCOVERY_FULL_TRAIN
+    if condition == ORACLE_TEST_FOLD_CONDITION:
+        return PETRI_DISCOVERY_OFFICIAL_TEST
+    if condition == DIFFACT_FULL_PETRI_LOW_CONDITION:
+        return PETRI_DISCOVERY_NESTED
+    raise ValueError(f"Unknown condition for Petri discovery source: {condition!r}")
+
+
+def resolve_petri_train_cases(
+    experiment_dir: Path,
+    *,
+    seed: int,
+    petri_fraction: Optional[int],
+    discovery_source: str,
+) -> Tuple[List[str], Path]:
+    """Resolve Petri discovery case IDs and the manifest path that produced them."""
+    if discovery_source == PETRI_DISCOVERY_NESTED:
+        if petri_fraction is None:
+            raise ValueError(
+                "nested_train_fraction discovery requires an explicit petri_fraction"
+            )
+        path = (
+            experiment_dir
+            / "manifests"
+            / f"seed_{seed}"
+            / f"train_cases_frac_{petri_fraction}.txt"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing Petri discovery manifest: {path}")
+        return read_case_manifest(path), path
+    if discovery_source == PETRI_DISCOVERY_FULL_TRAIN:
+        # Always use the seed-independent official training pool.
+        path = experiment_dir / "manifests" / "train_pool_cases.txt"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing full-train Petri discovery manifest: {path}")
+        return read_case_manifest(path), path
+    if discovery_source == PETRI_DISCOVERY_OFFICIAL_TEST:
+        path = experiment_dir / "manifests" / "test_cases.txt"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing oracle Petri discovery manifest: {path}")
+        return read_case_manifest(path), path
+    raise ValueError(
+        f"petri_discovery_source must be one of {list(PETRI_DISCOVERY_SOURCES)}; "
+        f"got {discovery_source!r}"
+    )
+
+
+def validate_fraction_condition(
+    *,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
+    condition: str,
+    petri_discovery_source: Optional[str] = None,
+) -> None:
+    if diffact_fraction not in FRACTIONS:
+        raise ValueError(
+            f"DiffAct fraction must be selected from {list(FRACTIONS)}; got "
+            f"DiffAct={diffact_fraction}"
+        )
+    discovery_source = petri_discovery_source or default_petri_discovery_source(condition)
+    expected_discovery_source = default_petri_discovery_source(condition)
+    if discovery_source != expected_discovery_source:
+        raise ValueError(
+            f"{condition} requires "
+            f"petri_discovery_source={expected_discovery_source!r}; "
+            f"got {discovery_source!r}"
+        )
+    if condition == ORACLE_TEST_FOLD_CONDITION:
+        if petri_fraction is not None:
+            raise ValueError(
+                "oracle_test_fold_petri requires petri_fraction=null "
+                f"(got {petri_fraction})"
+            )
+        return
+    if petri_fraction is None or petri_fraction not in FRACTIONS:
+        raise ValueError(
+            f"Petri fraction must be selected from {list(FRACTIONS)}; got "
+            f"Petri={petri_fraction}"
+        )
+    expected = condition_for_fractions(diffact_fraction, petri_fraction)
+    if condition != expected:
+        raise ValueError(
+            f"Condition {condition!r} does not match DiffAct={diffact_fraction}, "
+            f"Petri={petri_fraction}; expected {expected!r}"
+        )
+    if condition == DIFFACT_LOW_PETRI_FULL_CONDITION:
+        if petri_fraction != 100 or diffact_fraction >= 100:
+            raise ValueError(
+                "structural_prior_full_train_petri allows D_f+P_100 only for f<100; "
+                f"got DiffAct={diffact_fraction}, Petri={petri_fraction}"
+            )
+        return
+    approved_cross = (
+        diffact_fraction != petri_fraction
+        and {diffact_fraction, petri_fraction} == {25, 100}
+    )
+    if diffact_fraction != petri_fraction and not approved_cross:
+        raise ValueError(
+            "Crossed process-scarcity control is approved only as D100+P25; "
+            "full-train structural bounds use structural_prior_full_train_petri"
+        )
+
+
+def resolve_fraction_pairs(
+    *,
+    legacy_fractions: Optional[Sequence[int]],
+    diffact_fractions: Optional[Sequence[int]],
+    petri_fractions: Optional[Sequence[int]],
+    condition: Optional[str],
+    petri_discovery_source: Optional[str] = None,
+) -> List[Tuple[int, Optional[int], str]]:
+    if condition == ORACLE_TEST_FOLD_CONDITION:
+        if petri_fractions is not None:
+            raise ValueError(
+                "--petri-fractions cannot be combined with --condition "
+                f"{ORACLE_TEST_FOLD_CONDITION}"
+            )
+        if legacy_fractions is not None and diffact_fractions is not None:
+            raise ValueError(
+                "--fractions cannot be combined with --diffact-fractions for oracle"
+            )
+        diffs = list(
+            FRACTIONS
+            if diffact_fractions is None and legacy_fractions is None
+            else (diffact_fractions if diffact_fractions is not None else legacy_fractions)
+        )
+        raw_pairs: List[Tuple[int, Optional[int]]] = [
+            (int(diffact_fraction), None) for diffact_fraction in diffs
+        ]
+    else:
+        explicit = diffact_fractions is not None or petri_fractions is not None
+        if explicit:
+            if legacy_fractions is not None:
+                raise ValueError(
+                    "--fractions cannot be combined with --diffact-fractions/--petri-fractions"
+                )
+            if diffact_fractions is None or petri_fractions is None:
+                raise ValueError(
+                    "--diffact-fractions and --petri-fractions must be supplied together "
+                    f"(except for {ORACLE_TEST_FOLD_CONDITION})"
+                )
+            if len(diffact_fractions) != len(petri_fractions):
+                raise ValueError(
+                    "--diffact-fractions and --petri-fractions must have equal lengths; "
+                    "pairs are zipped in the given order"
+                )
+            raw_pairs = [
+                (int(diffact_fraction), int(petri_fraction))
+                for diffact_fraction, petri_fraction in zip(diffact_fractions, petri_fractions)
+            ]
+        else:
+            fractions = list(FRACTIONS if legacy_fractions is None else legacy_fractions)
+            legacy_condition = condition or COUPLED_CONDITION
+            if legacy_condition == COUPLED_CONDITION:
+                raw_pairs = [(fraction, fraction) for fraction in fractions]
+            elif legacy_condition == DIFFACT_LOW_PETRI_FULL_CONDITION:
+                raw_pairs = [(fraction, 100) for fraction in fractions]
+            elif legacy_condition == ORACLE_TEST_FOLD_CONDITION:
+                raw_pairs = [(fraction, None) for fraction in fractions]
+            else:
+                raw_pairs = [(100, fraction) for fraction in fractions]
+
+    resolved: List[Tuple[int, Optional[int], str]] = []
+    seen: set[Tuple[int, Optional[int], str]] = set()
+    for diffact_fraction, petri_fraction in raw_pairs:
+        if (
+            condition == DIFFACT_LOW_PETRI_FULL_CONDITION
+            and int(diffact_fraction) == 100
+            and petri_fraction == 100
+        ):
+            continue
+        if condition == ORACLE_TEST_FOLD_CONDITION:
+            resolved_condition = ORACLE_TEST_FOLD_CONDITION
+        else:
+            resolved_condition = condition or condition_for_fractions(
+                int(diffact_fraction), int(petri_fraction)  # type: ignore[arg-type]
+            )
+        validate_fraction_condition(
+            diffact_fraction=int(diffact_fraction),
+            petri_fraction=None if petri_fraction is None else int(petri_fraction),
+            condition=resolved_condition,
+            petri_discovery_source=petri_discovery_source,
+        )
+        item = (
+            int(diffact_fraction),
+            None if petri_fraction is None else int(petri_fraction),
+            resolved_condition,
+        )
+        if item not in seen:
+            resolved.append(item)
+            seen.add(item)
+    if not resolved:
+        raise ValueError(
+            "D100+P100 is the shared coupled reference and is not emitted under a "
+            "crossed-control condition"
+        )
+    return resolved
 
 
 def load_softmax_case_map(softmax_dir: Path) -> Dict[str, str]:
@@ -157,14 +420,18 @@ def learn_temperature_from_validation(
     return float(temperature)
 
 
-def iter_requested(seeds: Iterable[int], fractions: Iterable[int], max_runs: Optional[int]):
+def iter_requested(
+    seeds: Iterable[int],
+    fraction_pairs: Iterable[Tuple[int, Optional[int], str]],
+    max_runs: Optional[int],
+):
     count = 0
     for seed in seeds:
-        for fraction in fractions:
+        for diffact_fraction, petri_fraction, condition in fraction_pairs:
             if max_runs is not None and count >= max_runs:
                 return
             count += 1
-            yield seed, fraction
+            yield seed, diffact_fraction, petri_fraction, condition
 
 
 def levenshtein_distance(a: Sequence[Any], b: Sequence[Any]) -> int:
@@ -297,6 +564,178 @@ def build_combined_inputs(
         encoding="utf-8",
     )
     return df, softmax_list, train_seq_ids, eval_seq_ids, map_path
+
+
+def resolve_case_artifact(
+    softmax_dir: Path,
+    *,
+    original_case_id: str,
+    source_case_id: str,
+    suffix: str,
+) -> Optional[Path]:
+    candidates = [
+        softmax_dir / f"{source_case_id}{suffix}",
+        softmax_dir / f"{original_case_id}{suffix}",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    return None
+
+
+def csv_identifier(value: Any) -> str:
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def prediction_labels_from_array(
+    array: np.ndarray,
+    *,
+    n_frames: int,
+    artifact_path: Path,
+    probabilities: bool,
+) -> List[str]:
+    values = np.asarray(array)
+    if probabilities:
+        values = np.squeeze(values)
+        if values.ndim == 1:
+            labels = values
+        elif values.ndim == 2 and values.shape[1] == n_frames:
+            labels = np.argmax(values, axis=0)
+        elif values.ndim == 2 and values.shape[0] == n_frames:
+            labels = np.argmax(values, axis=1)
+        else:
+            raise ValueError(
+                f"{artifact_path}: raw probability shape {values.shape} is not aligned "
+                f"to {n_frames} frames"
+            )
+    else:
+        values = np.squeeze(values)
+        if values.ndim != 1:
+            raise ValueError(
+                f"{artifact_path}: official prediction must be one-dimensional after squeeze; "
+                f"got {values.shape}"
+            )
+        labels = values
+    if len(labels) != n_frames:
+        raise ValueError(
+            f"{artifact_path}: prediction length={len(labels)} expected {n_frames}"
+        )
+    return [str(int(x)) for x in labels]
+
+
+def attach_diffact_comparators(
+    *,
+    results_df: pd.DataFrame,
+    combined_map_path: Path,
+    softmax_dir: Path,
+    require_comparators: bool,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Attach official DiffAct predictions and pre-postprocessing raw argmax when exported."""
+    map_df = pd.read_csv(combined_map_path)
+    eval_rows = map_df[map_df["role"] == "eval"]
+    specs = {
+        "official_diffact": ("_pred.npy", "official_diffact_activity", False),
+        "raw_diffact": ("_raw.npy", "raw_diffact_activity", True),
+    }
+    provenance: Dict[str, Any] = {
+        "softmax_source_dir": str(softmax_dir),
+        "required": bool(require_comparators),
+        "streams": {},
+    }
+    result = results_df.copy()
+
+    for stream, (suffix, column, probabilities) in specs.items():
+        resolved: List[Tuple[pd.Series, Path]] = []
+        missing: List[str] = []
+        for _, row in eval_rows.iterrows():
+            original_case = csv_identifier(row["original_case_id"])
+            source_case = csv_identifier(row["source_softmax_case_id"])
+            path = resolve_case_artifact(
+                softmax_dir,
+                original_case_id=original_case,
+                source_case_id=source_case,
+                suffix=suffix,
+            )
+            if path is None:
+                missing.append(original_case)
+            else:
+                resolved.append((row, path))
+
+        if missing and resolved:
+            raise FileNotFoundError(
+                f"Incomplete {stream} comparator stream in {softmax_dir}; "
+                f"missing cases={missing}"
+            )
+        if missing:
+            provenance["streams"][stream] = {
+                "available": False,
+                "filename_suffix": suffix,
+                "missing_cases": missing,
+            }
+            if require_comparators:
+                raise FileNotFoundError(
+                    f"Required {stream} comparator stream is absent from {softmax_dir}; "
+                    f"expected {{case_id}}{suffix}"
+                )
+            continue
+
+        result[column] = ""
+        artifact_paths: Dict[str, str] = {}
+        for row, path in resolved:
+            seq_case = csv_identifier(row["sequential_case_id"])
+            mask = result["case:concept:name"].astype(str) == seq_case
+            n_frames = int(mask.sum())
+            labels = prediction_labels_from_array(
+                np.load(path),
+                n_frames=n_frames,
+                artifact_path=path,
+                probabilities=probabilities,
+            )
+            result.loc[mask, column] = labels
+            artifact_paths[csv_identifier(row["original_case_id"])] = str(path)
+        provenance["streams"][stream] = {
+            "available": True,
+            "filename_suffix": suffix,
+            "artifact_paths": artifact_paths,
+        }
+    return result, provenance
+
+
+def preflight_required_diffact_comparators(
+    *,
+    combined_map_path: Path,
+    softmax_dir: Path,
+) -> None:
+    """Fail before expensive decoding when required comparator artifacts are incomplete."""
+    map_df = pd.read_csv(combined_map_path)
+    eval_rows = map_df[map_df["role"] == "eval"]
+    missing_by_suffix: Dict[str, List[str]] = {}
+    for suffix in ("_pred.npy", "_raw.npy"):
+        missing: List[str] = []
+        for _, row in eval_rows.iterrows():
+            original_case = csv_identifier(row["original_case_id"])
+            source_case = csv_identifier(row["source_softmax_case_id"])
+            if (
+                resolve_case_artifact(
+                    softmax_dir,
+                    original_case_id=original_case,
+                    source_case_id=source_case,
+                    suffix=suffix,
+                )
+                is None
+            ):
+                missing.append(original_case)
+        if missing:
+            missing_by_suffix[suffix] = missing
+    if missing_by_suffix:
+        raise FileNotFoundError(
+            "Required official DiffAct comparator artifacts are incomplete in "
+            f"{softmax_dir}: {missing_by_suffix}"
+        )
 
 
 def allowed_transition_set(df: pd.DataFrame, train_cases: Sequence[str]) -> set[tuple[str, str]]:
@@ -489,11 +928,25 @@ def run_collapsed_distance_for_case(case_df: pd.DataFrame, pred_col: str) -> int
     return levenshtein_distance(pred, gt)
 
 
+def comparison_method_map(results_df: pd.DataFrame, post_method: str) -> Dict[str, str]:
+    methods: Dict[str, str] = {}
+    if "raw_diffact_activity" in results_df.columns:
+        methods["raw_argmax"] = "raw_diffact_activity"
+        methods["canonical_softmax_argmax"] = "argmax_activity"
+    else:
+        methods["raw_argmax"] = "argmax_activity"
+    if "official_diffact_activity" in results_df.columns:
+        methods["official_diffact"] = "official_diffact_activity"
+    methods[post_method] = "sktr_activity"
+    return methods
+
+
 def build_per_case_metric_rows(
     *,
     dataset: str,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     condition: str,
     split: str,
     post_method: str,
@@ -509,10 +962,7 @@ def build_per_case_metric_rows(
         for _, row in map_df[map_df["role"] == "eval"].iterrows()
     }
     rows: List[Dict[str, Any]] = []
-    method_map = {
-        "raw_argmax": "argmax_activity",
-        post_method: "sktr_activity",
-    }
+    method_map = comparison_method_map(results_df, post_method)
     for seq_case, case_df in results_df.groupby("case:concept:name", sort=False):
         seq_case_s = str(seq_case)
         original_case = seq_to_original.get(seq_case_s, seq_case_s)
@@ -534,16 +984,18 @@ def build_per_case_metric_rows(
                 "run_collapsed_levenshtein": float(run_collapsed_distance_for_case(case_df, pred_col)),
                 "illegal_transition_pct": illegal_transition_pct(case_df, pred_col, allowed_transitions),
             }
-            if method == "petri_conformance":
+            if method == post_method and post_method == "petri_conformance":
                 metric_values["alignment_cost"] = float(case_df["sktr_move_cost"].sum())
-            elif method != "raw_argmax" and "sktr_move_cost" in case_df.columns:
+            elif method == post_method and "sktr_move_cost" in case_df.columns:
                 metric_values["transition_penalty_cost"] = float(case_df["sktr_move_cost"].sum())
             for metric_name, metric_value in metric_values.items():
                 rows.append(
                     {
                         "dataset": dataset,
                         "seed": seed,
-                        "fraction": fraction,
+                        "fraction": diffact_fraction,
+                        "diffact_fraction": diffact_fraction,
+                        "petri_fraction": petri_fraction,
                         "condition": condition,
                         "split": split,
                         "method": method,
@@ -562,7 +1014,8 @@ def build_metric_rows(
     *,
     dataset: str,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     condition: str,
     split: str,
     post_method: str,
@@ -573,10 +1026,7 @@ def build_metric_rows(
     calibrated: bool,
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
-    method_map = {
-        "raw_argmax": "argmax_activity",
-        post_method: "sktr_activity",
-    }
+    method_map = comparison_method_map(results_df, post_method)
     for method, pred_col in method_map.items():
         metrics = compute_tas_metrics_asformer(
             results_df,
@@ -595,10 +1045,10 @@ def build_metric_rows(
             "run_collapsed_levenshtein": mean_run_collapsed_distance(results_df, pred_col),
             "illegal_transition_pct": illegal_transition_pct(results_df, pred_col, allowed_transitions),
         }
-        if method == "petri_conformance":
+        if method == post_method and post_method == "petri_conformance":
             metric_values["mean_alignment_cost"] = float(results_df["sktr_move_cost"].mean())
             metric_values["total_alignment_cost"] = float(results_df["sktr_move_cost"].sum())
-        elif method != "raw_argmax" and "sktr_move_cost" in results_df.columns:
+        elif method == post_method and "sktr_move_cost" in results_df.columns:
             metric_values["mean_transition_penalty"] = float(results_df["sktr_move_cost"].mean())
             metric_values["total_transition_penalty"] = float(results_df["sktr_move_cost"].sum())
         for metric_name, metric_value in metric_values.items():
@@ -606,7 +1056,9 @@ def build_metric_rows(
                 {
                     "dataset": dataset,
                     "seed": seed,
-                    "fraction": fraction,
+                    "fraction": diffact_fraction,
+                    "diffact_fraction": diffact_fraction,
+                    "petri_fraction": petri_fraction,
                     "condition": condition,
                     "split": split,
                     "method": method,
@@ -623,7 +1075,8 @@ def build_metric_rows(
 def build_runtime_tables(
     *,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     condition: str,
     split: str,
     method: str,
@@ -647,7 +1100,9 @@ def build_runtime_tables(
             per_case_rows.append(
                 {
                     "seed": seed,
-                    "fraction": fraction,
+                    "fraction": diffact_fraction,
+                    "diffact_fraction": diffact_fraction,
+                    "petri_fraction": petri_fraction,
                     "condition": condition,
                     "method": method,
                     "split": split,
@@ -663,6 +1118,8 @@ def build_runtime_tables(
         columns=[
             "seed",
             "fraction",
+            "diffact_fraction",
+            "petri_fraction",
             "condition",
             "method",
             "split",
@@ -683,7 +1140,9 @@ def build_runtime_tables(
         [
             {
                 "seed": seed,
-                "fraction": fraction,
+                "fraction": diffact_fraction,
+                "diffact_fraction": diffact_fraction,
+                "petri_fraction": petri_fraction,
                 "condition": condition,
                 "method": method,
                 "split": split,
@@ -698,7 +1157,11 @@ def build_runtime_tables(
 
 def validation_selection_score(metrics_df: pd.DataFrame) -> Tuple[float, Dict[str, float]]:
     petri = metrics_df[
-        (metrics_df["method"] != "raw_argmax")
+        (
+            metrics_df["method"].isin(
+                ["petri_conformance", "petri_transition_viterbi"]
+            )
+        )
         & (metrics_df["metric_name"].isin(["edit", "f1@10", "f1@25", "f1@50"]))
     ]
     values = {
@@ -715,16 +1178,44 @@ def select_validation_hyperparameters(
     experiment_dir: Path,
     condition: str,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     method: str,
+    protocol: str,
 ) -> Optional[Dict[str, Any]]:
     """Select Petri postprocessing parameters from validation metrics only."""
-    run_root = experiment_dir / "petri" / condition / f"seed_{seed}" / f"frac_{fraction}"
-    if not run_root.exists():
+    if condition == ORACLE_TEST_FOLD_CONDITION or petri_fraction is None:
+        factorized_root = (
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"diffact_frac_{diffact_fraction}"
+            / "petri_source_test"
+        )
+    else:
+        factorized_root = (
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"diffact_frac_{diffact_fraction}"
+            / f"petri_frac_{petri_fraction}"
+        )
+    legacy_root = (
+        experiment_dir / "petri" / condition / f"seed_{seed}" / f"frac_{diffact_fraction}"
+    )
+    roots = [factorized_root]
+    if legacy_root != factorized_root:
+        roots.append(legacy_root)
+    if not any(root.exists() for root in roots):
         return None
     candidates: List[Dict[str, Any]] = []
-    metric_paths = sorted(set(run_root.glob("val*/metrics.csv")) | set(run_root.glob("*/val*/metrics.csv")))
-    for metrics_path in metric_paths:
+    metric_paths: set[Path] = set()
+    for run_root in roots:
+        metric_paths.update(run_root.glob("val*/metrics.csv"))
+        metric_paths.update(run_root.glob("*/val*/metrics.csv"))
+    for metrics_path in sorted(metric_paths):
         metrics_df = pd.read_csv(metrics_path)
         if metrics_df.empty:
             continue
@@ -766,12 +1257,22 @@ def select_validation_hyperparameters(
         "selection_metric": "mean(edit,f1@10,f1@25,f1@50)",
         "condition": condition,
         "seed": seed,
-        "fraction": fraction,
+        "fraction": diffact_fraction,
+        "diffact_fraction": diffact_fraction,
+        "petri_fraction": petri_fraction,
         "n_candidates": len(candidates),
         "selected": selected,
         "candidates": candidates,
     }
-    selection_path = run_root / method / "selected_hyperparameters.json"
+    selection_root = (
+        legacy_root
+        if (
+            protocol == LEGACY_PROTOCOL
+            and condition in {COUPLED_CONDITION, DIFFACT_LOW_PETRI_FULL_CONDITION}
+        )
+        else factorized_root
+    )
+    selection_path = selection_root / method / "selected_hyperparameters.json"
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     selection_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n",
@@ -798,16 +1299,91 @@ def resolve_postprocess_output_dir(
     experiment_dir: Path,
     condition: str,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     method: str,
     split_dir: str,
+    protocol: str,
     calibrated: bool,
 ) -> Path:
-    run_root = experiment_dir / "petri" / condition / f"seed_{seed}" / f"frac_{fraction}"
-    legacy = run_root / split_dir
-    if legacy_output_matches_method(legacy, method, calibrated):
-        return legacy
+    if condition == ORACLE_TEST_FOLD_CONDITION or petri_fraction is None:
+        return (
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"diffact_frac_{diffact_fraction}"
+            / "petri_source_test"
+            / method
+            / split_dir
+        )
+    if (
+        protocol == LEGACY_PROTOCOL
+        and condition in {COUPLED_CONDITION, DIFFACT_LOW_PETRI_FULL_CONDITION}
+    ):
+        legacy_root = (
+            experiment_dir
+            / "petri"
+            / condition
+            / f"seed_{seed}"
+            / f"frac_{diffact_fraction}"
+        )
+        legacy = legacy_root / split_dir
+        if legacy_output_matches_method(legacy, method, calibrated):
+            return legacy
+        return legacy_root / method / split_dir
+    run_root = (
+        experiment_dir
+        / "petri"
+        / condition
+        / f"seed_{seed}"
+        / f"diffact_frac_{diffact_fraction}"
+        / f"petri_frac_{petri_fraction}"
+    )
     return run_root / method / split_dir
+
+
+def validate_primary_decoder_config(
+    *,
+    split: str,
+    method: str,
+    chunk_size: int,
+    prob_threshold: float,
+    model_move_cost: float,
+    conformance_switch_penalty_weight: float,
+    petri_discovery_representation: str,
+    calibrated: bool,
+) -> None:
+    expected = {
+        "split": "test",
+        "method": PAPER_DIFFACT_SKTR_METHOD,
+        "chunk_size": PAPER_DIFFACT_SKTR_CHUNK_SIZE,
+        "prob_threshold": 1e-6,
+        "model_move_cost": 1.0,
+        "conformance_switch_penalty_weight": 1.0,
+        "petri_discovery_representation": PAPER_DIFFACT_SKTR_DISCOVERY_REPRESENTATION,
+        "calibrated": False,
+    }
+    actual = {
+        "split": split,
+        "method": method,
+        "chunk_size": chunk_size,
+        "prob_threshold": prob_threshold,
+        "model_move_cost": model_move_cost,
+        "conformance_switch_penalty_weight": conformance_switch_penalty_weight,
+        "petri_discovery_representation": petri_discovery_representation,
+        "calibrated": calibrated,
+    }
+    mismatches = {
+        key: {"expected": expected[key], "actual": actual[key]}
+        for key in expected
+        if actual[key] != expected[key]
+    }
+    if mismatches:
+        raise ValueError(
+            "Primary no-validation protocol requires the fixed canonical "
+            f"petri_conformance decoder config; mismatches={mismatches}"
+        )
 
 
 def run_one(
@@ -816,9 +1392,11 @@ def run_one(
     data_root: Path,
     dataset: str,
     seed: int,
-    fraction: int,
+    diffact_fraction: int,
+    petri_fraction: Optional[int],
     split: str,
     condition: str,
+    protocol: str,
     method: str,
     chunk_size: int,
     prob_threshold: float,
@@ -826,23 +1404,49 @@ def run_one(
     conformance_switch_penalty_weight: float,
     progress_log_interval_chunks: int,
     petri_discovery_representation: str,
+    petri_discovery_source: str,
     transition_illegal_penalty: float,
     calibrated: bool,
     temp_bounds: Tuple[float, float],
     workers: int,
     inner_parallel: bool,
+    runtime_pilot_case_limit: Optional[int],
+    require_diffact_comparators: bool,
     force: bool,
-) -> Optional[Path]:
+) -> Path:
+    validate_fraction_condition(
+        diffact_fraction=diffact_fraction,
+        petri_fraction=petri_fraction,
+        condition=condition,
+        petri_discovery_source=petri_discovery_source,
+    )
+    if runtime_pilot_case_limit is not None and runtime_pilot_case_limit < 1:
+        raise ValueError("--runtime-pilot-case-limit must be positive")
+    if protocol == PRIMARY_PROTOCOL:
+        validate_primary_decoder_config(
+            split=split,
+            method=method,
+            chunk_size=chunk_size,
+            prob_threshold=prob_threshold,
+            model_move_cost=model_move_cost,
+            conformance_switch_penalty_weight=conformance_switch_penalty_weight,
+            petri_discovery_representation=petri_discovery_representation,
+            calibrated=calibrated,
+        )
     if calibrated and split != "test":
         raise ValueError("Validation-learned calibration is only evaluated on --split test")
     split_dir = f"{split}_calibrated" if calibrated else split
+    if runtime_pilot_case_limit is not None:
+        split_dir = f"{split_dir}_runtime_pilot_n{runtime_pilot_case_limit}"
     out_dir = resolve_postprocess_output_dir(
         experiment_dir=experiment_dir,
         condition=condition,
         seed=seed,
-        fraction=fraction,
+        diffact_fraction=diffact_fraction,
+        petri_fraction=petri_fraction,
         method=method,
         split_dir=split_dir,
+        protocol=protocol,
         calibrated=calibrated,
     )
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -857,21 +1461,46 @@ def run_one(
         and per_case_runtime_csv.is_file()
         and not force
     ):
-        print(f"SKIP seed={seed} frac={fraction} split={split}: existing {metrics_csv}")
+        print(
+            f"SKIP seed={seed} diffact_frac={diffact_fraction} "
+            f"petri_frac={petri_fraction} split={split}: existing {metrics_csv}"
+        )
         return metrics_csv
 
-    subset_cases = read_case_manifest(
-        experiment_dir / "manifests" / f"seed_{seed}" / f"train_cases_frac_{fraction}.txt"
+    diffact_manifest = (
+        experiment_dir
+        / "manifests"
+        / f"seed_{seed}"
+        / f"train_cases_frac_{diffact_fraction}.txt"
     )
-    if condition == "structural_prior_full_train_petri":
-        train_cases = read_case_manifest(experiment_dir / "manifests" / "train_pool_cases.txt")
-    else:
-        train_cases = subset_cases
-    eval_cases = read_case_manifest(experiment_dir / "manifests" / f"{split}_cases.txt")
-    softmax_dir = experiment_dir / "diffact" / f"seed_{seed}" / f"frac_{fraction}" / f"softmax_{split}"
+    if not diffact_manifest.is_file():
+        raise FileNotFoundError(f"Missing DiffAct training manifest: {diffact_manifest}")
+    diffact_train_cases = read_case_manifest(diffact_manifest)
+    train_cases, petri_manifest = resolve_petri_train_cases(
+        experiment_dir,
+        seed=seed,
+        petri_fraction=petri_fraction,
+        discovery_source=petri_discovery_source,
+    )
+    all_eval_cases = read_case_manifest(experiment_dir / "manifests" / f"{split}_cases.txt")
+    eval_cases = (
+        all_eval_cases[:runtime_pilot_case_limit]
+        if runtime_pilot_case_limit is not None
+        else all_eval_cases
+    )
+    softmax_dir = (
+        experiment_dir
+        / "diffact"
+        / f"seed_{seed}"
+        / f"frac_{diffact_fraction}"
+        / f"softmax_{split}"
+    )
     if not softmax_dir.is_dir():
-        print(f"MISSING softmax seed={seed} frac={fraction} split={split}: {softmax_dir}")
-        return None
+        raise FileNotFoundError(
+            f"Missing DiffAct softmax directory for seed={seed}, "
+            f"diffact_fraction={diffact_fraction}, split={split}: {softmax_dir}. "
+            "The producing train/infer task must complete before Petri postprocessing."
+        )
 
     learned_temperature: Optional[float] = None
     if calibrated:
@@ -880,7 +1509,7 @@ def run_one(
             dataset=dataset,
             experiment_dir=experiment_dir,
             seed=seed,
-            fraction=fraction,
+            fraction=diffact_fraction,
             temp_bounds=temp_bounds,
         )
         (out_dir / "calibration.json").write_text(
@@ -888,7 +1517,9 @@ def run_one(
                 {
                     "dataset": dataset,
                     "seed": seed,
-                    "fraction": fraction,
+                    "fraction": diffact_fraction,
+                    "diffact_fraction": diffact_fraction,
+                    "petri_fraction": petri_fraction,
                     "condition": condition,
                     "temperature": learned_temperature,
                     "temp_bounds": list(temp_bounds),
@@ -904,19 +1535,21 @@ def run_one(
         )
 
     validation_selection: Optional[Dict[str, Any]] = None
-    if split == "test":
+    if split == "test" and protocol == LEGACY_PROTOCOL:
         validation_selection = select_validation_hyperparameters(
             experiment_dir=experiment_dir,
             condition=condition,
             seed=seed,
-            fraction=fraction,
+            diffact_fraction=diffact_fraction,
+            petri_fraction=petri_fraction,
             method=method,
+            protocol=protocol,
         )
         if validation_selection is None:
             raise FileNotFoundError(
                 "Test postprocessing requires validation metrics for hyperparameter "
                 f"selection with method={method}: "
-                f"{experiment_dir / 'petri' / condition / f'seed_{seed}' / f'frac_{fraction}'}"
+                f"{experiment_dir / 'petri' / condition / f'seed_{seed}'}"
             )
         selected_hp = validation_selection["selected"]
         if selected_hp.get("method") is not None:
@@ -944,9 +1577,15 @@ def run_one(
         temperature=learned_temperature,
         petri_discovery_representation=petri_discovery_representation,
     )
+    if require_diffact_comparators:
+        preflight_required_diffact_comparators(
+            combined_map_path=map_path,
+            softmax_dir=softmax_dir,
+        )
     allowed = allowed_transition_set(df, train_seq_ids)
     hp = DATASET_HP_DEFAULTS[(dataset, "diffact")]
     weights = HP_STRATEGIES[hp["strategy"]]
+    is_oracle = petri_discovery_source == PETRI_DISCOVERY_OFFICIAL_TEST
     cfg = {
         "method": method,
         "n_train_traces": None,
@@ -955,7 +1594,7 @@ def run_one(
         "test_cases": eval_seq_ids,
         "ensure_train_variant_diversity": False,
         "ensure_test_variant_diversity": False,
-        "allow_train_cases_in_test": False,
+        "allow_train_cases_in_test": is_oracle,
         "use_same_traces_for_train_test": False,
         "compute_marking_transition_map": False,
         "sequential_sampling": False,
@@ -1010,31 +1649,90 @@ def run_one(
         if k != "conditioning_combine_fn"
     }
     serializable_cfg["conditioning_combine_fn"] = "linear_prob_combiner"
+    discovery_label = {
+        COUPLED_CONDITION: "same_fraction_training_subset",
+        DIFFACT_LOW_PETRI_FULL_CONDITION: "full_training_pool_structural_prior",
+        DIFFACT_FULL_PETRI_LOW_CONDITION: "low_data_process_discovery_with_full_diffact",
+        ORACLE_TEST_FOLD_CONDITION: "official_test_fold_gt_oracle",
+    }[condition]
     serializable_cfg.update(
         {
             "dataset": dataset,
             "seed": seed,
-            "fraction": fraction,
+            "fraction": diffact_fraction,
+            "diffact_fraction": diffact_fraction,
+            "petri_fraction": petri_fraction,
             "split": split,
             "condition": condition,
+            "protocol": protocol,
+            "petri_discovery_source": petri_discovery_source,
+            "oracle_upper_bound": is_oracle,
+            "petri_discovery_uses_test_gt": is_oracle,
+            "is_oracle_condition": is_oracle,
+            "petri_discovery_manifest": str(petri_manifest),
             "train_original_cases": train_cases,
+            "diffact_train_original_cases": diffact_train_cases,
+            "petri_train_original_cases": train_cases,
+            "n_diffact_train_cases": len(diffact_train_cases),
+            "n_petri_train_cases": len(train_cases),
             "eval_original_cases": eval_cases,
+            "n_eval_cases": len(eval_cases),
+            "n_full_eval_cases": len(all_eval_cases),
             "combined_case_map": str(map_path),
             "softmax_dir": str(softmax_dir),
+            "softmax_source": {
+                "directory": str(softmax_dir),
+                "diffact_fraction": diffact_fraction,
+                "canonical_probability_pattern": "{case_id}.npy",
+                "raw_probability_pattern": "{case_id}_raw.npy",
+                "official_prediction_pattern": "{case_id}_pred.npy",
+            },
             "calibrated": calibrated,
             "learned_temperature": learned_temperature,
             "temp_bounds": list(temp_bounds),
             "calibration_fit_split": "val" if calibrated else None,
             "calibration_uses_test_data": False,
             "validation_selection": validation_selection,
-            "main_condition_petri_discovery": (
-                "same_fraction_training_subset"
-                if condition == "honest_low_data_petri"
-                else "full_training_pool_structural_prior"
+            "validation_selection_enabled": protocol == LEGACY_PROTOCOL,
+            "test_set_tuning": False,
+            "main_condition_petri_discovery": discovery_label,
+            "run_scope": (
+                "runtime_only_partial_pilot"
+                if runtime_pilot_case_limit is not None
+                else "complete_evaluation"
+            ),
+            "runtime_pilot_case_limit": runtime_pilot_case_limit,
+            "complete_evaluation_set": runtime_pilot_case_limit is None,
+            "deterministic_eval_case_selection": (
+                "first_n_manifest_order" if runtime_pilot_case_limit is not None else None
             ),
             "no_event_level_subsampling": cfg["n_indices"] >= 10**9 and not cfg["sequential_sampling"],
             "petri_discovery_trace_representation": petri_discovery_representation,
             "eval_postprocessing_trace_representation": "frame_events",
+            "fixed_decoder_config": {
+                "policy": (
+                    "canonical_petri_conformance_no_tuning"
+                    if protocol == PRIMARY_PROTOCOL
+                    else "legacy_validation_selected_pilot"
+                ),
+                "method": method,
+                "chunk_size": chunk_size,
+                "prob_threshold": prob_threshold,
+                "model_move_cost": model_move_cost,
+                "log_move_cost": cfg["log_move_cost"],
+                "tau_move_cost": cfg["tau_move_cost"],
+                "conformance_switch_penalty_weight": conformance_switch_penalty_weight,
+                "conditioning_alpha": hp["alpha"],
+                "conditioning_interpolation_weights": weights,
+                "conditioning_state_mode": cfg["conditioning_state_mode"],
+                "conditioning_top_m": cfg["conditioning_top_m"],
+                "candidate_top_k": cfg["candidate_top_k"],
+                "restrict_log_moves": cfg["restrict_log_moves"],
+                "restrict_model_moves_to_tau": cfg["restrict_model_moves_to_tau"],
+                "max_consecutive_tau_moves": cfg["max_consecutive_tau_moves"],
+                "petri_discovery_representation": petri_discovery_representation,
+                "temperature_calibration": calibrated,
+            },
             "paper_diffact_sktr_config": (
                 method == PAPER_DIFFACT_SKTR_METHOD
                 and chunk_size == PAPER_DIFFACT_SKTR_CHUNK_SIZE
@@ -1049,9 +1747,9 @@ def run_one(
             ),
         }
     )
-    (out_dir / "postprocess_config.json").write_text(
-        json.dumps(serializable_cfg, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    config_path = out_dir / "postprocess_config.json"
+    config_path.write_text(
+        json.dumps(serializable_cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     if validation_selection is not None:
         (out_dir / "selected_hyperparameters.json").write_text(
@@ -1084,7 +1782,29 @@ def run_one(
     else:
         raise ValueError(f"Unsupported method: {method}")
     total_seconds = time.perf_counter() - start
+    results_df, comparator_provenance = attach_diffact_comparators(
+        results_df=results_df,
+        combined_map_path=map_path,
+        softmax_dir=softmax_dir,
+        require_comparators=require_diffact_comparators,
+    )
+    run_scope = (
+        "runtime_only_partial_pilot"
+        if runtime_pilot_case_limit is not None
+        else "complete_evaluation"
+    )
+    results_df["diffact_fraction"] = diffact_fraction
+    results_df["petri_fraction"] = petri_fraction
+    results_df["condition"] = condition
+    results_df["petri_discovery_source"] = petri_discovery_source
+    results_df["oracle_upper_bound"] = is_oracle
+    results_df["is_oracle_condition"] = is_oracle
+    results_df["run_scope"] = run_scope
     results_df.to_csv(results_csv, index=False)
+    serializable_cfg["diffact_comparator_provenance"] = comparator_provenance
+    config_path.write_text(
+        json.dumps(serializable_cfg, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     (out_dir / "accuracy_dict.json").write_text(
         json.dumps(accuracy_dict, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -1092,7 +1812,8 @@ def run_one(
     metric_df = build_metric_rows(
         dataset=dataset,
         seed=seed,
-        fraction=fraction,
+        diffact_fraction=diffact_fraction,
+        petri_fraction=petri_fraction,
         condition=condition,
         split=split,
         post_method=method,
@@ -1102,11 +1823,18 @@ def run_one(
         total_seconds=total_seconds,
         calibrated=calibrated,
     )
+    metric_df["run_scope"] = run_scope
+    metric_df["complete_evaluation_set"] = runtime_pilot_case_limit is None
+    metric_df["runtime_pilot_case_limit"] = runtime_pilot_case_limit
+    metric_df["petri_discovery_source"] = petri_discovery_source
+    metric_df["oracle_upper_bound"] = is_oracle
+    metric_df["is_oracle_condition"] = is_oracle
     metric_df.to_csv(metrics_csv, index=False)
     per_case_df = build_per_case_metric_rows(
         dataset=dataset,
         seed=seed,
-        fraction=fraction,
+        diffact_fraction=diffact_fraction,
+        petri_fraction=petri_fraction,
         condition=condition,
         split=split,
         post_method=method,
@@ -1116,11 +1844,18 @@ def run_one(
         allowed_transitions=allowed,
         calibrated=calibrated,
     )
+    per_case_df["run_scope"] = run_scope
+    per_case_df["complete_evaluation_set"] = runtime_pilot_case_limit is None
+    per_case_df["runtime_pilot_case_limit"] = runtime_pilot_case_limit
+    per_case_df["petri_discovery_source"] = petri_discovery_source
+    per_case_df["oracle_upper_bound"] = is_oracle
+    per_case_df["is_oracle_condition"] = is_oracle
     per_case_df.to_csv(per_case_metrics_csv, index=False)
     method_name = f"{method}_calibrated" if calibrated else method
     runtime_df, per_case_runtime_df = build_runtime_tables(
         seed=seed,
-        fraction=fraction,
+        diffact_fraction=diffact_fraction,
+        petri_fraction=petri_fraction,
         condition=condition,
         split=split,
         method=method_name,
@@ -1128,6 +1863,10 @@ def run_one(
         combined_map_path=map_path,
         total_seconds=total_seconds,
     )
+    for runtime_table in (runtime_df, per_case_runtime_df):
+        runtime_table["run_scope"] = run_scope
+        runtime_table["complete_evaluation_set"] = runtime_pilot_case_limit is None
+        runtime_table["runtime_pilot_case_limit"] = runtime_pilot_case_limit
     runtime_df.to_csv(out_dir / "runtime.csv", index=False)
     per_case_runtime_df.to_csv(per_case_runtime_csv, index=False)
     print(f"Wrote {metrics_csv}")
@@ -1139,13 +1878,35 @@ def main() -> None:
     parser.add_argument("--experiment-dir", type=Path, default=DEFAULT_EXPERIMENT_DIR)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--seeds", nargs="+", type=int, default=list(SEEDS))
-    parser.add_argument("--fractions", nargs="+", type=int, default=list(FRACTIONS))
+    parser.add_argument(
+        "--fractions",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Legacy selector; maps through --condition. Defaults to the coupled 25/50/75/100 curve.",
+    )
+    parser.add_argument(
+        "--diffact-fractions",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit DiffAct softmax fractions, zipped with --petri-fractions.",
+    )
+    parser.add_argument(
+        "--petri-fractions",
+        nargs="+",
+        type=int,
+        default=None,
+        help="Explicit Petri discovery fractions, zipped with --diffact-fractions.",
+    )
     parser.add_argument("--split", choices=["val", "test"], default="test")
     parser.add_argument(
         "--condition",
-        choices=["honest_low_data_petri", "structural_prior_full_train_petri"],
-        default="honest_low_data_petri",
+        choices=CONDITIONS,
+        default=None,
+        help="Defaults to the condition implied by each explicit fraction pair.",
     )
+    parser.add_argument("--protocol", choices=PROTOCOL_CHOICES, default="auto")
     parser.add_argument(
         "--method",
         choices=["petri_transition_viterbi", "petri_conformance"],
@@ -1184,6 +1945,18 @@ def main() -> None:
             "traces are always postprocessed and scored at frame level."
         ),
     )
+    parser.add_argument(
+        "--petri-discovery-source",
+        choices=list(PETRI_DISCOVERY_SOURCES),
+        default=None,
+        help=(
+            "Expected Petri discovery provenance. It must agree with --condition "
+            "and normally should be omitted so it is inferred: "
+            "nested_train_fraction (honest / D100+P25), full_train "
+            "(structural_prior_full_train_petri), or official_test_fold "
+            "(oracle_test_fold_petri)."
+        ),
+    )
     parser.add_argument("--calibrated", action="store_true")
     parser.add_argument("--temp-bounds", nargs=2, type=float, default=[1.0, 10.0])
     parser.add_argument("--workers", type=int, default=PAPER_DIFFACT_SKTR_WORKERS)
@@ -1198,6 +1971,24 @@ def main() -> None:
         ),
     )
     parser.add_argument("--max-runs", type=int, default=None)
+    parser.add_argument(
+        "--runtime-pilot-case-limit",
+        type=int,
+        default=None,
+        help=(
+            "Decode only the first N manifest-ordered cases for runtime estimation. "
+            "Outputs are isolated and marked runtime_only_partial_pilot."
+        ),
+    )
+    parser.add_argument(
+        "--require-diffact-comparators",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Require complete {case_id}_pred.npy and {case_id}_raw.npy streams. "
+            "Defaults on for the primary no-validation protocol."
+        ),
+    )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
@@ -1206,38 +1997,123 @@ def main() -> None:
     data_root = args.data_root.resolve()
     metadata = json.loads((experiment_dir / "experiment_metadata.json").read_text())
     dataset = metadata["dataset"]
+    protocol = resolve_protocol(metadata, args.protocol)
+    fraction_pairs = resolve_fraction_pairs(
+        legacy_fractions=args.fractions,
+        diffact_fractions=args.diffact_fractions,
+        petri_fractions=args.petri_fractions,
+        condition=args.condition,
+        petri_discovery_source=args.petri_discovery_source,
+    )
+    require_diffact_comparators = (
+        protocol == PRIMARY_PROTOCOL
+        if args.require_diffact_comparators is None
+        else bool(args.require_diffact_comparators)
+    )
+    if args.runtime_pilot_case_limit is not None and args.runtime_pilot_case_limit < 1:
+        parser.error("--runtime-pilot-case-limit must be positive")
+    if protocol == PRIMARY_PROTOCOL:
+        validate_primary_decoder_config(
+            split=args.split,
+            method=args.method,
+            chunk_size=args.chunk_size,
+            prob_threshold=args.prob_threshold,
+            model_move_cost=args.model_move_cost,
+            conformance_switch_penalty_weight=args.conformance_switch_penalty_weight,
+            petri_discovery_representation=args.petri_discovery_representation,
+            calibrated=args.calibrated,
+        )
     setup_logging()
 
     commands: List[str] = []
     completed = 0
-    for seed, fraction in iter_requested(args.seeds, args.fractions, args.max_runs):
-        parallel_flag = "--inner-parallel" if args.inner_parallel else "--no-inner-parallel"
-        command = (
-            f"python {Path(__file__).resolve()} --experiment-dir {experiment_dir} "
-            f"--data-root {data_root} --seeds {seed} --fractions {fraction} "
-            f"--split {args.split} --condition {args.condition} "
-            f"--method {args.method} --transition-illegal-penalty {args.transition_illegal_penalty} "
-            f"--chunk-size {args.chunk_size} --prob-threshold {args.prob_threshold} "
-            f"--model-move-cost {args.model_move_cost} "
-            f"--conformance-switch-penalty-weight {args.conformance_switch_penalty_weight} "
-            f"--progress-log-interval-chunks {args.progress_log_interval_chunks} "
-            f"--petri-discovery-representation {args.petri_discovery_representation} "
-            f"--workers {args.workers} {parallel_flag} --execute"
+    requested_runs = list(iter_requested(args.seeds, fraction_pairs, args.max_runs))
+    for seed, diffact_fraction, petri_fraction, condition in requested_runs:
+        discovery_source = args.petri_discovery_source or default_petri_discovery_source(
+            condition
         )
+        parallel_flag = "--inner-parallel" if args.inner_parallel else "--no-inner-parallel"
+        command_parts = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--experiment-dir",
+            str(experiment_dir),
+            "--data-root",
+            str(data_root),
+            "--seeds",
+            str(seed),
+            "--diffact-fractions",
+            str(diffact_fraction),
+        ]
+        if petri_fraction is not None:
+            command_parts += ["--petri-fractions", str(petri_fraction)]
+        command_parts += [
+            "--split",
+            args.split,
+            "--condition",
+            condition,
+            "--protocol",
+            protocol,
+            "--method",
+            args.method,
+            "--transition-illegal-penalty",
+            str(args.transition_illegal_penalty),
+            "--chunk-size",
+            str(args.chunk_size),
+            "--prob-threshold",
+            str(args.prob_threshold),
+            "--model-move-cost",
+            str(args.model_move_cost),
+            "--conformance-switch-penalty-weight",
+            str(args.conformance_switch_penalty_weight),
+            "--progress-log-interval-chunks",
+            str(args.progress_log_interval_chunks),
+            "--petri-discovery-representation",
+            args.petri_discovery_representation,
+            "--petri-discovery-source",
+            discovery_source,
+            "--workers",
+            str(args.workers),
+            parallel_flag,
+            (
+                "--require-diffact-comparators"
+                if require_diffact_comparators
+                else "--no-require-diffact-comparators"
+            ),
+            "--execute",
+        ]
         if args.calibrated:
-            command += f" --calibrated --temp-bounds {args.temp_bounds[0]} {args.temp_bounds[1]}"
+            command_parts += [
+                "--calibrated",
+                "--temp-bounds",
+                str(args.temp_bounds[0]),
+                str(args.temp_bounds[1]),
+            ]
+        if args.runtime_pilot_case_limit is not None:
+            command_parts += [
+                "--runtime-pilot-case-limit",
+                str(args.runtime_pilot_case_limit),
+            ]
+        if args.force:
+            command_parts.append("--force")
+        command = shlex.join(command_parts)
         commands.append(command)
         if not args.execute:
-            print(f"PREPARED seed={seed} frac={fraction}: {command}")
+            print(
+                f"PREPARED seed={seed} diffact_frac={diffact_fraction} "
+                f"petri_frac={petri_fraction} condition={condition}: {command}"
+            )
             continue
-        path = run_one(
+        run_one(
             experiment_dir=experiment_dir,
             data_root=data_root,
             dataset=dataset,
             seed=seed,
-            fraction=fraction,
+            diffact_fraction=diffact_fraction,
+            petri_fraction=petri_fraction,
             split=args.split,
-            condition=args.condition,
+            condition=condition,
+            protocol=protocol,
             method=args.method,
             chunk_size=args.chunk_size,
             prob_threshold=args.prob_threshold,
@@ -1245,18 +2121,39 @@ def main() -> None:
             conformance_switch_penalty_weight=args.conformance_switch_penalty_weight,
             progress_log_interval_chunks=args.progress_log_interval_chunks,
             petri_discovery_representation=args.petri_discovery_representation,
+            petri_discovery_source=discovery_source,
             transition_illegal_penalty=args.transition_illegal_penalty,
             calibrated=args.calibrated,
             temp_bounds=(float(args.temp_bounds[0]), float(args.temp_bounds[1])),
             workers=args.workers,
             inner_parallel=args.inner_parallel,
+            runtime_pilot_case_limit=args.runtime_pilot_case_limit,
+            require_diffact_comparators=require_diffact_comparators,
             force=args.force,
         )
-        if path is not None:
-            completed += 1
+        completed += 1
 
     cal_suffix = "_calibrated" if args.calibrated else ""
-    cmd_path = experiment_dir / "petri" / f"run_{args.condition}_{args.split}{cal_suffix}_commands.sh"
+    pilot_suffix = (
+        f"_runtime_pilot_n{args.runtime_pilot_case_limit}"
+        if args.runtime_pilot_case_limit is not None
+        else ""
+    )
+    if len(requested_runs) == 1:
+        _, diffact_fraction, petri_fraction, condition = requested_runs[0]
+        if petri_fraction is None:
+            command_scope = f"{condition}_d{diffact_fraction}_ptest_test"
+        else:
+            command_scope = f"{condition}_d{diffact_fraction}_p{petri_fraction}"
+    elif len({condition for _, _, _, condition in requested_runs}) == 1:
+        command_scope = requested_runs[0][3]
+    else:
+        command_scope = "factorized"
+    cmd_path = (
+        experiment_dir
+        / "petri"
+        / f"run_{command_scope}_{args.split}{cal_suffix}{pilot_suffix}_commands.sh"
+    )
     cmd_path.parent.mkdir(parents=True, exist_ok=True)
     cmd_path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n\n" + "\n".join(commands) + "\n")
     cmd_path.chmod(0o755)
