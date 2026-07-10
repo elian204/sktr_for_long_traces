@@ -2649,10 +2649,10 @@ class PetriNet:
         profile_stats: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[str], List[float]]:
         """
-        Wrapper function to replace process_test_case_incremental using chunked_trace_conformance.
+        Recover one softmax trace with chunked conformance checking.
 
-        This function maintains the same interface as process_test_case_incremental but uses
-        the more efficient chunked conformance checking approach instead of beam search.
+        This wrapper delegates to ``conformance_chunked`` and returns the
+        frame-level predictions and move costs.
 
         Args:
             softmax_matrix: Softmax probability matrix (n_activities, n_timestamps)

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# 50 Salads fold 1 x DiffAct softmax -> SKTR with the non-beam bounded search settings.
+# 50 Salads fold 1 x DiffAct softmax -> SKTR with canonical bounded conformance settings.
 # Intended for tmux: tmux new -s paper_50salads_fold1_taucap8 scripts/run_eval_diffact_50salads_fold1_w7_taucap8.sh
 set -euo pipefail
 
 cd /home/dsi/eli-bogdanov/sktr_for_long_traces
 
+# Keep the historical output path so existing partial results remain resumable.
 OUT="results/paper_diffact_50salads_fold1_w7_taucap8_topm1_topk3_chunk11_nobeam"
 mkdir -p "$OUT"
 export PYTHONUNBUFFERED=1

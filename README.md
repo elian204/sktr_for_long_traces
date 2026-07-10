@@ -53,6 +53,30 @@ results_df, accuracy_dict, prob_dict = incremental_softmax_recovery(
 print(f"Final accuracy: {pd.Series(accuracy_dict['sktr_accuracy']).mean():.3f}")
 ```
 
+## Canonical DiffAct experiment configuration
+
+Use `run_eval_diffact_sktr_paper.sh` for the configuration established by the
+prior full-data DiffAct experiments:
+
+```bash
+./run_eval_diffact_sktr_paper.sh --datasets 50salads gtea --all-folds
+```
+
+The wrapper explicitly pins the result-affecting search settings: chunk size
+11, probability threshold `1e-6`, top-M state mode with M=1, top-K candidate
+filtering with K=3, switch penalty 1.0, restricted log moves, model moves
+restricted to tau, and at most 8 consecutive tau moves. Dataset-specific
+conditioning weights remain defined in `eval_diffact_sktr_fold1_paper.py`.
+Arguments appended to the command can intentionally override the preset.
+
+The current recovery path is chunked Petri-net conformance only. The original
+`beam_search.py` and hybrid decoder were removed in the conformance-only
+refactor, and the later `dijkstra_beam_width` and
+`dijkstra_beam_cost_delta` options were also removed. Old beam experiments
+must be reproduced from a historical revision. The current top-M state and
+top-K candidate bounds are conformance-search optimizations, not either legacy
+beam implementation.
+
 ## 🧪 Testing
 
 Run the comprehensive test notebook:

@@ -2,8 +2,7 @@
 Softmax Trace Recovery: Main high-level function.
 
 This module provides the main entry point for recovering activity sequences from 
-softmax probability matrices using Petri net models. Supports both beam search 
-and conformance checking approaches for flexible trace recovery.
+softmax probability matrices using chunked Petri-net conformance checking.
 """
 
 from typing import Any, Callable, List, Optional, Tuple, Union, Dict, Set

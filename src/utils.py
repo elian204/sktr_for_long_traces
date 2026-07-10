@@ -1,9 +1,8 @@
 """
-Incremental Softmax Recovery: Main high-level function.
+Incremental Softmax Recovery: Shared utilities.
 
-This module provides the main entry point for incremental softmax matrix recovery
-using beam search with Petri nets, following the pattern of the existing 
-compare_stochastic_vs_argmax_random_indices function.
+This module provides validation, probability-adjustment, serialization, and
+visualization helpers for Petri-net conformance recovery.
 """
 
 import os

@@ -1,8 +1,8 @@
 """
 Conformance checking functions for trace recovery.
 
-This module provides conformance-based alternatives to beam search
-for recovering activity sequences from softmax probability matrices.
+This module recovers activity sequences from softmax probability matrices with
+chunked Petri-net conformance checking.
 """
 
 from typing import Callable, List, Tuple, Dict, Any, Mapping, Optional
