@@ -5,7 +5,8 @@ This module provides the main entry point for recovering activity sequences from
 softmax probability matrices using chunked Petri-net conformance checking.
 """
 
-from typing import Any, Callable, List, Optional, Tuple, Union, Dict, Set
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import logging
 import pandas as pd
 import numpy as np
@@ -34,6 +35,141 @@ _WORKER_PROB_UNCOLLAPSED = None
 _WORKER_PROB_COLLAPSED = None
 _WORKER_SETTINGS: Dict[str, Any] = {}
 _TAU_MOVE_COST_FORCED = 1e-6
+
+
+@dataclass
+class RecoveryContext:
+    """Petri discovery artifacts that can be reused across softmax checkpoints."""
+
+    model: Any
+    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]]
+    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]]
+    train_case_ids: Tuple[str, ...]
+    max_hist_len: int
+    enabled_cache_size: int
+    compute_marking_transition_map: bool
+    precompute_marking_transition_map: bool
+    probability_dicts_enabled: bool
+
+
+def build_recovery_context(
+    train_df: pd.DataFrame,
+    *,
+    max_hist_len: int,
+    enabled_cache_size: int,
+    compute_marking_transition_map: bool,
+    precompute_marking_transition_map: bool,
+    conformance_switch_penalty_weight: float,
+    conditioning_alpha: Optional[float],
+    save_model: bool = False,
+    save_model_path: str = "./results/discovered_petri_net",
+) -> RecoveryContext:
+    """Discover and prepare a Petri model once for repeated checkpoint decoding."""
+    if train_df.empty:
+        raise ValueError("Cannot build a recovery context from an empty training log")
+    train_case_ids = tuple(
+        str(value) for value in train_df["case:concept:name"].drop_duplicates().tolist()
+    )
+    logger.info("Discovering reusable Petri net model from %d training cases.", len(train_case_ids))
+    model = discover_petri_net(train_df)
+    model.enable_caching(True, max_size=enabled_cache_size)
+
+    if save_model:
+        try:
+            visualize_petri_net(model, output_path=save_model_path)
+            logger.info("Petri net visualization saved to %s.pdf", save_model_path)
+        except Exception as exc:
+            logger.warning("Failed to save Petri net visualization: %s", exc)
+            logger.warning("Continuing without saving model visualization...")
+    logger.info(
+        "Discovered Petri net model: %d places, %d transitions.",
+        len(model.places),
+        len(model.transitions),
+    )
+
+    if compute_marking_transition_map:
+        if precompute_marking_transition_map:
+            logger.info("Computing full marking-to-transition map for reusable context.")
+            model.build_marking_transition_map()
+            model._allow_lazy_map_build = False
+        else:
+            logger.info("Initializing on-demand marking-to-transition cache.")
+            model._allow_lazy_map_build = True
+            try:
+                model.get_or_build_marking_transition_map(max_tau_depth=100)
+                model.get_tau_reachable_transitions_initial(max_tau_depth=100)
+            except Exception as exc:
+                logger.warning("Failed to warm-start tau-reachability cache: %s", exc)
+    else:
+        model._allow_lazy_map_build = False
+
+    probability_dicts_enabled = (
+        conformance_switch_penalty_weight > 0.0 or conditioning_alpha is not None
+    )
+    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
+    if probability_dicts_enabled:
+        prob_dict_uncollapsed = build_probability_dict(
+            train_df,
+            max_hist_len=max_hist_len,
+            use_collapsed=False,
+        )
+        prob_dict_collapsed = build_probability_dict(
+            train_df,
+            max_hist_len=max_hist_len,
+            use_collapsed=True,
+        )
+        logger.info(
+            "Built reusable probability dictionaries: uncollapsed=%d, collapsed=%d.",
+            len(prob_dict_uncollapsed),
+            len(prob_dict_collapsed),
+        )
+
+    return RecoveryContext(
+        model=model,
+        prob_dict_uncollapsed=prob_dict_uncollapsed,
+        prob_dict_collapsed=prob_dict_collapsed,
+        train_case_ids=train_case_ids,
+        max_hist_len=max_hist_len,
+        enabled_cache_size=enabled_cache_size,
+        compute_marking_transition_map=compute_marking_transition_map,
+        precompute_marking_transition_map=precompute_marking_transition_map,
+        probability_dicts_enabled=probability_dicts_enabled,
+    )
+
+
+def _validate_recovery_context(
+    context: RecoveryContext,
+    train_df: pd.DataFrame,
+    *,
+    max_hist_len: int,
+    enabled_cache_size: int,
+    compute_marking_transition_map: bool,
+    precompute_marking_transition_map: bool,
+    conformance_switch_penalty_weight: float,
+    conditioning_alpha: Optional[float],
+) -> None:
+    train_case_ids = tuple(
+        str(value) for value in train_df["case:concept:name"].drop_duplicates().tolist()
+    )
+    expected_probability_dicts = (
+        conformance_switch_penalty_weight > 0.0 or conditioning_alpha is not None
+    )
+    mismatches = {}
+    expected = {
+        "train_case_ids": train_case_ids,
+        "max_hist_len": max_hist_len,
+        "enabled_cache_size": enabled_cache_size,
+        "compute_marking_transition_map": compute_marking_transition_map,
+        "precompute_marking_transition_map": precompute_marking_transition_map,
+        "probability_dicts_enabled": expected_probability_dicts,
+    }
+    for field, value in expected.items():
+        actual = getattr(context, field)
+        if actual != value:
+            mismatches[field] = {"expected": value, "actual": actual}
+    if mismatches:
+        raise ValueError(f"Recovery context does not match decode configuration: {mismatches}")
 
 
 def _safe_case_filename(case_id: Any) -> str:
@@ -665,6 +801,7 @@ def incremental_softmax_recovery(
     # removed: restrict_to_observed_moves
     compute_marking_transition_map: bool = True,
     precompute_marking_transition_map: bool = False,
+    recovery_context: Optional[RecoveryContext] = None,
     verbose: bool = True,
     log_level: int = logging.INFO,
     # Backwards compatibility: this flag used to control whether to build
@@ -672,7 +809,14 @@ def incremental_softmax_recovery(
     # always builds both uncollapsed and collapsed probability dictionaries,
     # so this parameter is accepted but ignored.
     use_collapsed_runs: bool = True,
-) -> Tuple[pd.DataFrame, Dict[str, List[float]], Dict[Tuple[str, ...], Dict[str, float]], Dict[Tuple[str, ...], Dict[str, float]]]:
+) -> Tuple[
+    pd.DataFrame,
+    Dict[str, List[float]],
+    Tuple[
+        Dict[Tuple[str, ...], Dict[str, float]],
+        Dict[Tuple[str, ...], Dict[str, float]],
+    ],
+]:
     """
     Recover activity sequences from softmax matrices using Petri net models (conformance only).
 
@@ -846,73 +990,38 @@ def incremental_softmax_recovery(
     if overlap_cases:
         logger.info(f"Train/test overlap: {len(overlap_cases)} case(s) - {sorted(overlap_cases)}")
 
-    # 7. Model discovery
-    logger.info("Discovering Petri net model from training data.")
-    model = discover_petri_net(train_df)
-    model.enable_caching(True, max_size=enabled_cache_size)
-    
-    if save_model:
-        try:
-            visualize_petri_net(model, output_path=save_model_path)
-            logger.info(f"Petri net visualization saved to {save_model_path}.pdf")
-        except Exception as e:
-            logger.warning(f"Failed to save Petri net visualization: {e}")
-            logger.warning("Continuing without saving model visualization...")
-    n_places = len(model.places)
-    n_transitions = len(model.transitions)
-    logger.info(f"Discovered Petri net model: {n_places} places, {n_transitions} transitions.")
-    
-    # τ-reachability support (macro transitions). Prefer on-demand caching to reduce peak memory.
-    if compute_marking_transition_map:
-        if precompute_marking_transition_map:
-            logger.info("Computing full marking-to-transition map (tau-reachability) for discovered Petri net...")
-            marking_transition_map = model.build_marking_transition_map()
-            logger.info(f"Computed marking-to-transition map with {len(marking_transition_map)} reachable markings.")
-            # Use the precomputed map directly; don't mutate it during search.
-            model._allow_lazy_map_build = False
-        else:
-            logger.info("Initializing on-demand marking-to-transition cache (tau-reachability).")
-            model._allow_lazy_map_build = True
-            try:
-                model.get_or_build_marking_transition_map(max_tau_depth=100)
-                init_reachable = model.get_tau_reachable_transitions_initial(max_tau_depth=100)
-                logger.debug(f"Cached tau-reachability for initial marking: {len(init_reachable)} visible transitions")
-            except Exception as exc:
-                logger.warning(f"Failed to warm-start tau-reachability cache: {exc}")
-            marking_transition_map = model.marking_transition_map
-    else:
-        logger.info("Skipping tau-reachability support (compute_marking_transition_map=False).")
-        logger.info("Disabling lazy map building - will use direct enabled transitions fallback.")
-        model._allow_lazy_map_build = False
-        marking_transition_map = None
-
-    # 8. Conditional probabilities (build when needed for switch penalty or conditioning)
-    # Build TWO dictionaries: uncollapsed (for continuation) and collapsed (for transitions)
-    prob_dict_uncollapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
-    prob_dict_collapsed: Dict[Tuple[str, ...], Dict[str, float]] = {}
-
-    if conformance_switch_penalty_weight > 0.0 or (conditioning_alpha is not None):
-        # Build UNCOLLAPSED dictionary for continuation probabilities
-        prob_dict_uncollapsed = build_probability_dict(
+    # 7-8. Petri discovery and conditional probabilities. A validated context can
+    # be reused across multiple softmax checkpoints from the same trajectory.
+    if recovery_context is None:
+        recovery_context = build_recovery_context(
             train_df,
             max_hist_len=max_hist_len,
-            use_collapsed=False  # UNCOLLAPSED
+            enabled_cache_size=enabled_cache_size,
+            compute_marking_transition_map=compute_marking_transition_map,
+            precompute_marking_transition_map=precompute_marking_transition_map,
+            conformance_switch_penalty_weight=conformance_switch_penalty_weight,
+            conditioning_alpha=conditioning_alpha,
+            save_model=save_model,
+            save_model_path=save_model_path,
         )
-        n_histories_uncollapsed = len(prob_dict_uncollapsed)
-        avg_activities_uncollapsed = np.mean([len(activities) for activities in prob_dict_uncollapsed.values()]) if prob_dict_uncollapsed else 0
-        logger.info(f"Built UNCOLLAPSED probability dictionary (for continuation): {n_histories_uncollapsed} histories, avg {avg_activities_uncollapsed:.1f} activities per history.")
-
-        # Build COLLAPSED dictionary for transition probabilities
-        prob_dict_collapsed = build_probability_dict(
+    else:
+        _validate_recovery_context(
+            recovery_context,
             train_df,
             max_hist_len=max_hist_len,
-            use_collapsed=True  # COLLAPSED
+            enabled_cache_size=enabled_cache_size,
+            compute_marking_transition_map=compute_marking_transition_map,
+            precompute_marking_transition_map=precompute_marking_transition_map,
+            conformance_switch_penalty_weight=conformance_switch_penalty_weight,
+            conditioning_alpha=conditioning_alpha,
         )
-        n_histories_collapsed = len(prob_dict_collapsed)
-        avg_activities_collapsed = np.mean([len(activities) for activities in prob_dict_collapsed.values()]) if prob_dict_collapsed else 0
-        logger.info(f"Built COLLAPSED probability dictionary (for transitions): {n_histories_collapsed} histories, avg {avg_activities_collapsed:.1f} activities per history.")
-    else:
-        logger.info("Skipping probability dictionary build (not requested).")
+        logger.info(
+            "Reusing Petri recovery context discovered from %d training cases.",
+            len(recovery_context.train_case_ids),
+        )
+    model = recovery_context.model
+    prob_dict_uncollapsed = recovery_context.prob_dict_uncollapsed
+    prob_dict_collapsed = recovery_context.prob_dict_collapsed
 
     # 9. Prepare test softmax matrices (with optional calibration)
     if filtered_softmax is None:
