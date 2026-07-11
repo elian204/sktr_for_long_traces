@@ -55,7 +55,9 @@ when an export is skipped and before a Petri decode begins.
 
 Every imported checkpoint records its source path, copied path, SHA-256,
 zero-based epoch index, completed epoch count, schedule fraction, training item
-presentations, trainer step, and optimizer update count. DiffAct accumulates
+presentations, trainer step, and optimizer update count. Here `trainer_step` is
+DiffAct's post-loop next-presentation counter, not the number of completed
+presentations. DiffAct accumulates
 gradients over `batch_size` training items, so for a checkpoint epoch `e`:
 
 ```
@@ -111,3 +113,10 @@ D100 task states are `complete` with return code 0. Operationally, wait for the
 entire Phase 1 GTEA study to finish before launching Phase 2 so the four shared
 GPUs are not contended. Every real task also
 recomputes the recorded source digest and refuses to run if the code changed.
+
+Status revalidates imported checkpoint hashes and provenance, complete export
+bundle hashes, and every epoch output in each completed decode grid; it does
+not trust completion booleans alone. Aggregation refuses to run until every
+task state is complete with return code zero and both the per-case and
+fold-global inputs cover the exact fold × checkpoint × condition × method ×
+metric grid.

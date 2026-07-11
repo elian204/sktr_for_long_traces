@@ -58,6 +58,15 @@ from export_epoch_checkpoint import validate_completed_export  # noqa: E402
 
 
 APPROVED_SCORE_METHODS = {"raw_argmax", "official_diffact", "petri_conformance"}
+CANONICAL_RECOVERY_KEYS = (
+    "chunk_size",
+    "conditioning_state_mode",
+    "conditioning_top_m",
+    "candidate_top_k",
+    "restrict_log_moves",
+    "restrict_model_moves_to_tau",
+    "max_consecutive_tau_moves",
+)
 
 
 def output_dir_for(
@@ -102,22 +111,22 @@ def recovery_config(dataset: str, seed: int, workers: int, out_dir: Path) -> Dic
         "random_seed": seed,
         "save_model": False,
         "non_sync_penalty": 1.0,
-        "chunk_size": 11,
+        "chunk_size": CANONICAL_DECODER["chunk_size"],
         "conformance_switch_penalty_weight": 1.0,
         "conditioning_alpha": hp["alpha"],
         "conditioning_combine_fn": linear_prob_combiner,
         "conditioning_n_prev_labels": 3,
         "conditioning_interpolation_weights": HP_STRATEGIES[hp["strategy"]],
-        "conditioning_state_mode": "topm",
-        "conditioning_top_m": 1,
+        "conditioning_state_mode": CANONICAL_DECODER["conditioning_state_mode"],
+        "conditioning_top_m": CANONICAL_DECODER["conditioning_top_m"],
         "candidate_top_p": 1.0,
-        "candidate_top_k": 3,
+        "candidate_top_k": CANONICAL_DECODER["candidate_top_k"],
         "candidate_min_k": 1,
         "candidate_source": "conditioned",
         "candidate_apply_to_sync": True,
-        "restrict_log_moves": True,
-        "restrict_model_moves_to_tau": True,
-        "max_consecutive_tau_moves": 8,
+        "restrict_log_moves": CANONICAL_DECODER["restrict_log_moves"],
+        "restrict_model_moves_to_tau": CANONICAL_DECODER["restrict_model_moves_to_tau"],
+        "max_consecutive_tau_moves": CANONICAL_DECODER["max_consecutive_tau_moves"],
         "progress_log_interval_chunks": 20,
         "adaptive_chunk_sizing": False,
         "use_state_caching": True,
@@ -134,6 +143,16 @@ def recovery_config(dataset: str, seed: int, workers: int, out_dir: Path) -> Dic
         "verbose": True,
         "log_level": logging.INFO,
     }
+
+
+def validate_canonical_recovery_config(config: Dict[str, Any]) -> None:
+    mismatches = {
+        key: {"expected": CANONICAL_DECODER[key], "actual": config.get(key)}
+        for key in CANONICAL_RECOVERY_KEYS
+        if config.get(key) != CANONICAL_DECODER[key]
+    }
+    if mismatches:
+        raise ValueError(f"Recovery configuration drifted from CANONICAL_DECODER: {mismatches}")
 
 
 def serializable_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -160,6 +179,18 @@ def validate_existing_output(
     discovery_source: str,
     is_oracle: bool,
 ) -> None:
+    required_outputs = (
+        "results.csv",
+        "metrics.csv",
+        "per_case_metrics.csv",
+        "runtime.csv",
+        "per_case_runtime.csv",
+        "accuracy_dict.json",
+        "postprocess_config.json",
+    )
+    missing = [name for name in required_outputs if not (out_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Missing completed decode outputs under {out_dir}: {missing}")
     config = read_json(out_dir / "postprocess_config.json")
     expected = {
         "condition": condition,
@@ -183,6 +214,15 @@ def validate_existing_output(
             "expected": CANONICAL_DECODER,
             "actual": config.get("canonical_decoder"),
         }
+    if not bool(config.get("context_reused_across_checkpoint_grid", False)):
+        mismatches["context_reused_across_checkpoint_grid"] = {
+            "expected": True,
+            "actual": config.get("context_reused_across_checkpoint_grid"),
+        }
+    try:
+        validate_canonical_recovery_config(config.get("recovery_config", {}))
+    except ValueError as exc:
+        mismatches["recovery_config"] = str(exc)
     if mismatches:
         raise ValueError(
             f"Existing epoch output is incompatible; rerun with --force: {out_dir}: "
@@ -199,6 +239,80 @@ def validate_existing_output(
         epochs = set(frame["checkpoint_epoch_index"].astype(int))
         if epochs != {epoch}:
             raise ValueError(f"Existing {name} has checkpoint epochs {sorted(epochs)}")
+        frame_expected = {
+            key: value
+            for key, value in expected.items()
+            if key != "petri_discovery_uses_test_gt"
+        }
+        for key, expected_value in frame_expected.items():
+            if key not in frame.columns:
+                raise ValueError(f"Existing {name} is missing required column {key!r}")
+            observed = set(frame[key].map(lambda value: str(value).strip().lower()))
+            expected_normalized = str(expected_value).strip().lower()
+            if observed != {expected_normalized}:
+                raise ValueError(
+                    f"Existing {name} has {key}={sorted(observed)}; "
+                    f"expected={expected_normalized!r}"
+                )
+
+
+def validate_completed_decode_grid(
+    experiment_dir: Path,
+    *,
+    seed: int,
+    condition: str,
+    discovery_source: str,
+) -> Dict[str, Any]:
+    """Revalidate a completed condition grid and every epoch output."""
+
+    experiment_dir = experiment_dir.resolve()
+    validate_condition_source(condition, discovery_source)
+    metadata = read_json(experiment_dir / "experiment_metadata.json")
+    epochs = list(map(int, dataset_spec(str(metadata["dataset"]))["checkpoint_epochs"]))
+    marker_path = (
+        experiment_dir / "petri" / condition / f"seed_{seed}" / "decode_grid_complete.json"
+    )
+    marker = read_json(marker_path)
+    is_oracle = condition == ORACLE_CONDITION
+    manifest = (
+        experiment_dir / "manifests" / "test_cases.txt"
+        if discovery_source == DISCOVERY_OFFICIAL_TEST
+        else experiment_dir / "manifests" / "train_pool_cases.txt"
+    )
+    expected = {
+        "completed": True,
+        "condition": condition,
+        "petri_discovery_source": discovery_source,
+        "is_oracle_condition": is_oracle,
+        "checkpoint_epoch_indices": epochs,
+        "petri_discovery_manifest": str(manifest),
+        "petri_discovery_manifest_sha256": file_sha256(manifest),
+    }
+    mismatches = {
+        key: {"expected": value, "actual": marker.get(key)}
+        for key, value in expected.items()
+        if marker.get(key) != value
+    }
+    discovery_count = marker.get("petri_context_discovery_count_this_invocation")
+    if discovery_count not in {0, 1}:
+        mismatches["petri_context_discovery_count_this_invocation"] = {
+            "expected": "0 or 1",
+            "actual": discovery_count,
+        }
+    for epoch in epochs:
+        validate_completed_export(experiment_dir, seed=seed, checkpoint_epoch=epoch)
+        validate_existing_output(
+            output_dir_for(experiment_dir, condition, seed, epoch),
+            epoch=epoch,
+            condition=condition,
+            discovery_source=discovery_source,
+            is_oracle=is_oracle,
+        )
+    if mismatches:
+        raise ValueError(
+            f"Completed decode grid failed immutable validation: {marker_path}: {mismatches}"
+        )
+    return marker
 
 
 def main() -> None:
@@ -293,6 +407,7 @@ def main() -> None:
             combined_df["case:concept:name"].astype(str).isin(set(map(str, train_seq_ids)))
         ]
         config = recovery_config(dataset, args.seed, args.workers, out_dir)
+        validate_canonical_recovery_config(config)
         config["resume_case_outputs"] = not args.force
         if context is None:
             context = build_recovery_context(

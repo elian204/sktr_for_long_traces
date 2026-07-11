@@ -16,6 +16,7 @@ from epoch_scarcity_common import ORACLE_CONDITION, PRIMARY_CONDITION, read_json
 
 
 CORE_METRICS = ("f1@25", "f1@10", "f1@50", "edit", "frame_accuracy")
+EXPECTED_METHODS = ("raw_decoder_argmax", "official_diffact", "sktr")
 INDEX_COLS = [
     "dataset",
     "official_fold",
@@ -419,6 +420,125 @@ def summarize_curve(
     return pd.DataFrame(rows).sort_values(group_cols).reset_index(drop=True)
 
 
+def validate_completed_task_states(metadata: Mapping[str, Any]) -> None:
+    tasks = metadata.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise ValueError("Study metadata has no task graph; refusing partial aggregation")
+    failures: List[str] = []
+    for task in tasks:
+        state_path = Path(str(task.get("state_path", "")))
+        try:
+            state = read_json(state_path)
+        except ValueError as exc:
+            failures.append(f"{task.get('task_id')}: {exc}")
+            continue
+        if state.get("status") != "complete" or state.get("returncode") != 0:
+            failures.append(
+                f"{task.get('task_id')}: status={state.get('status')!r}, "
+                f"returncode={state.get('returncode')!r}"
+            )
+    if failures:
+        raise RuntimeError(
+            "All epoch-scarcity tasks must complete successfully before aggregation: "
+            + "; ".join(failures)
+        )
+
+
+def validate_metric_grid(
+    metrics: pd.DataFrame,
+    global_metrics: pd.DataFrame,
+    metadata: Mapping[str, Any],
+) -> None:
+    experiments = metadata.get("experiments")
+    conditions = metadata.get("conditions")
+    checkpoint_grid = metadata.get("checkpoint_grid")
+    if not isinstance(experiments, list) or not experiments:
+        raise ValueError("Study metadata has no experiments")
+    if not isinstance(conditions, dict) or set(conditions) != {
+        PRIMARY_CONDITION,
+        ORACLE_CONDITION,
+    }:
+        raise ValueError(f"Unexpected condition registry: {conditions}")
+    if not isinstance(checkpoint_grid, dict):
+        raise ValueError("Study metadata has no checkpoint_grid")
+    expected = set()
+    for experiment in experiments:
+        dataset = str(experiment["dataset"]).lower()
+        fold = int(experiment["official_fold"])
+        seed = int(experiment["trajectory_seed"])
+        epochs = checkpoint_grid.get(dataset)
+        if not isinstance(epochs, list) or not epochs:
+            raise ValueError(f"Missing checkpoint grid for dataset {dataset!r}")
+        for epoch in epochs:
+            for condition in conditions:
+                for metric in CORE_METRICS:
+                    for method in EXPECTED_METHODS:
+                        expected.add(
+                            (dataset, fold, seed, int(epoch), condition, metric, method)
+                        )
+
+    key_columns = [
+        "dataset",
+        "official_fold",
+        "trajectory_seed",
+        "checkpoint_epoch_index",
+        "condition",
+        "metric",
+        "method",
+    ]
+
+    def observed_keys(frame: pd.DataFrame) -> set[tuple[Any, ...]]:
+        return {
+            (
+                str(row["dataset"]).lower(),
+                int(row["official_fold"]),
+                int(row["trajectory_seed"]),
+                int(row["checkpoint_epoch_index"]),
+                str(row["condition"]),
+                str(row["metric"]),
+                str(row["method"]),
+            )
+            for row in frame[key_columns].to_dict("records")
+        }
+
+    for label, frame in (("per-case", metrics), ("fold-global", global_metrics)):
+        observed = observed_keys(frame) if not frame.empty else set()
+        missing = sorted(expected.difference(observed))
+        extra = sorted(observed.difference(expected))
+        if missing or extra:
+            raise ValueError(
+                f"Incomplete {label} checkpoint grid: missing={missing[:10]}, "
+                f"extra={extra[:10]}, expected_keys={len(expected)}, "
+                f"observed_keys={len(observed)}"
+            )
+        for condition, condition_spec in conditions.items():
+            subset = frame[frame["condition"] == condition]
+            sources = set(subset["petri_discovery_source"].astype(str))
+            expected_source = str(condition_spec["petri_discovery_source"])
+            flags = set(subset["is_oracle_condition"].map(boolean))
+            expected_flag = bool(condition_spec["is_oracle_condition"])
+            if sources != {expected_source} or flags != {expected_flag}:
+                raise ValueError(
+                    f"{label} condition metadata mismatch for {condition}: "
+                    f"sources={sorted(sources)}, oracle_flags={sorted(flags)}"
+                )
+    case_group_cols = [
+        "dataset",
+        "official_fold",
+        "trajectory_seed",
+        "checkpoint_epoch_index",
+        "condition",
+        "metric",
+        "original_case_id",
+    ]
+    for key, group in metrics.groupby(case_group_cols, dropna=False):
+        methods = set(group["method"].astype(str))
+        if methods != set(EXPECTED_METHODS):
+            raise ValueError(
+                f"Incomplete per-case method pairing for {key}: methods={sorted(methods)}"
+            )
+
+
 def aggregate_study(
     study_dir: Path,
     *,
@@ -426,11 +546,13 @@ def aggregate_study(
 ) -> Dict[str, Path]:
     study_dir = study_dir.resolve()
     metadata = read_json(study_dir / "study_metadata.json")
+    validate_completed_task_states(metadata)
+    metrics = load_per_case(study_dir)
+    global_metrics = load_global_metrics(study_dir)
+    validate_metric_grid(metrics, global_metrics, metadata)
     output_dir = study_dir / "aggregation"
     output_dir.mkdir(parents=True, exist_ok=True)
-    metrics = load_per_case(study_dir)
     deltas = build_deltas(metrics)
-    global_metrics = load_global_metrics(study_dir)
     global_deltas = build_global_deltas(global_metrics)
     method_curve = summarize_curve(
         metrics,

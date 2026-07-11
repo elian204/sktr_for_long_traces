@@ -20,8 +20,10 @@ for path in (SCRIPT_DIR, WORKSPACE_ROOT):
 
 import epoch_scarcity_aggregation as aggregation  # noqa: E402
 import epoch_scarcity_common as common  # noqa: E402
+import epoch_scarcity_status as status  # noqa: E402
 import export_epoch_checkpoint as exporter  # noqa: E402
 import generate_epoch_scarcity_study as generator  # noqa: E402
+import import_d100_trajectory as importer  # noqa: E402
 import run_epoch_petri_bounds as bounds  # noqa: E402
 import run_epoch_scarcity_task as task_runner  # noqa: E402
 from src import incremental_softmax_recovery as recovery  # noqa: E402
@@ -69,6 +71,15 @@ class CheckpointProtocolTests(unittest.TestCase):
         self.assertEqual(set(retained["method"]), bounds.APPROVED_SCORE_METHODS)
         with self.assertRaisesRegex(ValueError, "missing"):
             bounds.retain_approved_score_methods(frame[frame["method"] != "raw_argmax"])
+
+    def test_recovery_kwargs_are_derived_from_canonical_decoder(self) -> None:
+        config = bounds.recovery_config("gtea", seed=0, workers=7, out_dir=Path("/tmp/out"))
+        bounds.validate_canonical_recovery_config(config)
+        for key in bounds.CANONICAL_RECOVERY_KEYS:
+            self.assertEqual(config[key], common.CANONICAL_DECODER[key])
+        config["candidate_top_k"] = 2
+        with self.assertRaisesRegex(ValueError, "CANONICAL_DECODER"):
+            bounds.validate_canonical_recovery_config(config)
 
 
 class GeneratorTests(unittest.TestCase):
@@ -367,10 +378,75 @@ class RecoveryContextTests(unittest.TestCase):
         pd.testing.assert_frame_equal(b_after_a, b_after_none)
 
 
+class ImportIntegrityTests(unittest.TestCase):
+    def test_completed_import_hashes_and_provenance_detect_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            experiment = root / "experiment"
+            source = root / "source"
+            source_config = source / "config.json"
+            source_complete = source / "train_complete.json"
+            write_json(source_config, {"batch_size": 4})
+            write_json(source_complete, {"completed": True, "returncode": 0})
+            write_json(
+                experiment / "experiment_metadata.json",
+                {
+                    "dataset": "gtea",
+                    "fold": 1,
+                    "trajectory_seed": 0,
+                    "source_d100_task_id": "source_d100",
+                },
+            )
+            records = []
+            for checkpoint in common.checkpoint_records(
+                "gtea", n_train_cases=21, batch_size=4
+            ):
+                epoch = checkpoint.epoch_index
+                source_model = source / f"epoch-{epoch}.model"
+                source_model.parent.mkdir(parents=True, exist_ok=True)
+                source_model.write_bytes(f"checkpoint-{epoch}".encode())
+                copied = common.checkpoint_model_path(experiment, 0, epoch)
+                copied.parent.mkdir(parents=True, exist_ok=True)
+                copied.write_bytes(source_model.read_bytes())
+                row = {
+                    **common.record_to_dict(checkpoint),
+                    "dataset": "gtea",
+                    "fold": 1,
+                    "trajectory_seed": 0,
+                    "source_checkpoint": str(source_model),
+                    "source_checkpoint_sha256": common.file_sha256(source_model),
+                    "copied_checkpoint": str(copied),
+                    "source_config": str(source_config),
+                    "source_config_sha256": common.file_sha256(source_config),
+                    "n_train_cases": 21,
+                    "batch_size": 4,
+                }
+                records.append(row)
+                write_json(common.checkpoint_metadata_path(experiment, 0, epoch), row)
+            write_json(
+                experiment / "trajectory" / "seed_0" / "import_complete.json",
+                {
+                    "completed": True,
+                    "dataset": "gtea",
+                    "fold": 1,
+                    "trajectory_seed": 0,
+                    "source_task_id": "source_d100",
+                    "source_train_complete": str(source_complete),
+                    "source_train_complete_sha256": common.file_sha256(source_complete),
+                    "checkpoint_records": records,
+                },
+            )
+            importer.validate_completed_import(experiment)
+            common.checkpoint_model_path(experiment, 0, 1000).write_bytes(b"tampered")
+            with self.assertRaisesRegex(ValueError, "copied_sha256"):
+                importer.validate_completed_import(experiment)
+
+
 class ExportIntegrityTests(unittest.TestCase):
     def test_completed_export_hashes_detect_content_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            experiment = Path(temporary) / "experiment"
+            study_dir = Path(temporary) / "study"
+            experiment = study_dir / "experiments" / "gtea" / "fold_1"
             seed = 0
             epoch = 200
             (experiment / "manifests").mkdir(parents=True)
@@ -412,6 +488,22 @@ class ExportIntegrityTests(unittest.TestCase):
                 seed=seed,
                 checkpoint_epoch=epoch,
             )
+            state_path = study_dir / "state" / "export.json"
+            write_json(state_path, {"status": "complete", "returncode": 0})
+            task = {
+                "task_id": "export",
+                "task_type": "export_checkpoint",
+                "dataset": "gtea",
+                "official_fold": 1,
+                "trajectory_seed": seed,
+                "checkpoint_epoch_index": epoch,
+                "condition": None,
+                "gpu": 0,
+                "queue": "gpu0",
+                "state_path": str(state_path),
+                "log_path": str(study_dir / "logs" / "export.log"),
+            }
+            self.assertEqual(status.task_row(task, study_dir)["effective_status"], "complete")
             np.save(output / "0.npy", np.asarray([[0.5, 0.5]], dtype=np.float32))
             with self.assertRaisesRegex(ValueError, "artifact_sha256"):
                 exporter.validate_completed_export(
@@ -419,18 +511,153 @@ class ExportIntegrityTests(unittest.TestCase):
                     seed=seed,
                     checkpoint_epoch=epoch,
                 )
+            row = status.task_row(task, study_dir)
+            self.assertEqual(row["effective_status"], "inconsistent")
+            self.assertFalse(row["artifact_complete"])
+            self.assertIn("artifact_sha256", row["artifact_detail"])
+
+
+class DecodeIntegrityTests(unittest.TestCase):
+    def test_completed_decode_grid_revalidates_every_epoch_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            experiment = (Path(temporary) / "experiment").resolve()
+            write_json(
+                experiment / "experiment_metadata.json",
+                {"dataset": "gtea", "fold": 1, "trajectory_seed": 0},
+            )
+            manifests = experiment / "manifests"
+            manifests.mkdir(parents=True)
+            (manifests / "train_pool_cases.txt").write_text("train_a\n", encoding="utf-8")
+            (manifests / "test_cases.txt").write_text("test_a\n", encoding="utf-8")
+            for epoch in common.dataset_spec("gtea")["checkpoint_epochs"]:
+                out_dir = bounds.output_dir_for(
+                    experiment,
+                    common.PRIMARY_CONDITION,
+                    0,
+                    epoch,
+                )
+                out_dir.mkdir(parents=True, exist_ok=True)
+                for name in ("results.csv", "runtime.csv", "per_case_runtime.csv"):
+                    (out_dir / name).write_text("placeholder\n", encoding="utf-8")
+                write_json(out_dir / "accuracy_dict.json", {})
+                rows = [
+                    {
+                        "method": method,
+                        "checkpoint_epoch_index": epoch,
+                        "condition": common.PRIMARY_CONDITION,
+                        "petri_discovery_source": common.DISCOVERY_FULL_TRAIN,
+                        "oracle_upper_bound": False,
+                        "is_oracle_condition": False,
+                    }
+                    for method in sorted(bounds.APPROVED_SCORE_METHODS)
+                ]
+                pd.DataFrame(rows).to_csv(out_dir / "metrics.csv", index=False)
+                pd.DataFrame(rows).to_csv(out_dir / "per_case_metrics.csv", index=False)
+                config = bounds.recovery_config("gtea", 0, 7, out_dir)
+                write_json(
+                    out_dir / "postprocess_config.json",
+                    {
+                        "condition": common.PRIMARY_CONDITION,
+                        "petri_discovery_source": common.DISCOVERY_FULL_TRAIN,
+                        "oracle_upper_bound": False,
+                        "petri_discovery_uses_test_gt": False,
+                        "is_oracle_condition": False,
+                        "checkpoint": {"epoch_index": epoch},
+                        "canonical_decoder": common.CANONICAL_DECODER,
+                        "recovery_config": bounds.serializable_config(config),
+                        "context_reused_across_checkpoint_grid": True,
+                    },
+                )
+            marker = (
+                experiment
+                / "petri"
+                / common.PRIMARY_CONDITION
+                / "seed_0"
+                / "decode_grid_complete.json"
+            )
+            write_json(
+                marker,
+                {
+                    "completed": True,
+                    "condition": common.PRIMARY_CONDITION,
+                    "petri_discovery_source": common.DISCOVERY_FULL_TRAIN,
+                    "is_oracle_condition": False,
+                    "checkpoint_epoch_indices": list(
+                        common.dataset_spec("gtea")["checkpoint_epochs"]
+                    ),
+                    "petri_context_discovery_count_this_invocation": 1,
+                    "petri_discovery_manifest": str(manifests / "train_pool_cases.txt"),
+                    "petri_discovery_manifest_sha256": common.file_sha256(
+                        manifests / "train_pool_cases.txt"
+                    ),
+                },
+            )
+            with mock.patch.object(bounds, "validate_completed_export", return_value={}):
+                bounds.validate_completed_decode_grid(
+                    experiment,
+                    seed=0,
+                    condition=common.PRIMARY_CONDITION,
+                    discovery_source=common.DISCOVERY_FULL_TRAIN,
+                )
+                tampered_dir = bounds.output_dir_for(
+                    experiment, common.PRIMARY_CONDITION, 0, 200
+                )
+                tampered = json.loads((tampered_dir / "postprocess_config.json").read_text())
+                tampered["recovery_config"]["candidate_top_k"] = 2
+                write_json(tampered_dir / "postprocess_config.json", tampered)
+                with self.assertRaisesRegex(ValueError, "recovery_config"):
+                    bounds.validate_completed_decode_grid(
+                        experiment,
+                        seed=0,
+                        condition=common.PRIMARY_CONDITION,
+                        discovery_source=common.DISCOVERY_FULL_TRAIN,
+                    )
 
 
 class AggregationTests(unittest.TestCase):
+    def test_aggregation_refuses_incomplete_task_states(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "task.json"
+            write_json(state_path, {"status": "running", "returncode": None})
+            with self.assertRaisesRegex(RuntimeError, "must complete successfully"):
+                aggregation.validate_completed_task_states(
+                    {"tasks": [{"task_id": "task", "state_path": str(state_path)}]}
+                )
+
     def test_primary_and_oracle_epoch_curves_are_separate(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             study_dir = Path(temporary) / "study"
+            tasks = []
+            experiments = []
+            for fold in (1, 2):
+                experiments.append(
+                    {
+                        "dataset": "gtea",
+                        "official_fold": fold,
+                        "trajectory_seed": 0,
+                    }
+                )
+                state_path = study_dir / "state" / f"fold_{fold}.json"
+                write_json(state_path, {"status": "complete", "returncode": 0})
+                tasks.append({"task_id": f"fold_{fold}", "state_path": str(state_path)})
             write_json(
                 study_dir / "study_metadata.json",
                 {
                     "study_id": "epoch_test",
                     "study_type": common.STUDY_TYPE,
                     "checkpoint_grid": {"gtea": [200, 1000]},
+                    "experiments": experiments,
+                    "conditions": {
+                        common.PRIMARY_CONDITION: {
+                            "petri_discovery_source": common.DISCOVERY_FULL_TRAIN,
+                            "is_oracle_condition": False,
+                        },
+                        common.ORACLE_CONDITION: {
+                            "petri_discovery_source": common.DISCOVERY_OFFICIAL_TEST,
+                            "is_oracle_condition": True,
+                        },
+                    },
+                    "tasks": tasks,
                 },
             )
             for fold in (1, 2):
@@ -442,31 +669,32 @@ class AggregationTests(unittest.TestCase):
                         rows = []
                         for case in ("case_a", "case_b"):
                             base = 60.0 + fold + epoch / 10000.0
-                            shared = {
-                                "dataset": "gtea",
-                                "official_fold": fold,
-                                "trajectory_seed": 0,
-                                "checkpoint_epoch_index": epoch,
-                                "completed_epochs": epoch + 1,
-                                "schedule_fraction_pct": epoch / 100.0,
-                                "training_item_presentations": (epoch + 1) * 21,
-                                "trainer_step": 1 + (epoch + 1) * 21,
-                                "optimizer_updates": ((epoch + 1) * 21) // 3,
-                                "condition": condition,
-                                "petri_discovery_source": source,
-                                "is_oracle_condition": oracle,
-                                "split": "test",
-                                "original_case_id": case,
-                                "n_frames": 100,
-                                "metric_name": "f1@25",
-                            }
-                            rows.extend(
-                                [
-                                    {**shared, "method": "raw_argmax", "metric_value": base - 2.0},
-                                    {**shared, "method": "official_diffact", "metric_value": base},
-                                    {**shared, "method": "petri_conformance", "metric_value": base + bonus},
-                                ]
-                            )
+                            for metric in aggregation.CORE_METRICS:
+                                shared = {
+                                    "dataset": "gtea",
+                                    "official_fold": fold,
+                                    "trajectory_seed": 0,
+                                    "checkpoint_epoch_index": epoch,
+                                    "completed_epochs": epoch + 1,
+                                    "schedule_fraction_pct": epoch / 100.0,
+                                    "training_item_presentations": (epoch + 1) * 21,
+                                    "trainer_step": 1 + (epoch + 1) * 21,
+                                    "optimizer_updates": ((epoch + 1) * 21) // 3,
+                                    "condition": condition,
+                                    "petri_discovery_source": source,
+                                    "is_oracle_condition": oracle,
+                                    "split": "test",
+                                    "original_case_id": case,
+                                    "n_frames": 100,
+                                    "metric_name": metric,
+                                }
+                                rows.extend(
+                                    [
+                                        {**shared, "method": "raw_argmax", "metric_value": base - 2.0},
+                                        {**shared, "method": "official_diffact", "metric_value": base},
+                                        {**shared, "method": "petri_conformance", "metric_value": base + bonus},
+                                    ]
+                                )
                         output = (
                             study_dir
                             / "experiments"
@@ -481,42 +709,43 @@ class AggregationTests(unittest.TestCase):
                         pd.DataFrame(rows).to_csv(output, index=False)
                         global_rows = []
                         global_base = 55.0 + fold + epoch / 10000.0
-                        global_shared = {
-                            "dataset": "gtea",
-                            "official_fold": fold,
-                            "trajectory_seed": 0,
-                            "checkpoint_epoch_index": epoch,
-                            "completed_epochs": epoch + 1,
-                            "schedule_fraction_pct": epoch / 100.0,
-                            "training_item_presentations": (epoch + 1) * 21,
-                            "trainer_step": 1 + (epoch + 1) * 21,
-                            "optimizer_updates": ((epoch + 1) * 21) // 3,
-                            "condition": condition,
-                            "petri_discovery_source": source,
-                            "is_oracle_condition": oracle,
-                            "split": "test",
-                            "n_cases": 2,
-                            "metric_name": "f1@25",
-                        }
-                        global_rows.extend(
-                            [
-                                {
-                                    **global_shared,
-                                    "method": "raw_argmax",
-                                    "metric_value": global_base - 2.0,
-                                },
-                                {
-                                    **global_shared,
-                                    "method": "official_diffact",
-                                    "metric_value": global_base,
-                                },
-                                {
-                                    **global_shared,
-                                    "method": "petri_conformance",
-                                    "metric_value": global_base + bonus,
-                                },
-                            ]
-                        )
+                        for metric in aggregation.CORE_METRICS:
+                            global_shared = {
+                                "dataset": "gtea",
+                                "official_fold": fold,
+                                "trajectory_seed": 0,
+                                "checkpoint_epoch_index": epoch,
+                                "completed_epochs": epoch + 1,
+                                "schedule_fraction_pct": epoch / 100.0,
+                                "training_item_presentations": (epoch + 1) * 21,
+                                "trainer_step": 1 + (epoch + 1) * 21,
+                                "optimizer_updates": ((epoch + 1) * 21) // 3,
+                                "condition": condition,
+                                "petri_discovery_source": source,
+                                "is_oracle_condition": oracle,
+                                "split": "test",
+                                "n_cases": 2,
+                                "metric_name": metric,
+                            }
+                            global_rows.extend(
+                                [
+                                    {
+                                        **global_shared,
+                                        "method": "raw_argmax",
+                                        "metric_value": global_base - 2.0,
+                                    },
+                                    {
+                                        **global_shared,
+                                        "method": "official_diffact",
+                                        "metric_value": global_base,
+                                    },
+                                    {
+                                        **global_shared,
+                                        "method": "petri_conformance",
+                                        "metric_value": global_base + bonus,
+                                    },
+                                ]
+                            )
                         pd.DataFrame(global_rows).to_csv(output.parent / "metrics.csv", index=False)
 
             paths = aggregation.aggregate_study(study_dir, n_bootstrap=20)
@@ -526,6 +755,15 @@ class AggregationTests(unittest.TestCase):
             global_primary = pd.read_csv(paths["fold_global_primary_curve"])
             global_oracle = pd.read_csv(paths["fold_global_oracle_curve"])
             global_deltas = pd.read_csv(paths["fold_global_deltas"])
+            victim = next(
+                study_dir.glob(
+                    "experiments/gtea/fold_1/petri/official_full_train_petri/"
+                    "epoch_200/per_case_metrics.csv"
+                )
+            )
+            victim.unlink()
+            with self.assertRaisesRegex(ValueError, "Incomplete per-case checkpoint grid"):
+                aggregation.aggregate_study(study_dir, n_bootstrap=0)
 
         self.assertEqual(set(primary["checkpoint_epoch_index"]), {200, 1000})
         self.assertEqual(set(primary["condition"]), {common.PRIMARY_CONDITION})

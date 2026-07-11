@@ -39,6 +39,119 @@ def copy_verified(source: Path, destination: Path, expected_sha256: str) -> None
     temporary.replace(destination)
 
 
+def validate_completed_import(experiment_dir: Path) -> Dict[str, Any]:
+    """Revalidate an imported trajectory and every copied checkpoint."""
+
+    experiment_dir = experiment_dir.resolve()
+    metadata = read_json(experiment_dir / "experiment_metadata.json")
+    dataset = str(metadata["dataset"])
+    fold = int(metadata["fold"])
+    seed = int(metadata["trajectory_seed"])
+    spec = dataset_spec(dataset)
+    trajectory_dir = experiment_dir / "trajectory" / f"seed_{seed}"
+    complete_path = trajectory_dir / "import_complete.json"
+    complete = read_json(complete_path)
+    expected_epochs = list(map(int, spec["checkpoint_epochs"]))
+    records = complete.get("checkpoint_records")
+    mismatches: Dict[str, Any] = {}
+    expected_header = {
+        "completed": True,
+        "dataset": dataset,
+        "fold": fold,
+        "trajectory_seed": seed,
+        "source_task_id": metadata["source_d100_task_id"],
+    }
+    for key, expected in expected_header.items():
+        if complete.get(key) != expected:
+            mismatches[key] = {"expected": expected, "actual": complete.get(key)}
+    if not isinstance(records, list):
+        mismatches["checkpoint_records"] = "missing or not a list"
+        records = []
+    observed_epochs = [int(record.get("epoch_index", -1)) for record in records]
+    if observed_epochs != expected_epochs:
+        mismatches["checkpoint_epoch_indices"] = {
+            "expected": expected_epochs,
+            "actual": observed_epochs,
+        }
+    calculated_records: Dict[int, Dict[str, Any]] = {}
+    if records:
+        try:
+            n_train_cases = int(records[0]["n_train_cases"])
+            batch_size = int(records[0]["batch_size"])
+            calculated_records = {
+                record.epoch_index: record_to_dict(record)
+                for record in checkpoint_records(
+                    dataset,
+                    n_train_cases=n_train_cases,
+                    batch_size=batch_size,
+                )
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            mismatches["checkpoint_provenance"] = str(exc)
+    source_complete = Path(str(complete.get("source_train_complete", "")))
+    if not source_complete.is_file():
+        mismatches["source_train_complete"] = f"missing: {source_complete}"
+    elif file_sha256(source_complete) != complete.get("source_train_complete_sha256"):
+        mismatches["source_train_complete_sha256"] = "content hash changed"
+    for record in records:
+        epoch = int(record.get("epoch_index", -1))
+        if epoch not in expected_epochs:
+            continue
+        calculated = calculated_records.get(epoch, {})
+        for key, expected_value in calculated.items():
+            if record.get(key) != expected_value:
+                mismatches[f"epoch_{epoch}_{key}"] = {
+                    "expected": expected_value,
+                    "actual": record.get(key),
+                }
+        for key, expected_value in {
+            "dataset": dataset,
+            "fold": fold,
+            "trajectory_seed": seed,
+        }.items():
+            if record.get(key) != expected_value:
+                mismatches[f"epoch_{epoch}_{key}"] = {
+                    "expected": expected_value,
+                    "actual": record.get(key),
+                }
+        copied = checkpoint_model_path(experiment_dir, seed, epoch)
+        recorded_copied = Path(str(record.get("copied_checkpoint", "")))
+        expected_sha = str(record.get("source_checkpoint_sha256", ""))
+        if recorded_copied.resolve() != copied.resolve():
+            mismatches[f"epoch_{epoch}_copied_checkpoint"] = {
+                "expected": str(copied),
+                "actual": str(recorded_copied),
+            }
+        if not copied.is_file():
+            mismatches[f"epoch_{epoch}_copied_checkpoint"] = f"missing: {copied}"
+        elif file_sha256(copied) != expected_sha:
+            mismatches[f"epoch_{epoch}_copied_sha256"] = "content hash changed"
+        source = Path(str(record.get("source_checkpoint", "")))
+        if not source.is_file():
+            mismatches[f"epoch_{epoch}_source_checkpoint"] = f"missing: {source}"
+        elif file_sha256(source) != expected_sha:
+            mismatches[f"epoch_{epoch}_source_sha256"] = "content hash changed"
+        source_config = Path(str(record.get("source_config", "")))
+        if not source_config.is_file():
+            mismatches[f"epoch_{epoch}_source_config"] = f"missing: {source_config}"
+        elif file_sha256(source_config) != record.get("source_config_sha256"):
+            mismatches[f"epoch_{epoch}_source_config_sha256"] = "content hash changed"
+        checkpoint_metadata = checkpoint_metadata_path(experiment_dir, seed, epoch)
+        try:
+            recorded_metadata = read_json(checkpoint_metadata)
+        except ValueError as exc:
+            mismatches[f"epoch_{epoch}_checkpoint_metadata"] = str(exc)
+        else:
+            if recorded_metadata != record:
+                mismatches[f"epoch_{epoch}_checkpoint_metadata"] = "record mismatch"
+    if mismatches:
+        raise ValueError(
+            f"Completed trajectory import failed immutable validation: {complete_path}: "
+            f"{mismatches}"
+        )
+    return complete
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--experiment-dir", type=Path, required=True)

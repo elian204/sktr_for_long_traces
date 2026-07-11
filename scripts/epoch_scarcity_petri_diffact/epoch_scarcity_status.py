@@ -12,7 +12,14 @@ from typing import Any, Dict
 
 import pandas as pd
 
-from epoch_scarcity_common import read_json, softmax_dir
+from epoch_scarcity_common import (
+    DISCOVERY_BY_CONDITION,
+    read_json,
+    softmax_dir,
+)
+from export_epoch_checkpoint import validate_completed_export
+from import_d100_trajectory import validate_completed_import
+from run_epoch_petri_bounds import validate_completed_decode_grid
 
 
 def completion_artifact(task: Dict[str, Any], study_dir: Path) -> Path:
@@ -43,14 +50,43 @@ def completion_artifact(task: Dict[str, Any], study_dir: Path) -> Path:
     raise ValueError(f"Unknown task type: {task_type!r}")
 
 
-def artifact_complete(path: Path) -> bool:
-    if not path.is_file():
-        return False
+def validate_task_artifact(
+    task: Dict[str, Any],
+    study_dir: Path,
+) -> tuple[bool, str]:
+    artifact_path = completion_artifact(task, study_dir)
+    if not artifact_path.is_file():
+        return False, f"missing completion artifact: {artifact_path}"
+    experiment_dir = (
+        study_dir
+        / "experiments"
+        / str(task["dataset"])
+        / f"fold_{int(task['official_fold'])}"
+    )
+    seed = int(task["trajectory_seed"])
+    task_type = str(task["task_type"])
     try:
-        payload = read_json(path)
-    except ValueError:
-        return False
-    return bool(payload.get("completed", False))
+        if task_type == "import_trajectory":
+            validate_completed_import(experiment_dir)
+        elif task_type == "export_checkpoint":
+            validate_completed_export(
+                experiment_dir,
+                seed=seed,
+                checkpoint_epoch=int(task["checkpoint_epoch_index"]),
+            )
+        elif task_type == "decode_checkpoint_grid":
+            condition = str(task["condition"])
+            validate_completed_decode_grid(
+                experiment_dir,
+                seed=seed,
+                condition=condition,
+                discovery_source=DISCOVERY_BY_CONDITION[condition],
+            )
+        else:
+            raise ValueError(f"Unknown task type: {task_type!r}")
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        return False, str(exc)
+    return True, "validated completion artifact and immutable contents"
 
 
 def task_row(task: Dict[str, Any], study_dir: Path) -> Dict[str, Any]:
@@ -62,7 +98,7 @@ def task_row(task: Dict[str, Any], study_dir: Path) -> Dict[str, Any]:
         except ValueError:
             state = {"status": "invalid_state"}
     artifact_path = completion_artifact(task, study_dir)
-    artifact_ok = artifact_complete(artifact_path)
+    artifact_ok, artifact_detail = validate_task_artifact(task, study_dir)
     state_status = str(state.get("status", "pending"))
     returncode = state.get("returncode")
     if state_status == "complete" and returncode == 0 and artifact_ok:
@@ -92,6 +128,7 @@ def task_row(task: Dict[str, Any], study_dir: Path) -> Dict[str, Any]:
         "returncode": returncode,
         "heartbeat_timestamp": state.get("heartbeat_timestamp"),
         "artifact_complete": artifact_ok,
+        "artifact_detail": artifact_detail,
         "artifact_path": str(artifact_path),
         "state_path": str(state_path),
         "log_path": task["log_path"],
