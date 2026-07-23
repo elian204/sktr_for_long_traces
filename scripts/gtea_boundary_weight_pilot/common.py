@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared contracts for the immutable GTEA boundary-weight pilot."""
+"""Shared contracts for the immutable GTEA boundary-weight replication."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ DEFAULT_DIFFACT_ROOT = Path(
     "/home/dsi/eli-bogdanov/sktr_for_long_traces/baselines/DiffAct"
 )
 DEFAULT_STUDY_DIR = Path(
+    "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_v2"
+)
+DEFAULT_V1_STUDY_DIR = Path(
     "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1"
 )
 DEFAULT_LOCKED_REFERENCE_CONFIG = Path(
@@ -43,13 +46,16 @@ DEFAULT_LOCKED_REFERENCE_TRAIN_BUNDLE = Path(
     "splits/train.split1.bundle"
 )
 
-PROTOCOL_VERSION = "gtea-boundary-weight-pilot-v1"
+PROTOCOL_VERSION = "gtea-boundary-weight-replication-v2"
 DATASET = "gtea"
 FOLD = 1
-TRAINING_SEED = 0
+TRAINING_SEEDS = (0, 1)
 PHYSICAL_GPU = 3
-BOUNDARY_WEIGHTS = (0.1, 0.3, 0.5, 1.0)
-PRIMARY_BOUNDARY_WEIGHT = 0.5
+BOUNDARY_WEIGHTS = (0.1, 0.75, 1.0, 1.5)
+IMPORTED_CURVE_WEIGHTS = (0.5,)
+PRIMARY_BOUNDARY_WEIGHT = 1.0
+BASELINE_BOUNDARY_WEIGHT = 0.1
+V1_IMPORTED_KEYS = ((0, 0.1), (0, 0.5), (0, 1.0))
 CHECKPOINT_EPOCHS = (200, 1000, 2000, 5000, 10000)
 INFERENCE_SEEDS = (0, 1, 2)
 INFERENCE_SEED_STRIDE = 1_000_000
@@ -57,8 +63,6 @@ FINAL_EPOCH = 10000
 EXPECTED_NUM_EPOCHS = FINAL_EPOCH + 1
 EXPECTED_TRAIN_CASES = 21
 EXPECTED_TEST_CASES = 7
-RECONCILIATION_METRIC_TOLERANCE = 0.5
-RECONCILIATION_FRAME_DISAGREEMENT_TOLERANCE = 0.01
 BOUNDARY_MATCH_MAX_DISTANCE = 50
 SHORT_SEGMENT_MAX_LENGTH = 3
 
@@ -70,7 +74,6 @@ PROVENANCE_FILES = (
     "scripts/gtea_boundary_weight_pilot/prepare_study.py",
     "scripts/gtea_boundary_weight_pilot/export_seeded_softmax.py",
     "scripts/gtea_boundary_weight_pilot/run_variant.py",
-    "scripts/gtea_boundary_weight_pilot/reconcile_baseline.py",
     "scripts/gtea_boundary_weight_pilot/study_status.py",
     "scripts/gtea_boundary_weight_pilot/analyze.py",
     "src/evaluation.py",
@@ -283,12 +286,12 @@ def boundary_weight_slug(weight: float) -> str:
     return str(weight).replace(".", "p")
 
 
-def variant_id(weight: float, training_seed: int = TRAINING_SEED) -> str:
+def variant_id(weight: float, training_seed: int) -> str:
     return f"gtea_fold{FOLD}_trainseed{training_seed}_boundary{boundary_weight_slug(weight)}"
 
 
 def training_invariant_payload(config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Fields that must remain identical across the four training variants."""
+    """Fields fixed across weights and training seeds in replication v2."""
     keys = (
         "dataset_name",
         "batch_size",
@@ -306,7 +309,6 @@ def training_invariant_payload(config: Mapping[str, Any]) -> Dict[str, Any]:
         "soft_label",
         "temporal_aug",
         "weight_decay",
-        "random_seed",
         "evaluate_during_training",
         "log_train_results",
     )
@@ -329,7 +331,7 @@ def build_variant_config(
     train_manifest: Path,
     test_manifest: Path,
     weight: float,
-    training_seed: int = TRAINING_SEED,
+    training_seed: int,
 ) -> Dict[str, Any]:
     config = deepcopy(dict(reference))
     task_id = variant_id(weight, training_seed)
@@ -352,6 +354,7 @@ def build_variant_config(
     config["checkpoint_selection"] = "pre_specified_final_epoch_no_test_selection"
     config["gtea_boundary_weight_protocol_version"] = PROTOCOL_VERSION
     config["gtea_boundary_weight_variant"] = float(weight)
+    config["gtea_boundary_weight_training_seed"] = int(training_seed)
     config["loss_weights"] = deepcopy(config["loss_weights"])
     config["loss_weights"]["decoder_boundary_loss"] = float(weight)
     return config
@@ -373,6 +376,7 @@ def assert_variant_config(
         "num_epochs": EXPECTED_NUM_EPOCHS,
         "log_freq": 100,
         "random_seed": int(task["training_seed"]),
+        "initialization_seed": int(task["training_seed"]),
         "evaluate_during_training": False,
         "log_train_results": False,
     }
@@ -398,6 +402,18 @@ def assert_variant_config(
             "expected": 0.0,
             "actual": config["loss_weights"].get("encoder_boundary_loss"),
         }
+    if config.get("gtea_boundary_weight_protocol_version") != PROTOCOL_VERSION:
+        mismatches["gtea_boundary_weight_protocol_version"] = {
+            "expected": PROTOCOL_VERSION,
+            "actual": config.get("gtea_boundary_weight_protocol_version"),
+        }
+    if int(config.get("gtea_boundary_weight_training_seed", -1)) != int(
+        task["training_seed"]
+    ):
+        mismatches["gtea_boundary_weight_training_seed"] = {
+            "expected": int(task["training_seed"]),
+            "actual": config.get("gtea_boundary_weight_training_seed"),
+        }
     if mismatches:
         raise ValueError(f"Variant changed a frozen training field: {mismatches}")
     digest = training_invariant_digest(config)
@@ -416,12 +432,14 @@ def load_task(study_dir: Path, task_id: str) -> Dict[str, Any]:
 
 
 def checkpoint_path(task: Mapping[str, Any], epoch: int) -> Path:
-    return Path(task["model_dir"]) / f"epoch-{int(epoch)}.model"
+    model_dir = task.get("artifact_model_dir", task["model_dir"])
+    return Path(model_dir) / f"epoch-{int(epoch)}.model"
 
 
 def export_dir(task: Mapping[str, Any], epoch: int, inference_seed: int) -> Path:
+    run_dir = task.get("artifact_run_dir", task["run_dir"])
     return (
-        Path(task["run_dir"])
+        Path(run_dir)
         / "exports"
         / f"epoch_{int(epoch):05d}"
         / f"sampling_seed_{int(inference_seed)}"

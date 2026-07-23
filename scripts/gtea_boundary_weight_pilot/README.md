@@ -1,109 +1,85 @@
-# GTEA decoder-boundary-loss pilot
+# GTEA boundary-weight replication v2
 
-This pilot asks whether DiffAct's dominant GTEA boundary mistiming can be
-reduced by strengthening its existing derived decoder-boundary loss. It is a
-base-model intervention, not a Petri postprocessor.
+This immutable follow-up asks whether the exploratory `decoder_boundary_loss=1.0`
+improvement from v1 survives a second training seed and where the local
+dose-response peaks.
 
-## Locked first-wave design
+## Locked design
 
-- Dataset: GTEA official fold 1 (21 train videos, 7 untouched test videos).
-- Training seed: 0.
-- Fresh trajectories for `decoder_boundary_loss` in `{0.1, 0.3, 0.5, 1.0}`.
-- `0.5` is the pre-registered primary treatment; the other non-baseline weights
-  are exploratory.
-- The four trajectories differ in exactly that loss weight. In particular,
-  `boundary_smooth=1`, `soft_label=1.4`, `cond_types`, purge-3 postprocessing,
-  epochs, checkpoint cadence, learning rate, and all architecture fields remain
-  fixed.
-- Checkpoint readouts: epochs 200, 1000, 2000, 5000, and 10000.
-- Diffusion inference seeds: 0, 1, and 2 at every checkpoint. Seed 0 preserves
-  the historical exporter contract (`video_seed = video_index`); seeds 1 and 2
-  use `video_seed = inference_seed * 1_000_000 + video_index`.
-- Physical GPU 3 only. The generated launcher exits if GPU 3 is occupied and
-  never falls back to GPUs 0--2.
-- Training-video order is copied from the locked low-data `frac_100` manifest,
-  not from the differently ordered official split file. The generated manifest
-  and the actual DiffAct train bundle are byte-checked against their locked
-  counterparts before study creation succeeds.
+- Dataset: GTEA official fold 1.
+- Training seeds: 0 and 1.
+- Primary grid: `decoder_boundary_loss ∈ {0.1, 0.75, 1.0, 1.5}`.
+- Seed-0 weights 0.1 and 1.0 are imported from v1, not retrained.
+- Seed-0 weight 0.5 is also imported as an exploratory curve reference; it is
+  outside the v2 primary grid and has no seed-1 counterpart.
+- Net new training trajectories: six.
+- Checkpoints: epochs 200, 1000, 2000, 5000, and 10000.
+- Diffusion inference seeds: 0, 1, and 2 at every checkpoint.
+- Both raw pre-purge argmax and official purge-3 predictions are evaluated.
+- Physical GPU 3 only, sequentially, with no automatic fallback.
 
-The official test set is never used for checkpoint or hyperparameter selection.
-The `0.5` primary value is fixed before launch. The seven-video fold-1 result is
-a pilot, not a final multi-fold claim.
+The generated train manifest and actual DiffAct train bundle must be
+byte-identical to the locked D100 inputs. The required bundle SHA-256 is
+`fe02e8f838bf30f2a050d67b8986ecc88fa07c18e9f87d39b3733c459a6bfa03`.
+All imported checkpoints and all exported inference artifacts are hashed into
+per-task `import_complete.json` manifests and revalidated before analysis.
 
-## Baseline reproduction gate
+## Why there is no reproduction gate
 
-The `0.1` baseline is retrained inside this harness. Before any treatment is
-started, its epoch-10000, inference-seed-0 export is compared with the locked
-D100/E10000 export from the epoch-scarcity study. Both pre-purge argmax and
-official purge-3 streams must satisfy:
+V1's `protocol_amendment_1.json` records a back-to-back determinism probe:
+nominally identical 201-epoch trainings produced different checkpoint hashes.
+The v1 locked-versus-retrained gate therefore measured benign run-to-run
+numeric variation rather than a protocol mismatch. V2 does not pretend that
+training is bitwise reproducible.
 
-- absolute difference no greater than 0.5 points for Accuracy, Edit, and
-  F1@10/25/50; and
-- frame-prediction disagreement no greater than 1%.
+Instead, V2 reports seed-0 versus seed-1 metric deltas and prediction-frame
+disagreement for every primary-grid weight, checkpoint, inference seed, and
+prediction stream. This is the per-weight noise floor and the replication
+readout.
 
-The serial queue uses `set -e`: a failed reconciliation stops before 0.3, 0.5,
-or 1.0 is trained. This tolerance is a comparability guard, not a statistical
-equivalence claim.
+## Pre-registered primary
 
-Failure diagnosis starts by comparing epoch-200 checkpoints: early divergence
-points to a data/order/config pipeline mismatch, whereas agreement at epoch 200
-followed by later divergence points more strongly to accumulated numeric drift.
+The primary comparison is weight 1.0 versus the paired 0.1 baseline at epoch
+10000, post-purge, averaged over both training seeds and all three inference
+seeds. It passes only if all six checks pass:
 
-## Readouts
+- Accuracy delta is non-negative.
+- Edit delta is positive.
+- F1@25 delta is positive.
+- Class-agnostic boundary F1 at ±10 frames improves.
+- Segment-count-ratio delta is no greater than +0.02.
+- Class-agnostic mean absolute boundary offset decreases.
 
-For both raw pre-purge argmax and official purge-3 predictions:
+V1 used median absolute boundary offset. That statistic tied at exactly zero
+and was therefore decision-degenerate. Before any v2 launch, the rule is
+deliberately replaced by mean absolute offset, which remains sensitive to
+distributed timing improvements.
 
-- Accuracy, Edit, and F1@10/25/50;
-- class-agnostic and transition-aware boundary F1 at +/-5 and +/-10 frames;
-- signed and absolute boundary offsets under one-to-one matching within 50
-  frames;
-- non-background predicted/GT segment-count ratio;
-- false predicted segments of length at most 3 frames;
-- frame-level fixed/broke ledger against the in-harness 0.1 trajectory; and
-- mean, standard deviation, minimum, and maximum over inference seeds.
+Weights 0.75 and 1.5 are exploratory. If the primary passes, the next ladder
+step is a class-specific Gaussian onset head. If it fails, the config-only rung
+closes and the onset-head decision uses the combined evidence rather than
+advancing automatically.
 
-The primary decision is made at epoch 10000 on the official purge-3 stream,
-using the mean over inference seeds. The ladder advances to a class-specific
-onset head only if weight 0.5, relative to 0.1:
+## Operations and immutability
 
-1. improves class-agnostic boundary F1@10;
-2. improves both Edit and F1@25;
-3. has non-negative Accuracy delta;
-4. does not increase segment-count ratio by more than 0.02; and
-5. reduces median absolute class-agnostic boundary offset.
+`prepare_study.py` creates a reviewable study but launches nothing. It:
 
-Failure does not prove all onset modeling is futile, but it argues against
-scaling simple loss reweighting. A second training seed on `{0.1, 0.5}` would be
-a separately generated immutable follow-up after this gate, not an unrecorded
-extension of the first-wave directory.
+1. validates the D100 bundle order and v1 protocol amendment;
+2. writes all configs and tasks;
+3. records and verifies imported v1 artifact hashes;
+4. creates `logs/` before generating the launcher;
+5. writes a serial fail-closed GPU-3 queue and detached-tmux launcher.
 
-## Prepare, review, and launch
+Production must be generated from a clean, committed branch. The launcher
+checks that GPU 3 has no compute process, creates `logs/` defensively, and
+refuses to fall back to another GPU.
 
-Preparation writes an immutable study but starts no jobs:
+Typical review generation:
 
 ```bash
 python scripts/gtea_boundary_weight_pilot/prepare_study.py \
-  --study-dir /data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1
+  --study-dir /tmp/gtea_boundary_weight_replication_v2_review
 ```
 
-Review `study_metadata.json`, `tasks.json`, and all four generated configs before
-launch. Then, while GPU 3 is free:
-
-```bash
-/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1/launch_tmux.sh
-/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1/status.sh
-```
-
-The single detached tmux queue trains the baseline, executes the reproduction
-gate, and only then runs the three treatments sequentially. Training resumes
-from each trajectory's own `latest.pt`; completed exports are hash-validated
-before they can be skipped.
-
-After all tasks complete:
-
-```bash
-/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1/analyze.sh
-```
-
-Generated study metadata are immutable. Source, config, manifest, or protocol
-changes require a new versioned study directory.
+Nothing should be launched until the generated configs, import hashes, bundle
+identity, primary rule, and queue have been independently reviewed.

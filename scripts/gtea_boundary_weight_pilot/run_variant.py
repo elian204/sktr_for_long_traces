@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 from common import (
+    canonical_digest,
     FINAL_EPOCH,
     PHYSICAL_GPU,
     SCRIPT_DIR,
@@ -119,6 +120,43 @@ def load_json_from_text(text: str) -> Dict[str, Any]:
 def validate_completed_task(
     task: Mapping[str, Any], metadata: Mapping[str, Any]
 ) -> Dict[str, Any] | None:
+    if task.get("execution_mode") == "imported":
+        import_path = Path(task["import_manifest_path"])
+        if not import_path.is_file():
+            raise FileNotFoundError(import_path)
+        imported = load_json(import_path)
+        expected_cases = read_bundle(Path(task["test_manifest"]))
+        checkpoint_hashes: Dict[str, str] = {}
+        exports: List[Dict[str, Any]] = []
+        for epoch in task["checkpoint_epochs"]:
+            checkpoint = checkpoint_path(task, int(epoch))
+            if not checkpoint.is_file() or checkpoint.stat().st_size <= 0:
+                raise FileNotFoundError(checkpoint)
+            checkpoint_hashes[str(epoch)] = file_sha256(checkpoint)
+            for inference_seed in task["inference_seeds"]:
+                output_dir = export_dir(task, int(epoch), int(inference_seed))
+                summary = verify_export(output_dir, expected_cases)
+                exports.append(
+                    {
+                        "checkpoint_epoch": int(epoch),
+                        "inference_seed": int(inference_seed),
+                        "output_dir": str(output_dir),
+                        "export_complete_sha256": file_sha256(
+                            output_dir / "export_complete.json"
+                        ),
+                        "artifact_digest": canonical_digest(
+                            summary["artifact_sha256"]
+                        ),
+                        "case_count": summary["case_count"],
+                        "frame_count": summary["frame_count"],
+                    }
+                )
+        if imported.get("checkpoint_sha256") != checkpoint_hashes:
+            raise ValueError(f"Imported checkpoint hashes changed: {task['task_id']}")
+        if imported.get("exports") != exports:
+            raise ValueError(f"Imported export hashes changed: {task['task_id']}")
+        return imported
+
     complete_path = Path(task["run_dir"]) / "task_complete.json"
     if not complete_path.is_file():
         return None
@@ -148,6 +186,12 @@ def run_task(study_dir: Path, task_id: str) -> None:
     diffact_root = Path(metadata["diffact_root"])
     verify_source_digest(metadata, diffact_root)
     task = load_task(study_dir, task_id)
+    if task.get("execution_mode") != "train":
+        validated = validate_completed_task(task, metadata)
+        if validated is None:
+            raise RuntimeError(f"Imported task did not validate: {task_id}")
+        print(f"IMPORTED {task_id}: all v1 hashes verified", flush=True)
+        return
     if int(task["physical_gpu"]) != PHYSICAL_GPU:
         raise ValueError(f"Task is not pinned to physical GPU {PHYSICAL_GPU}")
     config = load_json(Path(task["config_path"]))
@@ -343,4 +387,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

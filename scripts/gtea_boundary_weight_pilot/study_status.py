@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report checkpoint, export, dependency-gate, tmux, and GPU-3 status."""
+"""Report import, training, export, analysis, tmux, and GPU-3 status."""
 
 from __future__ import annotations
 
@@ -73,8 +73,18 @@ def main() -> None:
         state_path = Path(task["state_path"])
         state = load_json(state_path) if state_path.is_file() else {}
         complete_path = Path(task["run_dir"]) / "task_complete.json"
-        status = "complete" if complete_path.is_file() else state.get("status", "not_started")
-        export_complete_count = len(list(Path(task["run_dir"]).glob(
+        imported = task.get("execution_mode") == "imported"
+        import_path = Path(task["import_manifest_path"]) if imported else None
+        status = (
+            "imported"
+            if imported and import_path is not None and import_path.is_file()
+            else "complete"
+            if complete_path.is_file()
+            else state.get("status", "not_started")
+        )
+        artifact_run_dir = Path(task.get("artifact_run_dir", task["run_dir"]))
+        artifact_model_dir = Path(task.get("artifact_model_dir", task["model_dir"]))
+        export_complete_count = len(list(artifact_run_dir.glob(
             "exports/epoch_*/sampling_seed_*/export_complete.json"
         )))
         expected_exports = len(task["checkpoint_epochs"]) * len(task["inference_seeds"])
@@ -82,10 +92,16 @@ def main() -> None:
             "task_id": task["task_id"],
             "decoder_boundary_loss": task["decoder_boundary_loss"],
             "role": task["role"],
+            "training_seed": task["training_seed"],
+            "execution_mode": task["execution_mode"],
             "status": status,
-            "stage": state.get("stage"),
-            "last_logged_epoch": last_logged_epoch(Path(task["run_dir"]) / "train.log"),
-            "highest_checkpoint_epoch": highest_saved_epoch(Path(task["model_dir"])),
+            "stage": "imported" if imported else state.get("stage"),
+            "last_logged_epoch": (
+                FINAL_EPOCH
+                if imported
+                else last_logged_epoch(Path(task["run_dir"]) / "train.log")
+            ),
+            "highest_checkpoint_epoch": highest_saved_epoch(artifact_model_dir),
             "final_epoch": FINAL_EPOCH,
             "exports_complete": export_complete_count,
             "exports_expected": expected_exports,
@@ -95,11 +111,9 @@ def main() -> None:
         }
         rows.append(row)
 
-    reconciliation_path = study_dir / "baseline_reconciliation.json"
-    reconciliation = load_json(reconciliation_path) if reconciliation_path.is_file() else None
     analysis_path = study_dir / "analysis" / "analysis_complete.json"
     analysis = load_json(analysis_path) if analysis_path.is_file() else None
-    session = "gtea_bweight_f1_s0_g3"
+    session = "gtea_bweight_f1_v2_g3"
     payload = {
         "checked_utc": datetime.now(timezone.utc).isoformat(),
         "study_dir": str(study_dir),
@@ -108,23 +122,19 @@ def main() -> None:
         "tmux_session": session,
         "tmux_alive": tmux_exists(session),
         "gpu_processes": gpu_processes(),
-        "baseline_reconciliation": (
-            {"available": True, "passed": reconciliation.get("passed")}
-            if reconciliation is not None
-            else {"available": False, "passed": None}
-        ),
         "analysis": analysis,
         "tasks": rows,
     }
     atomic_write_json(study_dir / "status_live.json", payload)
     print(
-        f"GTEA boundary-weight pilot | GPU {PHYSICAL_GPU} | "
+        f"GTEA boundary-weight replication v2 | GPU {PHYSICAL_GPU} | "
         f"tmux={'alive' if payload['tmux_alive'] else 'absent'} | "
         f"processes={len(payload['gpu_processes'])}"
     )
     for row in rows:
         print(
-            f"  weight={row['decoder_boundary_loss']:<3} role={row['role']:<32} "
+            f"  seed={row['training_seed']} weight={row['decoder_boundary_loss']:<4} "
+            f"mode={row['execution_mode']:<8} role={row['role']:<27} "
             f"status={row['status']:<11} stage={str(row['stage']):<15} "
             f"epoch={row['last_logged_epoch']}/{FINAL_EPOCH} "
             f"checkpoint={row['highest_checkpoint_epoch']} "
@@ -132,11 +142,9 @@ def main() -> None:
         )
         if row["error"]:
             print(f"    error: {row['error']}")
-    gate = payload["baseline_reconciliation"]
-    print(f"  baseline reconciliation: {gate['passed'] if gate['available'] else 'pending'}")
+    print("  baseline reconciliation: not used (cross-seed noise readout)")
     print(f"  analysis: {'complete' if analysis else 'pending'}")
 
 
 if __name__ == "__main__":
     main()
-
