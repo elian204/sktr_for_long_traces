@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Leakage-safe video-aware DiffAct span-selector bake-off for Breakfast."""
+"""Leakage-safe four-fold Breakfast base-selector scale-up."""
 
 from __future__ import annotations
 
@@ -23,11 +23,17 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.metrics import average_precision_score, roc_auc_score
 
 from common import (
+    BASE_NUMERIC_FEATURES,
     DATASET,
     DEFAULT_STUDY_DIR,
     FRAME_BUDGETS,
+    FORBIDDEN_PRIMARY_FEATURE_PREFIXES,
     INNER_FOLDS,
+    OUTER_FOLDS,
     PROTOCOL_VERSION,
+    REPAIR_CANDIDATE_FIELDS,
+    REPAIR_CANDIDATE_TOP_K,
+    SHAPE_FEATURES,
     WORKSPACE_ROOT,
     atomic_write_json,
     file_sha256,
@@ -37,6 +43,7 @@ from common import (
     parse_case,
     read_bundle,
     read_lines,
+    repair_candidate_columns,
     verify_source_digest,
 )
 
@@ -51,29 +58,7 @@ RANDOM_STATE = 20260717
 LONG_MIN_LEN = 100
 LONG_HOMOGENEITY = 0.90
 MODES = ("official", "raw_argmax")
-VARIANT_PROCESS_KIND = {
-    "base": "none",
-    "base_plus_dfg": "dfg",
-    "base_plus_prefix_petri": "prefix_petri",
-}
-
-BASE_NUMERIC_FEATURES = (
-    "uncertainty_mean",
-    "uncertainty_q90",
-    "entropy_mean",
-    "top1_uncertainty_mean",
-    "margin_mean",
-    "pred_probability_mean",
-    "official_override_gap_mean",
-    "duration_raw_abs_z",
-    "duration_norm_abs_z",
-    "segment_log_length",
-    "segment_fraction",
-    "video_progress_mid",
-    "class_frame_rarity",
-    "class_segment_rarity",
-    "neighbor_class_rarity",
-)
+VARIANTS = ("base", "base_plus_metadata", "base_plus_shape")
 DFG_FEATURES = (
     "dfg_start_violation",
     "dfg_incoming_unseen",
@@ -127,6 +112,7 @@ class PetriRuntime:
 
 @dataclass
 class CaseData:
+    outer_fold: int
     scope: str
     mode: str
     inner_fold: int | None
@@ -140,8 +126,8 @@ class CaseData:
     segment_ids: np.ndarray
 
     @property
-    def key(self) -> Tuple[str, str, int | None, str]:
-        return (self.scope, self.mode, self.inner_fold, self.case_id)
+    def key(self) -> Tuple[int, str, str, int | None, str]:
+        return (self.outer_fold, self.scope, self.mode, self.inner_fold, self.case_id)
 
 
 def stable_uint64(*parts: Any) -> np.uint64:
@@ -245,6 +231,106 @@ def probability_features(probabilities: np.ndarray, pred: np.ndarray) -> Dict[st
         "pred_probability": pred_probability,
         "entropy": entropy,
         "override_gap": top1 - pred_probability,
+    }
+
+
+def segment_candidate_pool(
+    probabilities: np.ndarray,
+    start: int,
+    end: int,
+    id_to_name: Mapping[int, str],
+    top_k: int = REPAIR_CANDIDATE_TOP_K,
+) -> Tuple[Dict[str, Any], np.ndarray]:
+    """Rank labels by their mean raw probability within one predicted span."""
+    probs = np.asarray(probabilities, dtype=float)
+    if probs.ndim != 2 or not (0 <= start < end <= probs.shape[1]):
+        raise ValueError(
+            f"Invalid segment bounds [{start}, {end}) for probability shape {probs.shape}"
+        )
+    if top_k <= 0 or top_k > probs.shape[0]:
+        raise ValueError(f"top_k must be in 1..{probs.shape[0]}, got {top_k}")
+    mean_probability = probs[:, start:end].mean(axis=1)
+    class_ids = np.arange(probs.shape[0], dtype=np.int32)
+    # Descending probability with class ID as a deterministic tie breaker.
+    order = np.lexsort((class_ids, -mean_probability))
+    row: Dict[str, Any] = {}
+    for rank, class_id in enumerate(order[:top_k], start=1):
+        class_id = int(class_id)
+        row[f"candidate_rank_{rank}_class_id"] = class_id
+        row[f"candidate_rank_{rank}_label"] = id_to_name[class_id]
+        row[f"candidate_rank_{rank}_mean_probability"] = float(
+            mean_probability[class_id]
+        )
+    return row, order
+
+
+def segment_probability_shape_features(
+    probabilities: np.ndarray,
+    raw_argmax: np.ndarray,
+    start: int,
+    end: int,
+) -> Dict[str, float]:
+    """Compute the exploratory probability-shape features from raw outputs."""
+    probs = np.asarray(probabilities, dtype=float)
+    raw = np.asarray(raw_argmax, dtype=np.int32)
+    if probs.ndim != 2 or raw.shape != (probs.shape[1],):
+        raise ValueError(
+            f"Raw stream/probability mismatch: probs={probs.shape}, argmax={raw.shape}"
+        )
+    if not (0 <= start < end <= probs.shape[1]):
+        raise ValueError(
+            f"Invalid segment bounds [{start}, {end}) for probability shape {probs.shape}"
+        )
+    span = probs[:, start:end]
+    length = end - start
+    pmax = span.max(axis=0)
+    top2 = (
+        np.partition(span, -2, axis=0)[-2]
+        if span.shape[0] > 1
+        else np.zeros(length, dtype=float)
+    )
+    margin = pmax - top2
+    if length >= 2:
+        position = np.linspace(0.0, 1.0, length)
+        centered = position - float(np.mean(position))
+        confidence_slope = float(
+            np.sum(centered * (pmax - float(np.mean(pmax))))
+            / np.sum(centered**2)
+        )
+        flicker_rate = float(np.mean(raw[start + 1 : end] != raw[start : end - 1]))
+    else:
+        confidence_slope = 0.0
+        flicker_rate = 0.0
+
+    edge_width = min(max(1, int(round(0.10 * length))), (length - 1) // 2)
+    if edge_width >= 1:
+        edge = np.concatenate([margin[:edge_width], margin[-edge_width:]])
+        core = margin[edge_width:-edge_width]
+        edge_vs_core_margin = float(np.mean(edge) - np.mean(core))
+    else:
+        edge_vs_core_margin = 0.0
+
+    mean_probability = span.mean(axis=1)
+    class_ids = np.arange(span.shape[0], dtype=np.int32)
+    segment_order = np.lexsort((class_ids, -mean_probability))
+    segment_runner_up = int(segment_order[1]) if len(segment_order) > 1 else int(
+        segment_order[0]
+    )
+    if span.shape[0] > 1:
+        frame_class_ids = np.broadcast_to(class_ids[:, None], span.shape)
+        frame_order = np.lexsort((frame_class_ids, -span), axis=0)
+        frame_runner_up = frame_order[1]
+        runner_up_consistency = float(np.mean(frame_runner_up == segment_runner_up))
+    else:
+        runner_up_consistency = 1.0
+    return {
+        "confidence_slope": confidence_slope,
+        "edge_vs_core_margin": edge_vs_core_margin,
+        "flicker_rate": flicker_rate,
+        # This is intentionally an explicit alias of the base margin_mean
+        # definition requested in the exploratory feature specification.
+        "runner_up_gap": float(np.mean(margin)),
+        "runner_up_consistency": runner_up_consistency,
     }
 
 
@@ -503,21 +589,23 @@ def exact_prefix_costs(
 def categorical_feature_columns(
     labels: Sequence[str], tasks: Sequence[str], cameras: Sequence[str]
 ) -> List[str]:
-    columns: List[str] = []
-    columns.extend(f"predicted_label__{label}" for label in labels)
-    columns.extend(f"left_label__{label}" for label in ["START", *labels])
-    columns.extend(f"right_label__{label}" for label in [*labels, "END"])
-    columns.extend(f"task__{task}" for task in tasks)
-    columns.extend(f"camera__{camera}" for camera in cameras)
-    return columns
+    del labels
+    return [
+        *(f"task__{task}" for task in tasks),
+        *(f"camera__{camera}" for camera in cameras),
+    ]
 
 
 def variant_features(categorical: Sequence[str]) -> Dict[str, List[str]]:
-    base = [*BASE_NUMERIC_FEATURES, *categorical]
+    metadata = [
+        column
+        for column in categorical
+        if column.startswith(FORBIDDEN_PRIMARY_FEATURE_PREFIXES)
+    ]
     return {
-        "base": base,
-        "base_plus_dfg": [*base, *DFG_FEATURES],
-        "base_plus_prefix_petri": [*base, *PETRI_FEATURES],
+        "base": list(BASE_NUMERIC_FEATURES),
+        "base_plus_metadata": [*BASE_NUMERIC_FEATURES, *metadata],
+        "base_plus_shape": [*BASE_NUMERIC_FEATURES, *SHAPE_FEATURES],
     }
 
 
@@ -559,11 +647,7 @@ def build_feature_contexts(
             for case in cases
         }
         stats_by_task = read_route_stats(data_root, cases, name_to_id)
-        petri_by_task: Dict[str, PetriRuntime] = {}
         for task, stats in stats_by_task.items():
-            model_path = out_dir / "process_models" / context_id / f"{task}.pnml"
-            runtime = build_route_petri(task, stats.traces, model_path)
-            petri_by_task[task] = runtime
             audit_rows.append(
                 {
                     "context_id": context_id,
@@ -573,10 +657,7 @@ def build_feature_contexts(
                     "train_cases": stats.total_cases,
                     "train_frames": stats.total_frames,
                     "train_collapsed_segments": stats.total_segments,
-                    "petri_places": len(runtime.places),
-                    "petri_transitions": len(runtime.transitions),
-                    "petri_model_path": str(model_path),
-                    "petri_model_sha256": file_sha256(model_path),
+                    "uses_process_features": False,
                 }
             )
         contexts[context_id] = {
@@ -585,8 +666,6 @@ def build_feature_contexts(
             "cases": case_set,
             "participants": participants,
             "stats": stats_by_task,
-            "petri": petri_by_task,
-            "prefix_cache": {},
         }
     return contexts, audit_rows
 
@@ -600,6 +679,9 @@ def build_segment_rows(
     id_to_name: Mapping[int, str],
     name_to_id: Mapping[str, int],
     contexts: Mapping[str, Dict[str, Any]],
+    *,
+    outer_fold: int,
+    segment_id_start: int,
 ) -> Tuple[List[CaseData], pd.DataFrame, pd.DataFrame, List[str]]:
     labels = [str(index) for index in sorted(id_to_name)]
     outer_train = read_bundle(Path(metadata["outer_train_manifest"]))
@@ -615,13 +697,17 @@ def build_segment_rows(
 
     sources: List[Dict[str, Any]] = []
     for task in tasks:
-        complete_path = Path(task["run_dir"]) / "task_complete.json"
+        complete_path = (
+            Path(task["import_manifest_path"])
+            if task.get("execution_mode") == "imported"
+            else Path(task["run_dir"]) / "task_complete.json"
+        )
         if not complete_path.is_file():
             raise FileNotFoundError(
                 f"OOF task is not complete: {task['task_id']} ({complete_path})"
             )
         complete = load_json(complete_path)
-        if complete.get("status") != "complete":
+        if task.get("execution_mode") != "imported" and complete.get("status") != "complete":
             raise ValueError(f"OOF task did not complete successfully: {task['task_id']}")
         sources.append(
             {
@@ -645,7 +731,7 @@ def build_segment_rows(
     cases_out: List[CaseData] = []
     segment_rows: List[Dict[str, Any]] = []
     case_rows: List[Dict[str, Any]] = []
-    next_segment_id = 0
+    next_segment_id = int(segment_id_start)
     for source in sources:
         export_dir = source["export_dir"]
         export_map = read_export_map(export_dir)
@@ -681,10 +767,9 @@ def build_segment_rows(
                     f"Subject leakage: eval participant {info.participant} occurs in "
                     f"{source['context_id']} feature training"
                 )
-            if info.task not in context["stats"] or info.task not in context["petri"]:
-                raise ValueError(f"No route model for {case_id} task={info.task}")
+            if info.task not in context["stats"]:
+                raise ValueError(f"No train-only route statistics for {case_id} task={info.task}")
             stats: RouteStats = context["stats"][info.task]
-            runtime: PetriRuntime = context["petri"][info.task]
 
             for mode in modes:
                 prediction_int = official_pred if mode == "official" else raw_pred
@@ -693,15 +778,6 @@ def build_segment_rows(
                 probability = probability_features(raw_prob, prediction_int)
                 segments = collapse_segments(pred.tolist())
                 trace = [label for _, _, label in segments]
-                dfg = dfg_features(trace, stats)
-                cache_key = (info.task, tuple(trace))
-                prefix_cache: Dict[Any, Tuple[np.ndarray, int]] = context["prefix_cache"]
-                if cache_key not in prefix_cache:
-                    prefix_cache[cache_key] = exact_prefix_costs(trace, runtime)
-                prefix_cost, search_states = prefix_cache[cache_key]
-                prefix_increment = np.diff(prefix_cost)
-                if len(prefix_increment) != len(segments):
-                    raise AssertionError("Prefix feature length does not match predicted segments")
                 error = pred != gt_text
                 long_sub = long_substitution_mask(gt_text, pred)
                 segment_ids = np.empty(len(pred), dtype=np.int64)
@@ -732,8 +808,25 @@ def build_segment_rows(
                         if neighbor not in {"START", "END"}
                     ]
                     uncertainty = 1.0 - probability["pred_probability"][start:end]
+                    gt_segment = gt_text[start:end]
+                    gt_counts = Counter(str(value) for value in gt_segment)
+                    correct_label, correct_count = gt_counts.most_common(1)[0]
+                    candidate_columns, candidate_order = segment_candidate_pool(
+                        raw_prob,
+                        start,
+                        end,
+                        id_to_name,
+                        top_k=REPAIR_CANDIDATE_TOP_K,
+                    )
+                    correct_label_rank = int(
+                        np.flatnonzero(candidate_order == int(correct_label))[0] + 1
+                    )
+                    shape_features = segment_probability_shape_features(
+                        raw_prob, raw_pred, start, end
+                    )
                     row: Dict[str, Any] = {
                         "segment_id": next_segment_id,
+                        "outer_fold": outer_fold,
                         "scope": source["scope"],
                         "mode": mode,
                         "inner_fold": source["inner_fold"],
@@ -747,10 +840,19 @@ def build_segment_rows(
                         "end": end,
                         "length": length,
                         "predicted_label": label,
+                        "predicted_label_name": id_to_name[int(label)],
                         "left_label": left_label,
                         "right_label": right_label,
                         "error_frames": int(np.sum(error[start:end])),
                         "error_fraction": float(np.mean(error[start:end])),
+                        "correct_label": correct_label,
+                        "correct_label_name": id_to_name[int(correct_label)],
+                        "correct_label_fraction": float(correct_count / length),
+                        "correct_label_probability_rank": correct_label_rank,
+                        "correct_label_in_top5": (
+                            correct_label_rank <= REPAIR_CANDIDATE_TOP_K
+                        ),
+                        "is_fully_correct": bool(np.all(~error[start:end])),
                         "long_substitution_frames": int(np.sum(long_sub[start:end])),
                         "long_substitution_fraction": float(np.mean(long_sub[start:end])),
                         "feature_context_id": source["context_id"],
@@ -786,26 +888,11 @@ def build_segment_rows(
                         "neighbor_class_rarity": float(
                             np.mean(neighbor_rarities) if neighbor_rarities else 0.0
                         ),
-                        "petri_prefix_cost_before": float(prefix_cost[segment_index]),
-                        "petri_prefix_cost_after": float(prefix_cost[segment_index + 1]),
-                        "petri_prefix_cost_increment": float(prefix_increment[segment_index]),
-                        "petri_prefix_cost_rate": float(
-                            prefix_cost[segment_index + 1] / (segment_index + 1)
-                        ),
-                        "petri_prefix_violation": float(prefix_increment[segment_index] > 0),
-                        "petri_case_final_prefix_cost": float(prefix_cost[-1]),
-                        "petri_case_final_prefix_cost_rate": float(
-                            prefix_cost[-1] / max(len(trace), 1)
-                        ),
-                        "petri_search_states": int(search_states),
+                        **shape_features,
+                        **candidate_columns,
                     }
-                    for feature_name, values in dfg.items():
-                        row[feature_name] = float(values[segment_index])
                     for column in categorical:
                         row[column] = 0.0
-                    row[f"predicted_label__{label}"] = 1.0
-                    row[f"left_label__{left_label}"] = 1.0
-                    row[f"right_label__{right_label}"] = 1.0
                     row[f"task__{info.task}"] = 1.0
                     row[f"camera__{info.camera}"] = 1.0
                     segment_rows.append(row)
@@ -814,6 +901,7 @@ def build_segment_rows(
 
                 cases_out.append(
                     CaseData(
+                        outer_fold=outer_fold,
                         scope=source["scope"],
                         mode=mode,
                         inner_fold=source["inner_fold"],
@@ -830,6 +918,7 @@ def build_segment_rows(
                 case_rows.append(
                     {
                         "scope": source["scope"],
+                        "outer_fold": outer_fold,
                         "mode": mode,
                         "inner_fold": source["inner_fold"],
                         "case_id": case_id,
@@ -841,12 +930,6 @@ def build_segment_rows(
                         "n_segments": len(segments),
                         "error_frames": int(np.sum(error)),
                         "long_substitution_frames": int(np.sum(long_sub)),
-                        "dfg_violation_segments": int(
-                            np.sum(dfg["dfg_segment_severity"] > 0)
-                        ),
-                        "petri_prefix_cost": float(prefix_cost[-1]),
-                        "petri_violation_segments": int(np.sum(prefix_increment > 0)),
-                        "petri_search_states": int(search_states),
                         "feature_context_id": source["context_id"],
                         "feature_train_manifest_sha256": context["manifest_sha256"],
                         "official_raw_changed_frames": int(np.sum(official_pred != raw_pred)),
@@ -891,47 +974,119 @@ def fit_selector_scores(
     feature_sets: Mapping[str, Sequence[str]],
     out_dir: Path,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Cross-fit OOF scores, then fit all OOF rows for untouched outer test."""
+    """Cross-fit independently inside each outer fold, then score its untouched test."""
     scored = segments.copy()
     audits: List[Dict[str, Any]] = []
     model_dir = out_dir / "selector_models"
     model_dir.mkdir(parents=True, exist_ok=True)
-    for mode in sorted(scored["mode"].unique()):
-        oof_mask = (scored["scope"] == "oof_validation") & (scored["mode"] == mode)
-        outer_mask = (scored["scope"] == "outer_test") & (scored["mode"] == mode)
-        if not oof_mask.any() or not outer_mask.any():
-            raise ValueError(f"Missing OOF or outer rows for mode={mode}")
-        for variant, features in feature_sets.items():
-            score_column = f"{variant}_score"
-            scored.loc[oof_mask | outer_mask, score_column] = np.nan
-            for held_fold in range(1, INNER_FOLDS + 1):
-                train_mask = oof_mask & (scored["inner_fold"] != held_fold)
-                eval_mask = oof_mask & (scored["inner_fold"] == held_fold)
-                train = scored.loc[train_mask]
-                evaluation = scored.loc[eval_mask]
+    for outer_fold in OUTER_FOLDS:
+        fold_mask = scored["outer_fold"] == outer_fold
+        for mode in sorted(scored["mode"].unique()):
+            oof_mask = (
+                fold_mask
+                & (scored["scope"] == "oof_validation")
+                & (scored["mode"] == mode)
+            )
+            outer_mask = (
+                fold_mask
+                & (scored["scope"] == "outer_test")
+                & (scored["mode"] == mode)
+            )
+            if not oof_mask.any() or not outer_mask.any():
+                raise ValueError(f"Missing rows for outer={outer_fold}, mode={mode}")
+            for variant, features in feature_sets.items():
+                score_column = f"{variant}_score"
+                scored.loc[oof_mask | outer_mask, score_column] = np.nan
+                for held_fold in range(1, INNER_FOLDS + 1):
+                    train_mask = oof_mask & (scored["inner_fold"] != held_fold)
+                    eval_mask = oof_mask & (scored["inner_fold"] == held_fold)
+                    train = scored.loc[train_mask]
+                    evaluation = scored.loc[eval_mask]
+                    train_people = set(train["participant"])
+                    eval_people = set(evaluation["participant"])
+                    if train_people.intersection(eval_people):
+                        raise AssertionError(
+                            f"Selector leakage outer={outer_fold}, held={held_fold}"
+                        )
+                    model = selector_model()
+                    targets = train["error_fraction"].to_numpy(dtype=float)
+                    weights = train["length"].to_numpy(dtype=float)
+                    model.fit(matrix(train, features), targets, sample_weight=weights)
+                    predictions = np.clip(
+                        model.predict(matrix(evaluation, features)), 0.0, 1.0
+                    )
+                    scored.loc[eval_mask, score_column] = predictions
+                    model_path = (
+                        model_dir
+                        / f"outer{outer_fold}_{mode}_{variant}_internal_held{held_fold}.joblib"
+                    )
+                    joblib.dump(model, model_path)
+                    audits.append(
+                        {
+                            "outer_fold": outer_fold,
+                            "mode": mode,
+                            "variant": variant,
+                            "evaluation_scope": "internal_oof",
+                            "held_inner_fold": held_fold,
+                            "train_inner_folds": ",".join(
+                                str(fold)
+                                for fold in range(1, INNER_FOLDS + 1)
+                                if fold != held_fold
+                            ),
+                            "train_segments": len(train),
+                            "train_cases": train["case_id"].nunique(),
+                            "train_participants": len(train_people),
+                            "evaluation_segments": len(evaluation),
+                            "evaluation_cases": evaluation["case_id"].nunique(),
+                            "evaluation_participants": len(eval_people),
+                            "participant_overlap": 0,
+                            "train_frame_weight": int(np.sum(weights)),
+                            "train_weighted_error_rate": float(
+                                np.average(targets, weights=weights)
+                            ),
+                            "score_min": float(np.min(predictions)),
+                            "score_mean": float(np.mean(predictions)),
+                            "score_max": float(np.max(predictions)),
+                            "feature_count": len(features),
+                            "features": ",".join(features),
+                            "model_path": str(model_path),
+                            "model_sha256": file_sha256(model_path),
+                            "uses_outer_test_targets": False,
+                        }
+                    )
+                if scored.loc[oof_mask, score_column].isna().any():
+                    raise AssertionError(
+                        f"Missing cross-fit scores: outer={outer_fold}/{mode}/{variant}"
+                    )
+
+                train = scored.loc[oof_mask]
+                evaluation = scored.loc[outer_mask]
                 train_people = set(train["participant"])
                 eval_people = set(evaluation["participant"])
                 if train_people.intersection(eval_people):
                     raise AssertionError(
-                        f"Selector CV participant leakage for mode={mode}, held_fold={held_fold}"
+                        f"Official participant overlap: outer={outer_fold}/{mode}"
                     )
                 model = selector_model()
                 targets = train["error_fraction"].to_numpy(dtype=float)
                 weights = train["length"].to_numpy(dtype=float)
                 model.fit(matrix(train, features), targets, sample_weight=weights)
-                predictions = np.clip(model.predict(matrix(evaluation, features)), 0.0, 1.0)
-                scored.loc[eval_mask, score_column] = predictions
-                model_path = model_dir / f"{mode}_{variant}_internal_held{held_fold}.joblib"
+                predictions = np.clip(
+                    model.predict(matrix(evaluation, features)), 0.0, 1.0
+                )
+                scored.loc[outer_mask, score_column] = predictions
+                model_path = (
+                    model_dir / f"outer{outer_fold}_{mode}_{variant}_official.joblib"
+                )
                 joblib.dump(model, model_path)
                 audits.append(
                     {
+                        "outer_fold": outer_fold,
                         "mode": mode,
                         "variant": variant,
-                        "evaluation_scope": "internal_oof",
-                        "held_inner_fold": held_fold,
-                        "train_inner_folds": ",".join(
-                            str(fold) for fold in range(1, INNER_FOLDS + 1) if fold != held_fold
-                        ),
+                        "evaluation_scope": "official_outer_test",
+                        "held_inner_fold": f"outer_{outer_fold}",
+                        "train_inner_folds": "1,2,3",
                         "train_segments": len(train),
                         "train_cases": train["case_id"].nunique(),
                         "train_participants": len(train_people),
@@ -953,51 +1108,10 @@ def fit_selector_scores(
                         "uses_outer_test_targets": False,
                     }
                 )
-            if scored.loc[oof_mask, score_column].isna().any():
-                raise AssertionError(f"Missing internal cross-fit scores: {mode}/{variant}")
-
-            train = scored.loc[oof_mask]
-            evaluation = scored.loc[outer_mask]
-            train_people = set(train["participant"])
-            eval_people = set(evaluation["participant"])
-            if train_people.intersection(eval_people):
-                raise AssertionError(f"Official outer train/test participants overlap for {mode}")
-            model = selector_model()
-            targets = train["error_fraction"].to_numpy(dtype=float)
-            weights = train["length"].to_numpy(dtype=float)
-            model.fit(matrix(train, features), targets, sample_weight=weights)
-            predictions = np.clip(model.predict(matrix(evaluation, features)), 0.0, 1.0)
-            scored.loc[outer_mask, score_column] = predictions
-            model_path = model_dir / f"{mode}_{variant}_outer_fold1.joblib"
-            joblib.dump(model, model_path)
-            audits.append(
-                {
-                    "mode": mode,
-                    "variant": variant,
-                    "evaluation_scope": "official_outer_test",
-                    "held_inner_fold": "outer_1",
-                    "train_inner_folds": "1,2,3",
-                    "train_segments": len(train),
-                    "train_cases": train["case_id"].nunique(),
-                    "train_participants": len(train_people),
-                    "evaluation_segments": len(evaluation),
-                    "evaluation_cases": evaluation["case_id"].nunique(),
-                    "evaluation_participants": len(eval_people),
-                    "participant_overlap": 0,
-                    "train_frame_weight": int(np.sum(weights)),
-                    "train_weighted_error_rate": float(np.average(targets, weights=weights)),
-                    "score_min": float(np.min(predictions)),
-                    "score_mean": float(np.mean(predictions)),
-                    "score_max": float(np.max(predictions)),
-                    "feature_count": len(features),
-                    "features": ",".join(features),
-                    "model_path": str(model_path),
-                    "model_sha256": file_sha256(model_path),
-                    "uses_outer_test_targets": False,
-                }
-            )
-            if scored.loc[outer_mask, score_column].isna().any():
-                raise AssertionError(f"Missing official outer scores: {mode}/{variant}")
+                if scored.loc[outer_mask, score_column].isna().any():
+                    raise AssertionError(
+                        f"Missing outer scores: outer={outer_fold}/{mode}/{variant}"
+                    )
     return scored, pd.DataFrame(audits)
 
 
@@ -1154,22 +1268,36 @@ def evaluate_selectors(
     for mode in sorted({case.mode for case in cases}):
         mode_cases = [case for case in cases if case.mode == mode]
         scopes: List[Tuple[str, Any, List[CaseData]]] = []
-        for fold in range(1, INNER_FOLDS + 1):
+        for outer_fold in OUTER_FOLDS:
+            for inner_fold in range(1, INNER_FOLDS + 1):
+                scopes.append(
+                    (
+                        "internal_oof",
+                        f"outer_{outer_fold}_inner_{inner_fold}",
+                        [
+                            case
+                            for case in mode_cases
+                            if case.outer_fold == outer_fold
+                            and case.scope == "oof_validation"
+                            and case.inner_fold == inner_fold
+                        ],
+                    )
+                )
             scopes.append(
                 (
-                    "internal_oof",
-                    fold,
+                    "official_outer_test",
+                    f"outer_{outer_fold}",
                     [
                         case
                         for case in mode_cases
-                        if case.scope == "oof_validation" and case.inner_fold == fold
+                        if case.outer_fold == outer_fold and case.scope == "outer_test"
                     ],
                 )
             )
         scopes.append(
             (
-                "official_outer_test",
-                "outer_1",
+                "pooled_outer_test",
+                "pooled",
                 [case for case in mode_cases if case.scope == "outer_test"],
             )
         )
@@ -1256,59 +1384,168 @@ def evaluate_selectors(
     )
 
 
-def make_pilot_decision(metrics: pd.DataFrame) -> Dict[str, Any]:
+def make_scale_decision(
+    metrics: pd.DataFrame, metadata: Mapping[str, Any]
+) -> Dict[str, Any]:
     official = metrics[
         (metrics["mode"] == "official")
         & np.isclose(metrics["requested_budget"].astype(float), 0.05)
+        & (metrics["variant"] == "base")
     ].copy()
-    decisions: Dict[str, Any] = {}
-    for variant in ("base_plus_dfg", "base_plus_prefix_petri"):
-        internal_deltas: List[float] = []
-        for fold in range(1, INNER_FOLDS + 1):
-            rows = official[
-                (official["scope"] == "internal_oof") & (official["fold"].astype(str) == str(fold))
-            ].set_index("variant")
-            internal_deltas.append(
-                float(rows.loc[variant, "error_recall_pct"] - rows.loc["base", "error_recall_pct"])
-            )
-        outer = official[official["scope"] == "official_outer_test"].set_index("variant")
-        outer_recall_delta = float(
-            outer.loc[variant, "error_recall_pct"] - outer.loc["base", "error_recall_pct"]
-        )
-        outer_acc_delta = float(
-            outer.loc[variant, "oracle_acc_gain_pp"] - outer.loc["base", "oracle_acc_gain_pp"]
-        )
-        outer_f1_delta = float(
-            outer.loc[variant, "oracle_f1_at_25_gain_pp"]
-            - outer.loc["base", "oracle_f1_at_25_gain_pp"]
-        )
-        pass_flags = {
-            "outer_error_recall_delta_at_least_0_5pp": outer_recall_delta >= 0.5,
-            "positive_internal_folds_at_least_2_of_3": sum(
-                delta > 0 for delta in internal_deltas
-            )
-            >= 2,
-            "outer_oracle_acc_nonnegative_vs_base": outer_acc_delta >= -1e-12,
-            "outer_oracle_f1_at_25_nonnegative_vs_base": outer_f1_delta >= -1e-12,
-        }
-        decisions[variant] = {
-            "internal_error_recall_delta_pp": internal_deltas,
-            "positive_internal_fold_count": sum(delta > 0 for delta in internal_deltas),
-            "outer_error_recall_delta_pp": outer_recall_delta,
-            "outer_oracle_acc_gain_delta_pp": outer_acc_delta,
-            "outer_oracle_f1_at_25_gain_delta_pp": outer_f1_delta,
-            "criteria": pass_flags,
-            "passes_pilot_gate": all(pass_flags.values()),
-        }
+    per_fold = official[official["scope"] == "official_outer_test"].copy()
+    if set(per_fold["fold"]) != {f"outer_{fold}" for fold in OUTER_FOLDS}:
+        raise ValueError("Scale decision is missing an official outer fold")
+    pooled_rows = official[official["scope"] == "pooled_outer_test"]
+    if len(pooled_rows) != 1:
+        raise ValueError("Scale decision expected exactly one pooled base row")
+    pooled = pooled_rows.iloc[0]
+    rule = metadata["success_rule"]
+    fold_rule = rule["all_outer_folds"]
+    pooled_rule = rule["pooled"]
+    recall_range = float(
+        per_fold["error_recall_pct"].max() - per_fold["error_recall_pct"].min()
+    )
+    checks = {
+        "all_folds_precision_at_least_85pct": bool(
+            (
+                per_fold["error_precision_pct"]
+                >= float(fold_rule["minimum_error_precision_pct"])
+            ).all()
+        ),
+        "all_folds_recall_at_least_15pct": bool(
+            (
+                per_fold["error_recall_pct"]
+                >= float(fold_rule["minimum_error_recall_pct"])
+            ).all()
+        ),
+        "recall_range_at_most_8pp": (
+            recall_range
+            <= float(fold_rule["maximum_recall_range_across_folds_pp"])
+        ),
+        "pooled_precision_at_least_85pct": (
+            float(pooled["error_precision_pct"])
+            >= float(pooled_rule["minimum_error_precision_pct"])
+        ),
+        "pooled_recall_at_least_18pct": (
+            float(pooled["error_recall_pct"])
+            >= float(pooled_rule["minimum_error_recall_pct"])
+        ),
+    }
     return {
         "decision_budget": 0.05,
         "primary_mode": "official",
+        "primary_variant": "base",
         "criteria_were_pre_specified": True,
-        "variants": decisions,
-        "scale_to_all_four_outer_folds": any(
-            value["passes_pilot_gate"] for value in decisions.values()
+        "checks": checks,
+        "green_light_repair_head": all(checks.values()),
+        "per_fold": {
+            str(row.fold): {
+                "error_recall_pct": float(row.error_recall_pct),
+                "error_precision_pct": float(row.error_precision_pct),
+                "long_substitution_recall_pct": float(
+                    row.long_substitution_recall_pct
+                ),
+                "oracle_acc_gain_pp": float(row.oracle_acc_gain_pp),
+                "oracle_f1_at_25_gain_pp": float(row.oracle_f1_at_25_gain_pp),
+            }
+            for row in per_fold.itertuples()
+        },
+        "recall_range_across_folds_pp": recall_range,
+        "pooled": {
+            "error_recall_pct": float(pooled["error_recall_pct"]),
+            "error_precision_pct": float(pooled["error_precision_pct"]),
+            "long_substitution_recall_pct": float(
+                pooled["long_substitution_recall_pct"]
+            ),
+            "oracle_acc_gain_pp": float(pooled["oracle_acc_gain_pp"]),
+            "oracle_f1_at_25_gain_pp": float(
+                pooled["oracle_f1_at_25_gain_pp"]
+            ),
+        },
+        "success_rule": rule,
+    }
+
+
+def make_shape_decision(
+    metrics: pd.DataFrame, metadata: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Apply the locked exploratory shape-feature comparison against base."""
+    selected = metrics[
+        (metrics["mode"] == "official")
+        & np.isclose(metrics["requested_budget"].astype(float), 0.05)
+        & (metrics["variant"].isin(["base", "base_plus_shape"]))
+        & (
+            metrics["scope"].isin(
+                ["official_outer_test", "pooled_outer_test"]
+            )
+        )
+    ].copy()
+    expected_folds = {*(f"outer_{fold}" for fold in OUTER_FOLDS), "pooled"}
+    if set(selected["fold"]) != expected_folds:
+        raise ValueError("Shape decision is missing an official fold or pooled row")
+    if selected.groupby(["fold", "variant"]).size().ne(1).any():
+        raise ValueError("Shape decision expected one row per fold and variant")
+
+    deltas: Dict[str, Dict[str, float]] = {}
+    for fold in sorted(expected_folds):
+        rows = selected[selected["fold"] == fold].set_index("variant")
+        base = rows.loc["base"]
+        shape = rows.loc["base_plus_shape"]
+        deltas[fold] = {
+            "error_recall_gain_pp": float(
+                shape.error_recall_pct - base.error_recall_pct
+            ),
+            "error_precision_gain_pp": float(
+                shape.error_precision_pct - base.error_precision_pct
+            ),
+            "long_substitution_recall_gain_pp": float(
+                shape.long_substitution_recall_pct
+                - base.long_substitution_recall_pct
+            ),
+            "oracle_acc_gain_difference_pp": float(
+                shape.oracle_acc_gain_pp - base.oracle_acc_gain_pp
+            ),
+            "oracle_f1_at_25_gain_difference_pp": float(
+                shape.oracle_f1_at_25_gain_pp
+                - base.oracle_f1_at_25_gain_pp
+            ),
+        }
+    rule = metadata["shape_variant_comparison_rule"]
+    positive_folds = sum(
+        deltas[f"outer_{fold}"]["error_recall_gain_pp"] > 0.0
+        for fold in OUTER_FOLDS
+    )
+    pooled = deltas["pooled"]
+    checks = {
+        "pooled_error_recall_gain_at_least_0p5pp": (
+            pooled["error_recall_gain_pp"]
+            >= float(rule["minimum_pooled_error_recall_gain_pp"])
         ),
-        "one_outer_fold_is_preliminary": True,
+        "positive_error_recall_gain_in_at_least_3_of_4_folds": (
+            positive_folds
+            >= int(rule["minimum_outer_folds_with_positive_error_recall_gain"])
+        ),
+        "pooled_oracle_acc_gain_not_worse": (
+            pooled["oracle_acc_gain_difference_pp"]
+            >= float(rule["minimum_pooled_oracle_acc_gain_difference_pp"])
+        ),
+        "pooled_oracle_f1_at_25_gain_not_worse": (
+            pooled["oracle_f1_at_25_gain_difference_pp"]
+            >= float(rule["minimum_pooled_oracle_f1_at_25_gain_difference_pp"])
+        ),
+    }
+    return {
+        "decision_budget": 0.05,
+        "primary_mode": "official",
+        "variant": "base_plus_shape",
+        "reference": "base",
+        "analysis_time_exploratory_only": True,
+        "criteria_were_pre_specified": True,
+        "checks": checks,
+        "retain_shape_features": all(checks.values()),
+        "positive_outer_fold_count": positive_folds,
+        "deltas": deltas,
+        "comparison_rule": rule,
     }
 
 
@@ -1317,71 +1554,92 @@ def write_findings(
     baselines: pd.DataFrame,
     metrics: pd.DataFrame,
     decisions: Mapping[str, Any],
+    shape_decision: Mapping[str, Any],
 ) -> None:
-    outer_baseline = baselines[
-        (baselines["scope"] == "official_outer_test") & (baselines["mode"] == "official")
+    pooled_baseline = baselines[
+        (baselines["scope"] == "pooled_outer_test") & (baselines["mode"] == "official")
     ].iloc[0]
     outer = metrics[
-        (metrics["scope"] == "official_outer_test")
+        (metrics["scope"].isin(["official_outer_test", "pooled_outer_test"]))
         & (metrics["mode"] == "official")
         & np.isclose(metrics["requested_budget"].astype(float), 0.05)
-    ].set_index("variant")
+    ].copy()
     lines = [
-        "# Breakfast video-aware span selector pilot",
+        "# Breakfast four-fold video-aware selector scale-up",
         "",
         "## Status",
         "",
         (
-            "This is a leakage-safe official outer-fold-1 pilot over "
-            f"{int(outer_baseline.n_cases)} videos and {int(outer_baseline.n_frames):,} frames. "
-            "The selector was trained only from subject-disjoint OOF DiffAct predictions."
+            "This is a leakage-safe four-fold study. Every outer-fold selector is trained "
+            "only from that fold's subject-disjoint OOF DiffAct predictions."
         ),
         "",
         "## Outer-fold baseline",
         "",
         (
-            f"Official DiffAct: Acc {outer_baseline.acc:.3f}, Edit {outer_baseline.edit:.3f}, "
-            f"F1@10 {outer_baseline['f1@10']:.3f}, F1@25 {outer_baseline['f1@25']:.3f}, "
-            f"F1@50 {outer_baseline['f1@50']:.3f}."
+            f"Pooled official DiffAct: Acc {pooled_baseline.acc:.3f}, "
+            f"Edit {pooled_baseline.edit:.3f}, F1@10 {pooled_baseline['f1@10']:.3f}, "
+            f"F1@25 {pooled_baseline['f1@25']:.3f}, "
+            f"F1@50 {pooled_baseline['f1@50']:.3f}."
         ),
         "",
         "## Matched 5% frame budget",
         "",
-        "| Selector | Error recall | Error precision | Long-sub recall | Oracle ΔAcc | Oracle ΔF1@25 |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Scope | Selector | Error recall | Error precision | Long-sub recall | Oracle ΔAcc | Oracle ΔF1@25 |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
-    for variant in ("base", "base_plus_dfg", "base_plus_prefix_petri"):
-        row = outer.loc[variant]
+    order = [*(f"outer_{fold}" for fold in OUTER_FOLDS), "pooled"]
+    for scope_name in order:
+        scope_rows = outer[outer["fold"] == scope_name].set_index("variant")
+        for variant in VARIANTS:
+            row = scope_rows.loc[variant]
+            lines.append(
+                f"| {scope_name} | {variant} | {row.error_recall_pct:.3f}% | "
+                f"{row.error_precision_pct:.3f}% | "
+                f"{row.long_substitution_recall_pct:.3f}% | "
+                f"{row.oracle_acc_gain_pp:+.3f} pp | "
+                f"{row.oracle_f1_at_25_gain_pp:+.3f} pp |"
+            )
+    lines.extend(["", "## Pre-registered base-selector gate", ""])
+    for name, passed in decisions["checks"].items():
         lines.append(
-            f"| {variant} | {row.error_recall_pct:.3f}% | {row.error_precision_pct:.3f}% | "
-            f"{row.long_substitution_recall_pct:.3f}% | {row.oracle_acc_gain_pp:+.3f} pp | "
-            f"{row.oracle_f1_at_25_gain_pp:+.3f} pp |"
+            f"- {'PASS' if passed else 'FAIL'}: {name}"
         )
-    lines.extend(["", "## Pre-registered process-feature gate", ""])
-    for variant, decision in decisions["variants"].items():
-        verdict = "PASS" if decision["passes_pilot_gate"] else "NO-GO"
-        lines.append(
-            f"- **{variant}: {verdict}.** Outer error-recall delta vs base "
-            f"{decision['outer_error_recall_delta_pp']:+.3f} pp; positive internal folds "
-            f"{decision['positive_internal_fold_count']}/3; oracle ΔAcc vs base "
-            f"{decision['outer_oracle_acc_gain_delta_pp']:+.3f} pp; oracle ΔF1@25 vs base "
-            f"{decision['outer_oracle_f1_at_25_gain_delta_pp']:+.3f} pp."
-        )
-    scale = decisions["scale_to_all_four_outer_folds"]
+    scale = decisions["green_light_repair_head"]
     lines.extend(
         [
             "",
             "## Decision",
             "",
             (
-                "At least one process augmentation passed; proceed to all four official outer folds."
+                "The deployment-safe base selector passed; green-light repair-head development."
                 if scale
-                else "Neither process augmentation passed; do not spend four-fold compute on process features."
+                else "The base selector did not meet the locked consistency rule; do not "
+                "advance the repair head automatically."
             ),
             "",
             "Oracle corrections replace selected frames with ground truth and are diagnostic ceilings only. "
-            "They are not deployable predictions. Raw argmax results are a sensitivity analysis; official "
-            "DiffAct is primary.",
+            "They are not deployable predictions. `base_plus_metadata` is an analysis-only "
+            "ablation; the primary base uses exactly 15 deployment-safe numeric features. "
+            "No DFG or Petri selector is evaluated.",
+            "",
+        ]
+    )
+    lines.extend(["## Exploratory `base_plus_shape` gate", ""])
+    for name, passed in shape_decision["checks"].items():
+        lines.append(f"- {'PASS' if passed else 'FAIL'}: {name}")
+    lines.extend(
+        [
+            "",
+            (
+                "Retain the raw-probability shape features for repair-head localization."
+                if shape_decision["retain_shape_features"]
+                else "Drop the shape features and retain the frozen 15-feature base."
+            ),
+            "",
+            "`runner_up_gap` is the explicitly requested mean p1−p2 feature. "
+            "It is mathematically identical to the existing `margin_mean` base feature; "
+            "the other four shape features are new signals.",
             "",
         ]
     )
@@ -1395,26 +1653,45 @@ def validate_outputs(
     model_audit: pd.DataFrame,
     baselines: pd.DataFrame,
     metrics: pd.DataFrame,
-    process_audit: pd.DataFrame,
+    context_audit: pd.DataFrame,
+    feature_sets: Mapping[str, Sequence[str]],
 ) -> pd.DataFrame:
     checks: List[Dict[str, Any]] = []
 
     def add(name: str, passed: bool, detail: str) -> None:
         checks.append({"check": name, "passed": bool(passed), "detail": detail})
 
-    for mode in MODES:
-        oof = [case for case in cases if case.mode == mode and case.scope == "oof_validation"]
-        outer = [case for case in cases if case.mode == mode and case.scope == "outer_test"]
-        add(
-            f"{mode}: OOF covers outer train exactly once",
-            len(oof) == 1460 and len({case.case_id for case in oof}) == 1460,
-            f"rows={len(oof)}, unique={len({case.case_id for case in oof})}",
-        )
-        add(
-            f"{mode}: outer test coverage",
-            len(outer) == 252 and len({case.case_id for case in outer}) == 252,
-            f"rows={len(outer)}, unique={len({case.case_id for case in outer})}",
-        )
+    for outer_fold in OUTER_FOLDS:
+        fold_meta = metadata["folds"][str(outer_fold)]
+        for mode in MODES:
+            oof = [
+                case
+                for case in cases
+                if case.outer_fold == outer_fold
+                and case.mode == mode
+                and case.scope == "oof_validation"
+            ]
+            outer = [
+                case
+                for case in cases
+                if case.outer_fold == outer_fold
+                and case.mode == mode
+                and case.scope == "outer_test"
+            ]
+            expected_oof = int(fold_meta["outer_train_case_count"])
+            expected_outer = int(fold_meta["outer_test_case_count"])
+            add(
+                f"outer {outer_fold}/{mode}: OOF coverage",
+                len(oof) == expected_oof
+                and len({case.case_id for case in oof}) == expected_oof,
+                f"rows={len(oof)}, expected={expected_oof}",
+            )
+            add(
+                f"outer {outer_fold}/{mode}: test coverage",
+                len(outer) == expected_outer
+                and len({case.case_id for case in outer}) == expected_outer,
+                f"rows={len(outer)}, expected={expected_outer}",
+            )
     add(
         "feature case leakage absent",
         not segments["eval_case_in_feature_train"].astype(bool).any(),
@@ -1435,7 +1712,7 @@ def validate_outputs(
         not model_audit["uses_outer_test_targets"].astype(bool).any(),
         "model audit uniformly false",
     )
-    score_columns = [f"{variant}_score" for variant in VARIANT_PROCESS_KIND]
+    score_columns = [f"{variant}_score" for variant in VARIANTS]
     add(
         "all learned scores finite",
         bool(np.isfinite(segments[score_columns].to_numpy(dtype=float)).all()),
@@ -1453,29 +1730,184 @@ def validate_outputs(
         "reported coverage reconciles to flagged/n_frames",
     )
     add(
-        "route Petri models persisted",
-        len(process_audit) == 40
-        and all(Path(path).is_file() for path in process_audit["petri_model_path"]),
-        f"models={len(process_audit)} (expected 4 contexts x 10 tasks)",
+        "no process features computed",
+        bool((context_audit["uses_process_features"] == False).all()),  # noqa: E712
+        f"context rows={len(context_audit)}",
+    )
+    primary = list(feature_sets["base"])
+    add(
+        "primary feature list exact",
+        primary == list(BASE_NUMERIC_FEATURES),
+        f"count={len(primary)}",
+    )
+    forbidden = [
+        column
+        for column in primary
+        if column.startswith(FORBIDDEN_PRIMARY_FEATURE_PREFIXES)
+    ]
+    add(
+        "primary excludes task/camera metadata",
+        not forbidden,
+        f"forbidden={forbidden}",
+    )
+    add(
+        "shape feature list exact",
+        list(feature_sets["base_plus_shape"])
+        == [*BASE_NUMERIC_FEATURES, *SHAPE_FEATURES],
+        f"shape_count={len(feature_sets['base_plus_shape'])}",
+    )
+    shape_values = segments[list(SHAPE_FEATURES)].to_numpy(dtype=float)
+    add(
+        "shape features finite",
+        bool(np.isfinite(shape_values).all()),
+        f"rows={len(segments)}",
+    )
+    add(
+        "runner-up gap reconciles to base margin",
+        bool(
+            np.allclose(
+                segments["runner_up_gap"].to_numpy(dtype=float),
+                segments["margin_mean"].to_numpy(dtype=float),
+                atol=1e-12,
+            )
+        ),
+        "requested runner_up_gap is the existing mean p1-p2 definition",
+    )
+    probability_columns = [
+        f"candidate_rank_{rank}_mean_probability"
+        for rank in range(1, REPAIR_CANDIDATE_TOP_K + 1)
+    ]
+    candidate_probability = segments[probability_columns].to_numpy(dtype=float)
+    add(
+        "top-5 candidate probabilities valid and sorted",
+        bool(
+            np.isfinite(candidate_probability).all()
+            and (candidate_probability >= 0.0).all()
+            and (candidate_probability <= 1.0 + 1e-7).all()
+            and (np.diff(candidate_probability, axis=1) <= 1e-12).all()
+        ),
+        f"columns={probability_columns}",
+    )
+    candidate_ids = [
+        f"candidate_rank_{rank}_class_id"
+        for rank in range(1, REPAIR_CANDIDATE_TOP_K + 1)
+    ]
+    add(
+        "top-5 candidate IDs unique per segment",
+        bool(
+            np.asarray(
+                [
+                    len(set(row)) == REPAIR_CANDIDATE_TOP_K
+                    for row in segments[candidate_ids]
+                    .to_numpy(dtype=int)
+                    .tolist()
+                ],
+                dtype=bool,
+            ).all()
+        ),
+        f"rows={len(segments)}",
+    )
+    rank = segments["correct_label_probability_rank"].to_numpy(dtype=int)
+    add(
+        "correct-label top-5 flags reconcile",
+        bool(
+            (rank >= 1).all()
+            and (
+                segments["correct_label_in_top5"].astype(bool).to_numpy()
+                == (rank <= REPAIR_CANDIDATE_TOP_K)
+            ).all()
+        ),
+        "correct_label_in_top5 equals rank<=5",
     )
     add(
         "outer baseline cardinality",
         bool(
             (
                 baselines[
-                    (baselines.scope == "official_outer_test")
+                    (baselines.scope == "pooled_outer_test")
                     & (baselines["mode"] == "official")
                 ].iloc[0].n_cases
-                == metadata["outer_test_case_count"]
+                == sum(
+                    int(metadata["folds"][str(fold)]["outer_test_case_count"])
+                    for fold in OUTER_FOLDS
+                )
             )
         ),
-        f"expected={metadata['outer_test_case_count']}",
+        "pooled outer test must cover all official cases",
     )
     result = pd.DataFrame(checks)
     if not result["passed"].all():
         failed = result.loc[~result["passed"], "check"].tolist()
         raise AssertionError(f"Analysis validation failed: {failed}")
     return result
+
+
+def validated_feature_sets(
+    study_dir: Path,
+    metadata: Mapping[str, Any],
+    categorical: Sequence[str],
+) -> Dict[str, List[str]]:
+    config_path = Path(metadata["selector_config"])
+    if config_path != study_dir / "selector_config.json":
+        raise ValueError("Selector config path escaped the immutable study")
+    if file_sha256(config_path) != metadata["selector_config_sha256"]:
+        raise ValueError("Selector config hash changed after study generation")
+    config = load_json(config_path)
+    declared_base = config["variants"]["base"]["feature_columns"]
+    if declared_base != list(BASE_NUMERIC_FEATURES):
+        raise ValueError(
+            "Primary selector feature list must equal BASE_NUMERIC_FEATURES exactly"
+        )
+    forbidden = [
+        column
+        for column in declared_base
+        if column.startswith(FORBIDDEN_PRIMARY_FEATURE_PREFIXES)
+    ]
+    if forbidden:
+        raise ValueError(
+            f"Deployment-forbidden metadata entered the primary features: {forbidden}"
+        )
+    if any(name in config["variants"] for name in config["forbidden_variants"]):
+        raise ValueError("A rejected process-feature variant re-entered selector config")
+    declared_shape = config["variants"]["base_plus_shape"]
+    if declared_shape["base_feature_columns"] != list(BASE_NUMERIC_FEATURES):
+        raise ValueError("Shape variant must inherit the frozen base exactly")
+    if declared_shape["additional_feature_columns"] != list(SHAPE_FEATURES):
+        raise ValueError("Shape variant feature list differs from SHAPE_FEATURES")
+    feature_sets = variant_features(categorical)
+    if feature_sets["base"] != declared_base:
+        raise ValueError("Runtime primary features differ from immutable selector config")
+    if feature_sets["base_plus_shape"] != [
+        *BASE_NUMERIC_FEATURES,
+        *SHAPE_FEATURES,
+    ]:
+        raise ValueError("Runtime shape features differ from immutable selector config")
+    if set(feature_sets) != set(VARIANTS):
+        raise ValueError(f"Unexpected runtime variants: {sorted(feature_sets)}")
+    return feature_sets
+
+
+def validated_repair_corpus_schema(
+    study_dir: Path, metadata: Mapping[str, Any]
+) -> Dict[str, Any]:
+    schema_path = Path(metadata["repair_corpus_schema"])
+    if schema_path != study_dir / "repair_corpus_schema.json":
+        raise ValueError("Repair-corpus schema path escaped the immutable study")
+    if file_sha256(schema_path) != metadata["repair_corpus_schema_sha256"]:
+        raise ValueError("Repair-corpus schema hash changed after study generation")
+    schema = load_json(schema_path)
+    candidate = schema["candidate_pool"]
+    if int(candidate["top_k"]) != REPAIR_CANDIDATE_TOP_K:
+        raise ValueError("Repair candidate pool size differs from the locked top-k")
+    if candidate["fields_per_rank"] != list(REPAIR_CANDIDATE_FIELDS):
+        raise ValueError("Repair candidate field schema changed")
+    if candidate["columns"] != list(repair_candidate_columns()):
+        raise ValueError("Repair candidate columns differ from the locked schema")
+    if schema["primary_feature_columns"] != list(BASE_NUMERIC_FEATURES):
+        raise ValueError("Repair schema primary features differ from frozen base")
+    if schema["exploratory_shape_feature_columns"] != list(SHAPE_FEATURES):
+        raise ValueError("Repair schema shape features changed")
+    return schema
 
 
 def main() -> None:
@@ -1485,75 +1917,140 @@ def main() -> None:
     parser.add_argument("--modes", nargs="+", choices=list(MODES), default=list(MODES))
     args = parser.parse_args()
     study_dir = args.study_dir.resolve()
-    out_dir = (args.out_dir or (study_dir / "analysis" / "video_selector_v1")).resolve()
+    out_dir = (
+        args.out_dir or (study_dir / "analysis" / "video_selector_allfolds_v2")
+    ).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     metadata = load_json(study_dir / "study_metadata.json")
     if metadata.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError(f"Unsupported study protocol: {metadata.get('protocol_version')}")
-    diffact_root = Path(metadata["diffact_root"])
-    verify_source_digest(metadata, diffact_root)
+    verify_source_digest(metadata, Path(metadata["diffact_root"]))
     data_root = Path(metadata["data_root"])
-    task_payload = load_json(study_dir / "tasks.json")
-    tasks = task_payload["tasks"]
+    tasks = load_json(study_dir / "tasks.json")["tasks"]
     id_to_name, name_to_id = parse_mapping(data_root / DATASET / "mapping.txt")
 
-    print("[1/5] Discovering route-conditioned train-only process models", flush=True)
-    contexts, process_rows = build_feature_contexts(
-        study_dir, metadata, data_root, name_to_id, out_dir
-    )
-    process_audit = pd.DataFrame(process_rows)
-    process_audit.to_csv(out_dir / "process_model_audit.csv", index=False)
+    all_cases: List[CaseData] = []
+    segment_frames: List[pd.DataFrame] = []
+    case_frames: List[pd.DataFrame] = []
+    context_rows: List[Dict[str, Any]] = []
+    categorical_columns: set[str] = set()
+    next_segment_id = 0
+    print("[1/5] Building train-only contexts and four-fold segment features", flush=True)
+    for outer_fold in OUTER_FOLDS:
+        fold_metadata = metadata["folds"][str(outer_fold)]
+        fold_tasks = [
+            task for task in tasks if int(task["outer_fold"]) == outer_fold
+        ]
+        contexts, fold_context_rows = build_feature_contexts(
+            study_dir,
+            fold_metadata,
+            data_root,
+            name_to_id,
+            out_dir / f"outer_fold_{outer_fold}",
+        )
+        for row in fold_context_rows:
+            row["outer_fold"] = outer_fold
+        context_rows.extend(fold_context_rows)
+        fold_cases, fold_segments, fold_inventory, categorical = build_segment_rows(
+            study_dir,
+            fold_metadata,
+            fold_tasks,
+            args.modes,
+            data_root,
+            id_to_name,
+            name_to_id,
+            contexts,
+            outer_fold=outer_fold,
+            segment_id_start=next_segment_id,
+        )
+        next_segment_id = int(fold_segments["segment_id"].max()) + 1
+        all_cases.extend(fold_cases)
+        segment_frames.append(fold_segments)
+        case_frames.append(fold_inventory)
+        categorical_columns.update(categorical)
 
-    print("[2/5] Building OOF and official outer-test segment features", flush=True)
-    cases, segments, case_inventory, categorical = build_segment_rows(
-        study_dir,
-        metadata,
-        tasks,
-        args.modes,
-        data_root,
-        id_to_name,
-        name_to_id,
-        contexts,
+    segments = pd.concat(segment_frames, ignore_index=True, sort=False).fillna(0.0)
+    case_inventory = pd.concat(case_frames, ignore_index=True, sort=False)
+    context_audit = pd.DataFrame(context_rows)
+    context_audit.to_csv(out_dir / "feature_context_audit.csv", index=False)
+    feature_sets = validated_feature_sets(
+        study_dir, metadata, sorted(categorical_columns)
     )
-    feature_sets = variant_features(categorical)
+    repair_schema = validated_repair_corpus_schema(study_dir, metadata)
     segments.to_csv(out_dir / "segment_features_unscored.csv", index=False)
     case_inventory.to_csv(out_dir / "case_inventory.csv", index=False)
 
-    print("[3/5] Cross-fitting fixed selectors and scoring untouched outer fold 1", flush=True)
+    print("[2/5] Cross-fitting deployment-safe selectors independently per fold", flush=True)
     scored, model_audit = fit_selector_scores(segments, feature_sets, out_dir)
     scored.to_csv(out_dir / "segment_scores.csv", index=False)
     model_audit.to_csv(out_dir / "selector_model_audit.csv", index=False)
 
-    print("[4/5] Evaluating complete-span selections at matched frame budgets", flush=True)
+    print("[3/5] Evaluating per-fold and pooled matched frame budgets", flush=True)
     baselines, budget_metrics, discrimination = evaluate_selectors(
-        cases, scored, list(VARIANT_PROCESS_KIND)
+        all_cases, scored, list(VARIANTS)
     )
     baselines.to_csv(out_dir / "baseline_metrics.csv", index=False)
     budget_metrics.to_csv(out_dir / "selector_budget_metrics.csv", index=False)
     discrimination.to_csv(out_dir / "selector_discrimination.csv", index=False)
-    decisions = make_pilot_decision(budget_metrics)
-    atomic_write_json(out_dir / "pilot_decision.json", decisions)
+    decision = make_scale_decision(budget_metrics, metadata)
+    atomic_write_json(out_dir / "scale_decision.json", decision)
+    shape_decision = make_shape_decision(budget_metrics, metadata)
+    atomic_write_json(out_dir / "shape_variant_decision.json", shape_decision)
+
+    print("[4/5] Writing the repair-head OOF training corpus", flush=True)
+    repair_corpus = scored[
+        (scored["scope"] == "oof_validation")
+        & (scored["mode"] == "official")
+    ].copy()
+    expected_case_records = int(
+        metadata["repair_corpus_contract"]["expected_case_records"]
+    )
+    observed_case_records = repair_corpus[
+        ["outer_fold", "case_id"]
+    ].drop_duplicates().shape[0]
+    if observed_case_records != expected_case_records:
+        raise ValueError(
+            f"Repair corpus case coverage {observed_case_records}, "
+            f"expected {expected_case_records}"
+        )
+    required_repair_columns = {
+        "correct_label",
+        "correct_label_name",
+        "correct_label_probability_rank",
+        "correct_label_in_top5",
+        "correct_label_fraction",
+        "error_fraction",
+        "base_score",
+        *repair_candidate_columns(),
+    }
+    if not required_repair_columns.issubset(repair_corpus.columns):
+        raise ValueError("Repair corpus lacks correct-label or selector-score columns")
+    repair_corpus.to_csv(out_dir / "repair_training_corpus_segments.csv", index=False)
 
     print("[5/5] Validating and writing the decision readout", flush=True)
     checks = validate_outputs(
         metadata,
-        cases,
+        all_cases,
         scored,
         model_audit,
         baselines,
         budget_metrics,
-        process_audit,
+        context_audit,
+        feature_sets,
     )
     checks.to_csv(out_dir / "validation_checks.csv", index=False)
-    write_findings(out_dir, baselines, budget_metrics, decisions)
+    write_findings(
+        out_dir, baselines, budget_metrics, decision, shape_decision
+    )
+    completed_utc = datetime.now(timezone.utc).isoformat()
     run_metadata = {
         "protocol_version": PROTOCOL_VERSION,
-        "completed_utc": datetime.now(timezone.utc).isoformat(),
+        "completed_utc": completed_utc,
         "study_dir": str(study_dir),
         "out_dir": str(out_dir),
         "source_digest": metadata["source_provenance"]["source_digest"],
         "modes": args.modes,
-        "variants": VARIANT_PROCESS_KIND,
+        "variants": list(VARIANTS),
         "frame_budgets": FRAME_BUDGETS,
         "long_substitution_definition": {
             "minimum_contiguous_error_length": LONG_MIN_LEN,
@@ -1562,10 +2059,29 @@ def main() -> None:
         "selector_hyperparameters": selector_model().get_params(),
         "feature_sets": feature_sets,
         "primary_mode": "official",
+        "primary_variant": "base",
+        "exploratory_shape_variant": "base_plus_shape",
+        "shape_variant_retain": shape_decision["retain_shape_features"],
         "oracle_outputs_are_diagnostic_only": True,
+        "repair_corpus_case_records": observed_case_records,
+        "repair_corpus_schema_sha256": metadata[
+            "repair_corpus_schema_sha256"
+        ],
+        "repair_candidate_columns": repair_schema["candidate_pool"]["columns"],
         "validation_passed": True,
     }
     atomic_write_json(out_dir / "run_metadata.json", run_metadata)
+    atomic_write_json(
+        out_dir / "analysis_complete.json",
+        {
+            "completed": True,
+            "completed_utc": completed_utc,
+            "green_light_repair_head": decision["green_light_repair_head"],
+            "retain_shape_features": shape_decision["retain_shape_features"],
+            "repair_corpus_case_records": observed_case_records,
+            "source_digest": metadata["source_provenance"]["source_digest"],
+        },
+    )
     print(f"Analysis complete: {out_dir}")
     print((out_dir / "findings.md").read_text(encoding="utf-8"), flush=True)
 

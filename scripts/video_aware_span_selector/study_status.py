@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Print a compact progress summary for the Breakfast selector OOF study."""
+"""Print a compact progress summary for the four-fold Breakfast selector study."""
 
 from __future__ import annotations
 
@@ -24,6 +24,18 @@ def latest_training_epoch(task: Dict[str, Any]) -> int | None:
 
 
 def task_snapshot(task: Dict[str, Any]) -> Dict[str, Any]:
+    if task.get("execution_mode") == "imported":
+        import_path = Path(task["import_manifest_path"])
+        return {
+            "task_id": task["task_id"],
+            "gpu": task["gpu"],
+            "outer_fold": task["outer_fold"],
+            "inner_fold": task["inner_fold"],
+            "execution_mode": "imported",
+            "status": "imported" if import_path.is_file() else "missing_import",
+            "epoch": 1000 if import_path.is_file() else None,
+            "exported_cases": task["heldout_summary"]["case_count"],
+        }
     run_dir = Path(task["run_dir"])
     complete_path = run_dir / "task_complete.json"
     status_path = run_dir / "task_status.json"
@@ -32,7 +44,9 @@ def task_snapshot(task: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "task_id": task["task_id"],
             "gpu": task["gpu"],
+            "outer_fold": task["outer_fold"],
             "inner_fold": task["inner_fold"],
+            "execution_mode": "train",
             "status": "complete",
             "epoch": 1000,
             "exported_cases": payload.get("export", {}).get("case_count"),
@@ -46,7 +60,9 @@ def task_snapshot(task: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "task_id": task["task_id"],
         "gpu": task["gpu"],
+        "outer_fold": task["outer_fold"],
         "inner_fold": task["inner_fold"],
+        "execution_mode": "train",
         "status": payload.get("status", "not_started"),
         "stage": payload.get("stage"),
         "epoch": latest_training_epoch(task),
@@ -61,7 +77,7 @@ def main() -> None:
     study_dir = args.study_dir.resolve()
     tasks = load_json(study_dir / "tasks.json")["tasks"]
     snapshots = [task_snapshot(task) for task in tasks]
-    print(f"Breakfast video-selector OOF study: {study_dir}")
+    print(f"Breakfast four-fold video-selector study: {study_dir}")
     for item in snapshots:
         epoch = "-" if item.get("epoch") is None else str(item["epoch"])
         stage = f"/{item['stage']}" if item.get("stage") else ""
@@ -69,7 +85,8 @@ def main() -> None:
             f" cases={item['exported_cases']}" if item.get("exported_cases") is not None else ""
         )
         print(
-            f"inner={item['inner_fold']} gpu={item['gpu']} "
+            f"outer={item['outer_fold']} inner={item['inner_fold']} "
+            f"mode={item['execution_mode']} gpu={item['gpu']} "
             f"status={item['status']}{stage} epoch={epoch}/1000{cases}"
         )
         if item.get("error"):
@@ -89,4 +106,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

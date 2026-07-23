@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared, provenance-aware helpers for the video-aware selector pilot."""
+"""Shared, provenance-aware helpers for the four-fold selector scale-up."""
 
 from __future__ import annotations
 
@@ -26,16 +26,50 @@ DEFAULT_DIFFACT_ROOT = Path(
 )
 DEFAULT_STUDY_DIR = Path(
     "/data1/eli-bogdanov/sktr_runs/"
+    "breakfast_video_selector_oof_allfolds_seed0_v2"
+)
+DEFAULT_V1_STUDY_DIR = Path(
+    "/data1/eli-bogdanov/sktr_runs/"
     "breakfast_video_selector_oof_outer1_seed0_v1"
+)
+DEFAULT_OUTER_EXPORT_ROOT = Path(
+    "/data1/eli-bogdanov/sktr_runs/breakfast_diffact_raw_exports_v1"
 )
 
 DATASET = "breakfast"
-OUTER_FOLD = 1
+OUTER_FOLDS = (1, 2, 3, 4)
 INNER_FOLDS = 3
 SEED = 0
 FINAL_EPOCH = 1000
-PROTOCOL_VERSION = "breakfast-video-aware-selector-oof-v1"
+PROTOCOL_VERSION = "breakfast-video-aware-selector-allfolds-v2"
 FRAME_BUDGETS = (0.005, 0.01, 0.02, 0.05, 0.10)
+BASE_NUMERIC_FEATURES = (
+    "uncertainty_mean",
+    "uncertainty_q90",
+    "entropy_mean",
+    "top1_uncertainty_mean",
+    "margin_mean",
+    "pred_probability_mean",
+    "official_override_gap_mean",
+    "duration_raw_abs_z",
+    "duration_norm_abs_z",
+    "segment_log_length",
+    "segment_fraction",
+    "video_progress_mid",
+    "class_frame_rarity",
+    "class_segment_rarity",
+    "neighbor_class_rarity",
+)
+SHAPE_FEATURES = (
+    "confidence_slope",
+    "edge_vs_core_margin",
+    "flicker_rate",
+    "runner_up_gap",
+    "runner_up_consistency",
+)
+REPAIR_CANDIDATE_TOP_K = 5
+REPAIR_CANDIDATE_FIELDS = ("class_id", "label", "mean_probability")
+FORBIDDEN_PRIMARY_FEATURE_PREFIXES = ("task__", "camera__")
 
 PROVENANCE_FILES = (
     "scripts/video_aware_span_selector/README.md",
@@ -67,6 +101,14 @@ class CaseInfo:
 def normalize_case_id(value: str) -> str:
     text = str(value).strip()
     return text[:-4] if text.endswith(".txt") else text
+
+
+def repair_candidate_columns() -> Tuple[str, ...]:
+    return tuple(
+        f"candidate_rank_{rank}_{field}"
+        for rank in range(1, REPAIR_CANDIDATE_TOP_K + 1)
+        for field in REPAIR_CANDIDATE_FIELDS
+    )
 
 
 def read_lines(path: Path) -> List[str]:
@@ -192,7 +234,7 @@ def load_case_infos(data_root: Path, cases: Sequence[str]) -> List[CaseInfo]:
     return infos
 
 
-def official_splits(data_root: Path, outer_fold: int = OUTER_FOLD) -> Tuple[List[str], List[str]]:
+def official_splits(data_root: Path, outer_fold: int) -> Tuple[List[str], List[str]]:
     split_dir = data_root / DATASET / "splits"
     train = read_bundle(split_dir / f"train.split{outer_fold}.bundle")
     test = read_bundle(split_dir / f"test.split{outer_fold}.bundle")
