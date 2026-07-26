@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Aggregate replication v2, quantify cross-seed noise, and apply its locked rule."""
+"""Aggregate the multi-fold confirmation and apply its pre-registered rule."""
 
 from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 import pandas as pd
 
 from common import (
     BASELINE_BOUNDARY_WEIGHT,
     FINAL_EPOCH,
+    FOLDS,
     PRIMARY_BOUNDARY_WEIGHT,
     atomic_write_json,
     export_dir,
@@ -59,6 +60,7 @@ def write_csv(path: Path, rows: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def summarize_inference_seeds(metrics: pd.DataFrame) -> pd.DataFrame:
     groups = [
+        "official_fold",
         "task_id",
         "decoder_boundary_loss",
         "role",
@@ -72,13 +74,38 @@ def summarize_inference_seeds(metrics: pd.DataFrame) -> pd.DataFrame:
         row = dict(zip(groups, keys))
         row["n_inference_seeds"] = int(len(group))
         for metric in METRICS:
-            values = pd.to_numeric(group[metric], errors="coerce")
+            values = pd.to_numeric(group[metric], errors="raise")
             row[f"{metric}_mean"] = float(values.mean())
             row[f"{metric}_std"] = float(values.std(ddof=0))
             row[f"{metric}_min"] = float(values.min())
             row[f"{metric}_max"] = float(values.max())
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def six_checks(means: Mapping[str, float]) -> Dict[str, bool]:
+    return {
+        "boundary_f1_class_agnostic@10_improves": (
+            means["delta_boundary_f1_class_agnostic@10"] > 0
+        ),
+        "edit_improves": means["delta_edit"] > 0,
+        "f1@25_improves": means["delta_f1@25"] > 0,
+        "accuracy_non_negative": means["delta_acc"] >= 0,
+        "segment_count_ratio_not_inflated": (
+            means["delta_segment_count_ratio"] <= 0.02
+        ),
+        "mean_absolute_boundary_offset_decreases": (
+            means["delta_boundary_offset_class_agnostic_mean_absolute"] < 0
+        ),
+    }
+
+
+def mean_deltas(frame: pd.DataFrame) -> Dict[str, float]:
+    return {
+        column: float(pd.to_numeric(frame[column], errors="raise").mean())
+        for column in frame.columns
+        if column.startswith("delta_")
+    }
 
 
 def main() -> None:
@@ -94,29 +121,44 @@ def main() -> None:
         if validate_completed_task(task, metadata) is None:
             raise RuntimeError(f"Cannot analyze incomplete task: {task['task_id']}")
 
-    case_ids = read_bundle(Path(tasks[0]["test_manifest"]))
     data_root = Path(metadata["data_root"])
+    case_ids_by_fold = {
+        int(fold): read_bundle(
+            Path(
+                next(
+                    task["test_manifest"]
+                    for task in tasks
+                    if int(task["official_fold"]) == int(fold)
+                )
+            )
+        )
+        for fold in metadata["official_folds"]
+    }
     metric_rows: List[Dict[str, Any]] = []
     per_case_rows: List[Dict[str, Any]] = []
     boundary_rows: List[Dict[str, Any]] = []
     predictions: Dict[Tuple[str, int, int, str], Dict[str, Any]] = {}
-    ground_truth: Dict[str, Any] | None = None
+    ground_truth_by_fold: Dict[int, Dict[str, Any]] = {}
     for task in tasks:
+        fold = int(task["official_fold"])
+        case_ids = case_ids_by_fold[fold]
         for epoch in task["checkpoint_epochs"]:
             for inference_seed in task["inference_seeds"]:
                 output_dir = export_dir(task, int(epoch), int(inference_seed))
                 verify_export(output_dir, case_ids)
-                summaries, case_metrics, matches, streams, current_ground_truth = (
-                    evaluate_export(
-                        data_root=data_root,
-                        case_ids=case_ids,
-                        output_dir=output_dir,
-                    )
+                summaries, case_metrics, matches, streams, ground_truth = evaluate_export(
+                    data_root=data_root,
+                    case_ids=case_ids,
+                    output_dir=output_dir,
                 )
-                if ground_truth is None:
-                    ground_truth = current_ground_truth
+                if fold in ground_truth_by_fold:
+                    if set(ground_truth_by_fold[fold]) != set(ground_truth):
+                        raise ValueError(f"Ground-truth cases changed within fold {fold}")
+                else:
+                    ground_truth_by_fold[fold] = ground_truth
                 for stream, summary in summaries.items():
                     prefix = {
+                        "official_fold": fold,
                         "task_id": task["task_id"],
                         "decoder_boundary_loss": task["decoder_boundary_loss"],
                         "role": task["role"],
@@ -136,6 +178,7 @@ def main() -> None:
                 for row in case_metrics:
                     row.update(
                         {
+                            "official_fold": fold,
                             "task_id": task["task_id"],
                             "decoder_boundary_loss": task["decoder_boundary_loss"],
                             "role": task["role"],
@@ -149,6 +192,7 @@ def main() -> None:
                 for row in matches:
                     row.update(
                         {
+                            "official_fold": fold,
                             "task_id": task["task_id"],
                             "decoder_boundary_loss": task["decoder_boundary_loss"],
                             "role": task["role"],
@@ -159,7 +203,6 @@ def main() -> None:
                         }
                     )
                     boundary_rows.append(row)
-    assert ground_truth is not None
 
     analysis_dir = study_dir / "analysis"
     metrics_frame = write_csv(analysis_dir / "fold_metrics.csv", metric_rows)
@@ -169,8 +212,12 @@ def main() -> None:
     summary_frame.to_csv(analysis_dir / "sampling_seed_summary.csv", index=False)
     summary_frame.to_csv(analysis_dir / "checkpoint_curves.csv", index=False)
 
-    task_by_seed_weight = {
-        (int(task["training_seed"]), float(task["decoder_boundary_loss"])): task
+    task_by_fold_seed_weight = {
+        (
+            int(task["official_fold"]),
+            int(task["training_seed"]),
+            float(task["decoder_boundary_loss"]),
+        ): task
         for task in tasks
     }
     metric_index = {
@@ -186,11 +233,16 @@ def main() -> None:
     paired_rows: List[Dict[str, Any]] = []
     ledger_rows: List[Dict[str, Any]] = []
     for task in tasks:
+        fold = int(task["official_fold"])
         weight = float(task["decoder_boundary_loss"])
         seed = int(task["training_seed"])
         if weight == BASELINE_BOUNDARY_WEIGHT:
             continue
-        baseline = task_by_seed_weight[(seed, BASELINE_BOUNDARY_WEIGHT)]
+        baseline = task_by_fold_seed_weight.get(
+            (fold, seed, BASELINE_BOUNDARY_WEIGHT)
+        )
+        if baseline is None:
+            continue
         for epoch in task["checkpoint_epochs"]:
             for inference_seed in task["inference_seeds"]:
                 for stream in ("pre_purge", "post_purge"):
@@ -209,6 +261,7 @@ def main() -> None:
                     base_row = metric_index[base_key]
                     variant_row = metric_index[variant_key]
                     paired = {
+                        "official_fold": fold,
                         "task_id": task["task_id"],
                         "baseline_task_id": baseline["task_id"],
                         "decoder_boundary_loss": weight,
@@ -224,7 +277,7 @@ def main() -> None:
                             float(variant_row[metric]) - float(base_row[metric])
                         )
                     ledger = fixed_broke_ledger(
-                        ground_truth,
+                        ground_truth_by_fold[fold],
                         predictions[base_key],
                         predictions[variant_key],
                     )
@@ -246,6 +299,7 @@ def main() -> None:
                             )
                             or key
                             in {
+                                "official_fold",
                                 "task_id",
                                 "baseline_task_id",
                                 "decoder_boundary_loss",
@@ -263,9 +317,17 @@ def main() -> None:
     write_csv(analysis_dir / "fixed_broke_ledger.csv", ledger_rows)
 
     cross_seed_rows: List[Dict[str, Any]] = []
-    for weight in metadata["boundary_weights"]:
-        seed0 = task_by_seed_weight[(0, float(weight))]
-        seed1 = task_by_seed_weight[(1, float(weight))]
+    fold_weight_pairs = sorted(
+        {
+            (fold, weight)
+            for fold, seed, weight in task_by_fold_seed_weight
+            if (fold, 0, weight) in task_by_fold_seed_weight
+            and (fold, 1, weight) in task_by_fold_seed_weight
+        }
+    )
+    for fold, weight in fold_weight_pairs:
+        seed0 = task_by_fold_seed_weight[(fold, 0, weight)]
+        seed1 = task_by_fold_seed_weight[(fold, 1, weight)]
         for epoch in seed0["checkpoint_epochs"]:
             for inference_seed in seed0["inference_seeds"]:
                 for stream in ("pre_purge", "post_purge"):
@@ -273,7 +335,8 @@ def main() -> None:
                     key1 = (seed1["task_id"], int(epoch), int(inference_seed), stream)
                     row0, row1 = metric_index[key0], metric_index[key1]
                     noise = {
-                        "decoder_boundary_loss": float(weight),
+                        "official_fold": fold,
+                        "decoder_boundary_loss": weight,
                         "seed0_task_id": seed0["task_id"],
                         "seed1_task_id": seed1["task_id"],
                         "checkpoint_epoch": int(epoch),
@@ -286,7 +349,7 @@ def main() -> None:
                         noise[f"absolute_delta_{metric}"] = abs(delta)
                     noise.update(
                         fixed_broke_ledger(
-                            ground_truth,
+                            ground_truth_by_fold[fold],
                             predictions[key0],
                             predictions[key1],
                         )
@@ -296,6 +359,7 @@ def main() -> None:
         analysis_dir / "cross_seed_noise.csv", cross_seed_rows
     )
     noise_group = [
+        "official_fold",
         "decoder_boundary_loss",
         "checkpoint_epoch",
         "stream",
@@ -324,80 +388,119 @@ def main() -> None:
         & (paired_frame["checkpoint_epoch"] == FINAL_EPOCH)
         & (paired_frame["stream"] == "post_purge")
     ]
-    expected_primary_rows = (
-        len(metadata["training_seeds"]) * len(metadata["inference_seeds"])
+    expected_per_fold = len(metadata["training_seeds"]) * len(
+        metadata["inference_seeds"]
     )
-    if len(primary_rows) != expected_primary_rows:
+    expected_total = len(metadata["official_folds"]) * expected_per_fold
+    if len(primary_rows) != expected_total:
         raise ValueError(
-            f"Primary expected {expected_primary_rows} seed pairs; found {len(primary_rows)}"
+            f"Primary expected {expected_total} paired rows; found {len(primary_rows)}"
         )
-    if set(primary_rows["training_seed"]) != set(metadata["training_seeds"]):
-        raise ValueError("Primary aggregation is missing a declared training seed")
-    means = {
-        column: float(pd.to_numeric(primary_rows[column], errors="raise").mean())
-        for column in primary_rows.columns
-        if column.startswith("delta_")
+
+    per_fold_decisions: Dict[str, Any] = {}
+    for fold in FOLDS:
+        fold_rows = primary_rows[primary_rows["official_fold"] == fold]
+        if len(fold_rows) != expected_per_fold:
+            raise ValueError(
+                f"Fold {fold} expected {expected_per_fold} primary rows; "
+                f"found {len(fold_rows)}"
+            )
+        means = mean_deltas(fold_rows)
+        checks = six_checks(means)
+        per_fold_decisions[str(fold)] = {
+            "n_paired_rows": len(fold_rows),
+            "mean_deltas": means,
+            "checks": checks,
+            "six_check_gate_passes": all(checks.values()),
+        }
+
+    pooled_means = mean_deltas(primary_rows)
+    pooled_checks = six_checks(pooled_means)
+    positive_edit_folds = sum(
+        decision["mean_deltas"]["delta_edit"] > 0
+        for decision in per_fold_decisions.values()
+    )
+    positive_f1_folds = sum(
+        decision["mean_deltas"]["delta_f1@25"] > 0
+        for decision in per_fold_decisions.values()
+    )
+    sign_consistency = {
+        "positive_delta_edit_folds": positive_edit_folds,
+        "positive_delta_f1@25_folds": positive_f1_folds,
+        "required_positive_folds": 3,
+        "edit_sign_consistent": positive_edit_folds >= 3,
+        "f1@25_sign_consistent": positive_f1_folds >= 3,
     }
-    checks = {
-        "boundary_f1_class_agnostic@10_improves": (
-            means["delta_boundary_f1_class_agnostic@10"] > 0
-        ),
-        "edit_improves": means["delta_edit"] > 0,
-        "f1@25_improves": means["delta_f1@25"] > 0,
-        "accuracy_non_negative": means["delta_acc"] >= 0,
-        "segment_count_ratio_not_inflated": (
-            means["delta_segment_count_ratio"] <= 0.02
-        ),
-        "mean_absolute_boundary_offset_decreases": (
-            means["delta_boundary_offset_class_agnostic_mean_absolute"] < 0
-        ),
-    }
+    primary_claim = (
+        all(pooled_checks.values())
+        and sign_consistency["edit_sign_consistent"]
+        and sign_consistency["f1@25_sign_consistent"]
+    )
     completed_utc = datetime.now(timezone.utc).isoformat()
     decision = {
         "completed_utc": completed_utc,
-        "advance_to_class_specific_onset_head": all(checks.values()),
+        "primary_claim_supported": primary_claim,
+        "onset_head_launch_gate_passes": primary_claim,
         "pre_registered_primary_boundary_weight": PRIMARY_BOUNDARY_WEIGHT,
         "baseline_boundary_weight": BASELINE_BOUNDARY_WEIGHT,
         "checkpoint_epoch": FINAL_EPOCH,
         "stream": "post_purge",
-        "aggregation": "mean_over_2_training_seeds_x_3_inference_seeds",
-        "training_seeds": sorted(int(value) for value in primary_rows["training_seed"].unique()),
+        "aggregation": (
+            "equal_weight_mean_over_4_folds_x_2_training_seeds_x_3_inference_seeds"
+        ),
         "n_paired_rows": len(primary_rows),
-        "mean_deltas": means,
-        "checks": checks,
-        "cross_seed_noise": str(analysis_dir / "cross_seed_noise.csv"),
+        "per_fold": per_fold_decisions,
+        "pooled_mean_deltas": pooled_means,
+        "pooled_checks": pooled_checks,
+        "sign_consistency": sign_consistency,
         "source_digest": metadata["source_provenance"]["source_digest"],
     }
     atomic_write_json(analysis_dir / "decision.json", decision)
-    decision_word = "GO" if decision["advance_to_class_specific_onset_head"] else "NO-GO"
+    decision_word = "GO" if primary_claim else "NO-GO"
     findings = [
-        "# GTEA boundary-weight replication v2",
+        "# GTEA multi-fold boundary-weight confirmation",
         "",
-        f"**{decision_word}** under the pre-registered replication rule.",
+        f"**{decision_word}** under the pre-registered multi-fold rule.",
         "",
-        "The primary comparison is weight 1.0 versus the paired 0.1 baseline at epoch "
-        "10000, official purge-3 output, averaged over both training seeds and all three "
-        "inference seeds.",
+        "The primary comparison is weight 1.0 versus paired 0.1 at epoch 10000, "
+        "official purge-3 output, pooled equally over four folds, two training seeds, "
+        "and three inference seeds.",
         "",
-        "V2 deliberately uses mean absolute boundary offset because the v1 median check "
-        "was tie-degenerate at zero.",
+        "The primary claim requires all six pooled checks plus positive Edit and "
+        "F1@25 deltas in at least three of four folds.",
         "",
-        "## Gate checks",
+        "## Pooled checks",
         "",
     ]
     findings.extend(
-        f"- {'PASS' if passed else 'FAIL'}: {name}" for name, passed in checks.items()
+        f"- {'PASS' if passed else 'FAIL'}: {name}"
+        for name, passed in pooled_checks.items()
     )
     findings.extend(
         [
             "",
-            "Weights 0.75 and 1.5 are exploratory. Seed-0 weight 0.5 is imported only "
-            "to preserve the dose-response curve.",
-            "See `cross_seed_noise.csv` for the replication noise floor.",
+            "## Sign consistency",
+            "",
+            f"- Positive Edit folds: {positive_edit_folds}/4 (need at least 3).",
+            f"- Positive F1@25 folds: {positive_f1_folds}/4 (need at least 3).",
+            "",
+            "## Per-fold gates",
             "",
         ]
     )
-    (analysis_dir / "FINDINGS.md").write_text("\n".join(findings), encoding="utf-8")
+    for fold, fold_decision in per_fold_decisions.items():
+        word = "PASS" if fold_decision["six_check_gate_passes"] else "FAIL"
+        findings.append(f"- Fold {fold}: {word} on all six checks.")
+    findings.extend(
+        [
+            "",
+            "Task 2 remains launch-gated by this decision and independent review.",
+            "",
+        ]
+    )
+    (analysis_dir / "FINDINGS.md").write_text(
+        "\n".join(findings), encoding="utf-8"
+    )
     atomic_write_json(
         analysis_dir / "analysis_complete.json",
         {
@@ -412,7 +515,7 @@ def main() -> None:
             "source_digest": metadata["source_provenance"]["source_digest"],
         },
     )
-    print(f"{decision_word}: replication analysis written to {analysis_dir}", flush=True)
+    print(f"{decision_word}: multi-fold analysis written to {analysis_dir}", flush=True)
 
 
 if __name__ == "__main__":

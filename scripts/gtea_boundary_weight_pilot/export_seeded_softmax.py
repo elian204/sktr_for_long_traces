@@ -13,7 +13,6 @@ from typing import Any, Tuple
 
 from common import (
     INFERENCE_SEED_STRIDE,
-    PHYSICAL_GPU,
     atomic_write_json,
     assert_variant_config,
     checkpoint_path,
@@ -74,9 +73,10 @@ def main() -> None:
     diffact_root = Path(metadata["diffact_root"])
     verify_source_digest(metadata, diffact_root)
     task = load_task(study_dir, args.task_id)
-    if args.device != PHYSICAL_GPU or args.device != int(task["physical_gpu"]):
+    physical_gpu = int(task["physical_gpu"])
+    if args.device != physical_gpu:
         raise ValueError(
-            f"Pilot is pinned to physical GPU {PHYSICAL_GPU}; got --device {args.device}"
+            f"Task is pinned to physical GPU {physical_gpu}; got --device {args.device}"
         )
     if args.checkpoint_epoch not in [int(value) for value in task["checkpoint_epochs"]]:
         raise ValueError(f"Checkpoint is outside the immutable grid: {args.checkpoint_epoch}")
@@ -100,7 +100,7 @@ def main() -> None:
             "checkpoint_epoch": args.checkpoint_epoch,
             "checkpoint_sha256": checkpoint_sha256,
             "inference_seed": args.inference_seed,
-            "physical_gpu": PHYSICAL_GPU,
+            "physical_gpu": physical_gpu,
         }
         mismatches = {
             key: {"expected": value, "actual": complete.get(key)}
@@ -129,7 +129,9 @@ def main() -> None:
     from utils import load_config_file
 
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is unavailable after pinning physical GPU 3")
+        raise RuntimeError(
+            f"CUDA is unavailable after pinning physical GPU {physical_gpu}"
+        )
     device = torch.device("cuda")
     params = load_config_file(str(Path(task["config_path"])))
     root_data_dir = Path(params["root_data_dir"])
@@ -204,7 +206,7 @@ def main() -> None:
         "model_seed_formula": (
             f"{args.inference_seed} * {INFERENCE_SEED_STRIDE} + video_index"
         ),
-        "physical_gpu": PHYSICAL_GPU,
+        "physical_gpu": physical_gpu,
         "config": task["config_path"],
         "source_digest": metadata["source_provenance"]["source_digest"],
         "case_count": summary["case_count"],
@@ -223,4 +225,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

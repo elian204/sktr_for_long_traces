@@ -13,12 +13,13 @@ from common import (
     CHECKPOINT_EPOCHS,
     DEFAULT_DATA_ROOT,
     DEFAULT_DIFFACT_ROOT,
+    DEFAULT_FOLD1_STUDY_DIR,
+    DEFAULT_LOCKED_MANIFEST_ROOT,
     DEFAULT_LOCKED_REFERENCE_CONFIG,
-    DEFAULT_LOCKED_REFERENCE_TRAIN_BUNDLE,
-    DEFAULT_LOCKED_REFERENCE_TRAIN_MANIFEST,
-    DEFAULT_V1_STUDY_DIR,
+    FOLDS,
+    GPU_IDS,
     INFERENCE_SEEDS,
-    PHYSICAL_GPU,
+    NEW_TRAINING_FOLDS,
     PRIMARY_BOUNDARY_WEIGHT,
     TRAINING_SEEDS,
     build_variant_config,
@@ -58,6 +59,7 @@ def test_variants_share_training_invariant_and_change_only_boundary_weight(tmp_p
                 view_root=tmp_path / "view",
                 train_manifest=tmp_path / "train.txt",
                 test_manifest=tmp_path / "test.txt",
+                fold=2,
                 weight=weight,
                 training_seed=training_seed,
             )
@@ -75,6 +77,7 @@ def test_variants_share_training_invariant_and_change_only_boundary_weight(tmp_p
         value["pre_specified_final_checkpoint"] = "<variant>"
         value["gtea_boundary_weight_variant"] = "<experimental>"
         value["gtea_boundary_weight_training_seed"] = "<experimental>"
+        value["gtea_boundary_weight_official_fold"] = "<experimental>"
         value["random_seed"] = "<experimental>"
         value["initialization_seed"] = "<experimental>"
         value["loss_weights"]["decoder_boundary_loss"] = "<experimental>"
@@ -133,70 +136,81 @@ def test_perfect_actual_gtea_prediction_has_perfect_metrics_and_zero_offsets():
     assert matches
 
 
-def test_generated_study_is_non_launched_serial_and_gpu3_fail_closed(tmp_path: Path):
+def test_generated_study_is_non_launched_multifold_and_waiters_fail_closed(
+    tmp_path: Path,
+):
     study_dir = tmp_path / "study"
     args = argparse.Namespace(
         study_dir=study_dir,
         data_root=DEFAULT_DATA_ROOT,
         diffact_root=DEFAULT_DIFFACT_ROOT,
-        v1_study_dir=DEFAULT_V1_STUDY_DIR,
+        fold1_study_dir=DEFAULT_FOLD1_STUDY_DIR,
         locked_reference_config=DEFAULT_LOCKED_REFERENCE_CONFIG,
-        locked_reference_train_manifest=DEFAULT_LOCKED_REFERENCE_TRAIN_MANIFEST,
-        locked_reference_train_bundle=DEFAULT_LOCKED_REFERENCE_TRAIN_BUNDLE,
+        locked_manifest_root=DEFAULT_LOCKED_MANIFEST_ROOT,
     )
     build_study(args)
     metadata = json.loads((study_dir / "study_metadata.json").read_text())
     tasks = json.loads((study_dir / "tasks.json").read_text())["tasks"]
     assert metadata["pre_registered_primary_boundary_weight"] == PRIMARY_BOUNDARY_WEIGHT
-    assert metadata["physical_gpu"] == PHYSICAL_GPU == 3
+    assert metadata["official_folds"] == list(FOLDS)
+    assert metadata["new_training_folds"] == list(NEW_TRAINING_FOLDS)
     assert metadata["checkpoint_epochs"] == list(CHECKPOINT_EPOCHS)
     assert metadata["inference_seeds"] == list(INFERENCE_SEEDS)
     assert metadata["training_seeds"] == list(TRAINING_SEEDS)
-    assert metadata["new_training_count"] == 6
-    assert metadata["import_count"] == 3
+    assert metadata["new_training_count"] == 12
+    assert metadata["import_count"] == 9
     assert metadata["baseline_reconciliation_gate"] is None
     assert (
-        metadata["decision_rule"]["requirements"][
+        metadata["decision_rule"]["six_requirements"][
             "delta_boundary_offset_class_agnostic_mean_absolute"
         ]
         == "<0"
     )
-    assert metadata["training_order_contract"][
-        "generated_manifest_byte_identical_to_locked_manifest"
-    ]
-    assert metadata["training_order_contract"][
-        "generated_bundle_byte_identical_to_locked_bundle"
-    ]
+    assert metadata["decision_rule"]["primary_claim_additional_requirements"][
+        "positive_delta_edit_folds"
+    ] == ">=3 of 4"
+    assert all(
+        contract["generated_bundle_byte_identical_to_locked_bundle"]
+        for contract in metadata["per_fold_training_order_contract"].values()
+    )
     grid = [
-        (task["training_seed"], task["decoder_boundary_loss"])
+        (task["official_fold"], task["training_seed"], task["decoder_boundary_loss"])
         for task in tasks
         if task["included_in_primary_grid"]
     ]
-    assert grid == [
-        (seed, weight) for seed in TRAINING_SEEDS for weight in BOUNDARY_WEIGHTS
-    ]
-    assert sum(task["execution_mode"] == "train" for task in tasks) == 6
-    assert sum(task["execution_mode"] == "imported" for task in tasks) == 3
-    assert all(task["physical_gpu"] == 3 for task in tasks)
+    assert set(grid) == {
+        (fold, seed, weight)
+        for fold in FOLDS
+        for seed in TRAINING_SEEDS
+        for weight in BOUNDARY_WEIGHTS
+    }
+    assert sum(task["execution_mode"] == "train" for task in tasks) == 12
+    assert sum(task["execution_mode"] == "imported" for task in tasks) == 9
+    assert set(task["physical_gpu"] for task in tasks if task["execution_mode"] == "train") == set(
+        GPU_IDS
+    )
     assert not (
-        study_dir / "state" / f"{variant_id(BASELINE_BOUNDARY_WEIGHT, 1)}.json"
+        study_dir / "state" / f"{variant_id(2, BASELINE_BOUNDARY_WEIGHT, 1)}.json"
     ).exists()
 
-    queue = (study_dir / "queues" / "gpu_3.sh").read_text()
-    assert variant_id(0.75, 0) in queue
-    assert variant_id(1.5, 0) in queue
-    assert variant_id(0.1, 1) in queue
-    assert variant_id(1.0, 0) not in queue
-    assert variant_id(0.5, 0) not in queue
-    assert "reconcile_baseline.py" not in queue
-    assert "CUDA_VISIBLE_DEVICES=3" in queue
+    queued_task_ids = []
+    for gpu in GPU_IDS:
+        queue = (study_dir / "queues" / f"gpu_{gpu}.sh").read_text()
+        assert f"CUDA_VISIBLE_DEVICES={gpu}" in queue
+        assert "reconcile_baseline.py" not in queue
+        for task in tasks:
+            if task["execution_mode"] == "train" and task["task_id"] in queue:
+                queued_task_ids.append(task["task_id"])
+        waiter = (study_dir / "waiters" / f"gpu_{gpu}_wait_then_run.sh").read_text()
+        assert "free_checks < 2" in waiter
+        assert "nvidia-smi" in waiter
+        assert "refusing to infer availability" in waiter
+    assert sorted(queued_task_ids) == sorted(metadata["training_tasks"])
 
     launcher = (study_dir / "launch_tmux.sh").read_text()
-    assert "nvidia-smi -i 3" in launcher
-    assert "refusing to launch" in launcher
     assert "mkdir -p" in launcher
-    assert "gpu_3.sh" in launcher
-    assert "gpu_0" not in launcher and "gpu_1" not in launcher and "gpu_2" not in launcher
+    for gpu in GPU_IDS:
+        assert f"gtea_bweight_multifold_g{gpu}" in launcher
 
     configs = [json.loads(Path(task["config_path"]).read_text()) for task in tasks]
     assert len({training_invariant_digest(config) for config in configs}) == 1
@@ -207,9 +221,32 @@ def test_generated_study_is_non_launched_serial_and_gpu3_fail_closed(tmp_path: P
             assert len(import_payload["exports"]) == len(CHECKPOINT_EPOCHS) * len(
                 INFERENCE_SEEDS
             )
-    assert (
-        study_dir / "manifests" / "train_cases_frac_100.txt"
-    ).read_bytes() == DEFAULT_LOCKED_REFERENCE_TRAIN_MANIFEST.read_bytes()
-    assert (
-        study_dir / "diffact_dataset_view" / "gtea" / "splits" / "train.split1.bundle"
-    ).read_bytes() == DEFAULT_LOCKED_REFERENCE_TRAIN_BUNDLE.read_bytes()
+    for fold in FOLDS:
+        locked_manifest = (
+            DEFAULT_LOCKED_MANIFEST_ROOT
+            / f"fold_{fold}"
+            / "manifests"
+            / "seed_0"
+            / "train_cases_frac_100.txt"
+        )
+        locked_bundle = (
+            DEFAULT_LOCKED_MANIFEST_ROOT
+            / f"fold_{fold}"
+            / "diffact_dataset_views"
+            / "seed_0"
+            / "frac_100"
+            / "gtea"
+            / "splits"
+            / "train.split1.bundle"
+        )
+        assert (
+            study_dir / "manifests" / f"fold_{fold}" / "train_cases_frac_100.txt"
+        ).read_bytes() == locked_manifest.read_bytes()
+        assert (
+            study_dir
+            / "diffact_dataset_views"
+            / f"fold_{fold}"
+            / "gtea"
+            / "splits"
+            / f"train.split{fold}.bundle"
+        ).read_bytes() == locked_bundle.read_bytes()

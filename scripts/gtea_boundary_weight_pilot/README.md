@@ -1,47 +1,35 @@
-# GTEA boundary-weight replication v2
+# GTEA multi-fold confirmation of boundary-loss weight 1.0
 
-This immutable follow-up asks whether the exploratory `decoder_boundary_loss=1.0`
-improvement from v1 survives a second training seed and where the local
-dose-response peaks.
+This immutable follow-up asks whether the fold-1 signal for
+`decoder_boundary_loss=1.0` generalizes across all four official GTEA folds.
+It is a minimal paired confirmation, not another weight search.
 
 ## Locked design
 
-- Dataset: GTEA official fold 1.
-- Training seeds: 0 and 1.
-- Primary grid: `decoder_boundary_loss ∈ {0.1, 0.75, 1.0, 1.5}`.
-- Seed-0 weights 0.1 and 1.0 are imported from v1, not retrained.
-- Seed-0 weight 0.5 is also imported as an exploratory curve reference; it is
-  outside the v2 primary grid and has no seed-1 counterpart.
-- Net new training trajectories: six.
-- Checkpoints: epochs 200, 1000, 2000, 5000, and 10000.
-- Diffusion inference seeds: 0, 1, and 2 at every checkpoint.
+- New trainings: folds 2, 3, and 4 × weights `{0.1, 1.0}` × training seeds
+  `{0, 1}` = 12 trajectories.
+- Every one of the nine completed fold-1 v2 tasks is imported from
+  `gtea_boundary_weight_fold1_v2` and protected by checkpoint/export hashes.
+- The primary grid on every fold is the paired `{0.1, 1.0}` × `{0, 1}` set.
+  Fold-1 exploratory weights are preserved only as imported curve context.
+- Checkpoints are fixed at epochs 200, 1000, 2000, 5000, and 10000.
+- Diffusion inference seeds are 0, 1, and 2 at every checkpoint.
 - Both raw pre-purge argmax and official purge-3 predictions are evaluated.
-- Physical GPU 3 only, sequentially, with no automatic fallback.
+- There is no reconciliation gate. Cross-training-seed metric and
+  frame-disagreement readouts quantify the noise floor per fold and weight.
 
-The generated train manifest and actual DiffAct train bundle must be
-byte-identical to the locked D100 inputs. The required bundle SHA-256 is
-`fe02e8f838bf30f2a050d67b8986ecc88fa07c18e9f87d39b3733c459a6bfa03`.
-All imported checkpoints and all exported inference artifacts are hashed into
-per-task `import_complete.json` manifests and revalidated before analysis.
+For every fold, the generated DiffAct train bundle is byte-identical to the
+actual `frac_100` bundle in the locked low-data study. Its order is also
+identical to that fold's locked `train_cases_frac_100.txt` manifest and its set
+is checked against the official train split. The official test split remains
+untouched and disjoint.
 
-## Why there is no reproduction gate
+## Pre-registered primary decision
 
-V1's `protocol_amendment_1.json` records a back-to-back determinism probe:
-nominally identical 201-epoch trainings produced different checkpoint hashes.
-The v1 locked-versus-retrained gate therefore measured benign run-to-run
-numeric variation rather than a protocol mismatch. V2 does not pretend that
-training is bitwise reproducible.
-
-Instead, V2 reports seed-0 versus seed-1 metric deltas and prediction-frame
-disagreement for every primary-grid weight, checkpoint, inference seed, and
-prediction stream. This is the per-weight noise floor and the replication
-readout.
-
-## Pre-registered primary
-
-The primary comparison is weight 1.0 versus the paired 0.1 baseline at epoch
-10000, post-purge, averaged over both training seeds and all three inference
-seeds. It passes only if all six checks pass:
+The primary comparison is weight 1.0 versus the paired weight 0.1 baseline at
+epoch 10000, post-purge, averaged over two training seeds and three inference
+seeds. The same six v2 checks are reported separately for each fold and pooled
+equally over folds 1–4:
 
 - Accuracy delta is non-negative.
 - Edit delta is positive.
@@ -50,36 +38,38 @@ seeds. It passes only if all six checks pass:
 - Segment-count-ratio delta is no greater than +0.02.
 - Class-agnostic mean absolute boundary offset decreases.
 
-V1 used median absolute boundary offset. That statistic tied at exactly zero
-and was therefore decision-degenerate. Before any v2 launch, the rule is
-deliberately replaced by mean absolute offset, which remains sensitive to
-distributed timing improvements.
+The primary claim passes only if all six pooled checks pass and the Edit and
+F1@25 deltas are each positive in at least three of four folds. Mean absolute
+offset is retained from v2 because the earlier median statistic was
+tie-degenerate at zero.
 
-Weights 0.75 and 1.5 are exploratory. If the primary passes, the next ladder
-step is a class-specific Gaussian onset head. If it fails, the config-only rung
-closes and the onset-head decision uses the combined evidence rather than
-advancing automatically.
+Passing records scientific support for considering the separately reviewed
+class-specific onset-head launch. Failing does not launch that study; it
+requires a new explicit decision.
 
-## Operations and immutability
+## GPU queues and non-preemption
 
-`prepare_study.py` creates a reviewable study but launches nothing. It:
+The 12 new trainings are Latin-rotated into four independent physical-GPU
+queues with exactly three trajectories each. `launch_tmux.sh` arms one named
+tmux waiter per GPU. A lane starts only after `nvidia-smi` succeeds and reports
+zero compute processes on two consecutive checks 60 seconds apart. A busy lane
+keeps waiting; it never kills, preempts, or shares with the running Breakfast
+selector study, and there is no automatic GPU fallback.
 
-1. validates the D100 bundle order and v1 protocol amendment;
-2. writes all configs and tasks;
-3. records and verifies imported v1 artifact hashes;
-4. creates `logs/` before generating the launcher;
-5. writes a serial fail-closed GPU-3 queue and detached-tmux launcher.
+GPU 3 can therefore start first when free. GPUs 0–2 join automatically only
+after their current selector lanes (and any other compute processes) leave.
 
-Production must be generated from a clean, committed branch. The launcher
-checks that GPU 3 has no compute process, creates `logs/` defensively, and
-refuses to fall back to another GPU.
+## Review and immutability
 
-Typical review generation:
+`prepare_study.py` creates configs, manifests, imports, queues, waiters, status
+tools, and provenance, but launches nothing. Generate a review study with:
 
 ```bash
 python scripts/gtea_boundary_weight_pilot/prepare_study.py \
-  --study-dir /tmp/gtea_boundary_weight_replication_v2_review
+  --study-dir /tmp/gtea_boundary_weight_multifold_review
 ```
 
-Nothing should be launched until the generated configs, import hashes, bundle
-identity, primary rule, and queue have been independently reviewed.
+Fable's spot-check is required before committing, generating the clean-tree
+production study, or running `launch_tmux.sh`. Once production starts, do not
+edit this worktree or its referenced DiffAct source; generate a new version for
+any change.

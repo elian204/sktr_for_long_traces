@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report import, training, export, analysis, tmux, and GPU-3 status."""
+"""Report multi-fold task, queue, tmux, analysis, and GPU status."""
 
 from __future__ import annotations
 
@@ -10,19 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from common import (
-    FINAL_EPOCH,
-    PHYSICAL_GPU,
-    atomic_write_json,
-    highest_saved_epoch,
-    load_json,
-)
+from common import FINAL_EPOCH, GPU_IDS, highest_saved_epoch, load_json
 
 
 def last_logged_epoch(path: Path) -> int | None:
     if not path.is_file():
         return None
-    matches = re.findall(r"Epoch\s+(\d+)\s+-\s+Running Loss", path.read_text(errors="replace"))
+    matches = re.findall(
+        r"Epoch\s+(\d+)\s+-\s+Running Loss", path.read_text(errors="replace")
+    )
     return int(matches[-1]) if matches else None
 
 
@@ -38,12 +34,12 @@ def tmux_exists(session: str) -> bool:
     )
 
 
-def gpu_processes() -> list[Dict[str, Any]]:
+def gpu_processes(gpu: int) -> list[Dict[str, Any]]:
     result = subprocess.run(
         [
             "nvidia-smi",
             "-i",
-            str(PHYSICAL_GPU),
+            str(gpu),
             "--query-compute-apps=pid,used_memory,process_name",
             "--format=csv,noheader,nounits",
         ],
@@ -51,12 +47,18 @@ def gpu_processes() -> list[Dict[str, Any]]:
         text=True,
         check=False,
     )
+    if result.returncode:
+        return [{"error": result.stderr.strip() or result.stdout.strip()}]
     rows: list[Dict[str, Any]] = []
     for line in result.stdout.splitlines():
         fields = [field.strip() for field in line.split(",", maxsplit=2)]
         if len(fields) == 3 and fields[0]:
             rows.append(
-                {"pid": int(fields[0]), "used_memory_mib": int(fields[1]), "process": fields[2]}
+                {
+                    "pid": int(fields[0]),
+                    "used_memory_mib": int(fields[1]),
+                    "process": fields[2],
+                }
             )
     return rows
 
@@ -84,66 +86,67 @@ def main() -> None:
         )
         artifact_run_dir = Path(task.get("artifact_run_dir", task["run_dir"]))
         artifact_model_dir = Path(task.get("artifact_model_dir", task["model_dir"]))
-        export_complete_count = len(list(artifact_run_dir.glob(
-            "exports/epoch_*/sampling_seed_*/export_complete.json"
-        )))
-        expected_exports = len(task["checkpoint_epochs"]) * len(task["inference_seeds"])
-        row = {
-            "task_id": task["task_id"],
-            "decoder_boundary_loss": task["decoder_boundary_loss"],
-            "role": task["role"],
-            "training_seed": task["training_seed"],
-            "execution_mode": task["execution_mode"],
-            "status": status,
-            "stage": "imported" if imported else state.get("stage"),
-            "last_logged_epoch": (
-                FINAL_EPOCH
-                if imported
-                else last_logged_epoch(Path(task["run_dir"]) / "train.log")
-            ),
-            "highest_checkpoint_epoch": highest_saved_epoch(artifact_model_dir),
-            "final_epoch": FINAL_EPOCH,
-            "exports_complete": export_complete_count,
-            "exports_expected": expected_exports,
-            "current_export_epoch": state.get("checkpoint_epoch"),
-            "current_inference_seed": state.get("inference_seed"),
-            "error": state.get("error"),
-        }
-        rows.append(row)
+        export_complete_count = len(
+            list(
+                artifact_run_dir.glob(
+                    "exports/epoch_*/sampling_seed_*/export_complete.json"
+                )
+            )
+        )
+        rows.append(
+            {
+                "task_id": task["task_id"],
+                "official_fold": task["official_fold"],
+                "decoder_boundary_loss": task["decoder_boundary_loss"],
+                "training_seed": task["training_seed"],
+                "physical_gpu": task["physical_gpu"],
+                "execution_mode": task["execution_mode"],
+                "status": status,
+                "stage": "imported" if imported else state.get("stage"),
+                "last_logged_epoch": (
+                    FINAL_EPOCH
+                    if imported
+                    else last_logged_epoch(Path(task["run_dir"]) / "train.log")
+                ),
+                "highest_checkpoint_epoch": highest_saved_epoch(artifact_model_dir),
+                "exports_complete": export_complete_count,
+                "exports_expected": (
+                    len(task["checkpoint_epochs"]) * len(task["inference_seeds"])
+                ),
+                "current_export_epoch": state.get("checkpoint_epoch"),
+                "current_inference_seed": state.get("inference_seed"),
+                "error": state.get("error"),
+            }
+        )
 
     analysis_path = study_dir / "analysis" / "analysis_complete.json"
     analysis = load_json(analysis_path) if analysis_path.is_file() else None
-    session = "gtea_bweight_f1_v2_g3"
+    sessions = {
+        str(gpu): {
+            "name": f"gtea_bweight_multifold_g{gpu}",
+            "alive": tmux_exists(f"gtea_bweight_multifold_g{gpu}"),
+            "queue_complete": (
+                study_dir / "state" / f"gpu_{gpu}_queue_complete"
+            ).is_file(),
+        }
+        for gpu in GPU_IDS
+    }
     payload = {
         "checked_utc": datetime.now(timezone.utc).isoformat(),
         "study_dir": str(study_dir),
         "protocol_version": metadata["protocol_version"],
-        "physical_gpu": PHYSICAL_GPU,
-        "tmux_session": session,
-        "tmux_alive": tmux_exists(session),
-        "gpu_processes": gpu_processes(),
-        "analysis": analysis,
         "tasks": rows,
+        "counts": {
+            status: sum(row["status"] == status for row in rows)
+            for status in ("imported", "not_started", "running", "complete", "failed")
+        },
+        "sessions": sessions,
+        "gpu_processes": {str(gpu): gpu_processes(gpu) for gpu in GPU_IDS},
+        "analysis": analysis,
     }
-    atomic_write_json(study_dir / "status_live.json", payload)
-    print(
-        f"GTEA boundary-weight replication v2 | GPU {PHYSICAL_GPU} | "
-        f"tmux={'alive' if payload['tmux_alive'] else 'absent'} | "
-        f"processes={len(payload['gpu_processes'])}"
-    )
-    for row in rows:
-        print(
-            f"  seed={row['training_seed']} weight={row['decoder_boundary_loss']:<4} "
-            f"mode={row['execution_mode']:<8} role={row['role']:<27} "
-            f"status={row['status']:<11} stage={str(row['stage']):<15} "
-            f"epoch={row['last_logged_epoch']}/{FINAL_EPOCH} "
-            f"checkpoint={row['highest_checkpoint_epoch']} "
-            f"exports={row['exports_complete']}/{row['exports_expected']}"
-        )
-        if row["error"]:
-            print(f"    error: {row['error']}")
-    print("  baseline reconciliation: not used (cross-seed noise readout)")
-    print(f"  analysis: {'complete' if analysis else 'pending'}")
+    import json
+
+    print(json.dumps(payload, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

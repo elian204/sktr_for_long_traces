@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared contracts for the immutable GTEA boundary-weight replication."""
+"""Shared contracts for the immutable GTEA multi-fold boundary-weight study."""
 
 from __future__ import annotations
 
@@ -22,40 +22,29 @@ DEFAULT_DIFFACT_ROOT = Path(
     "/home/dsi/eli-bogdanov/sktr_for_long_traces/baselines/DiffAct"
 )
 DEFAULT_STUDY_DIR = Path(
-    "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_v2"
+    "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_multifold_v1"
 )
-DEFAULT_V1_STUDY_DIR = Path(
-    "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_seed0_v1"
+DEFAULT_FOLD1_STUDY_DIR = Path(
+    "/data1/eli-bogdanov/sktr_runs/gtea_boundary_weight_fold1_v2"
 )
 DEFAULT_LOCKED_REFERENCE_CONFIG = Path(
     "/data1/eli-bogdanov/sktr_runs/epoch_scarcity_gtea_seed0_v1/"
     "experiments/gtea/fold_1/trajectory/seed_0/config.json"
 )
-DEFAULT_LOCKED_REFERENCE_EXPORT = Path(
-    "/data1/eli-bogdanov/sktr_runs/epoch_scarcity_gtea_seed0_v1/"
-    "experiments/gtea/fold_1/trajectory/seed_0/checkpoints/"
-    "epoch_10000/softmax_test"
-)
-DEFAULT_LOCKED_REFERENCE_TRAIN_MANIFEST = Path(
+DEFAULT_LOCKED_MANIFEST_ROOT = Path(
     "/data1/eli-bogdanov/sktr_runs/low_data_decoding_study_gtea_seed0_bounds_v2/"
-    "experiments/gtea/fold_1/manifests/seed_0/train_cases_frac_100.txt"
-)
-DEFAULT_LOCKED_REFERENCE_TRAIN_BUNDLE = Path(
-    "/data1/eli-bogdanov/sktr_runs/low_data_decoding_study_gtea_seed0_bounds_v2/"
-    "experiments/gtea/fold_1/diffact_dataset_views/seed_0/frac_100/gtea/"
-    "splits/train.split1.bundle"
+    "experiments/gtea"
 )
 
-PROTOCOL_VERSION = "gtea-boundary-weight-replication-v2"
+PROTOCOL_VERSION = "gtea-boundary-weight-multifold-confirmation-v1"
 DATASET = "gtea"
-FOLD = 1
+FOLDS = (1, 2, 3, 4)
+NEW_TRAINING_FOLDS = (2, 3, 4)
 TRAINING_SEEDS = (0, 1)
-PHYSICAL_GPU = 3
-BOUNDARY_WEIGHTS = (0.1, 0.75, 1.0, 1.5)
-IMPORTED_CURVE_WEIGHTS = (0.5,)
+GPU_IDS = (0, 1, 2, 3)
+BOUNDARY_WEIGHTS = (0.1, 1.0)
 PRIMARY_BOUNDARY_WEIGHT = 1.0
 BASELINE_BOUNDARY_WEIGHT = 0.1
-V1_IMPORTED_KEYS = ((0, 0.1), (0, 0.5), (0, 1.0))
 CHECKPOINT_EPOCHS = (200, 1000, 2000, 5000, 10000)
 INFERENCE_SEEDS = (0, 1, 2)
 INFERENCE_SEED_STRIDE = 1_000_000
@@ -218,12 +207,15 @@ def ensure_symlink_or_copy(source: Path, destination: Path) -> None:
 def create_dataset_view(
     study_dir: Path,
     data_root: Path,
+    fold: int,
     train_cases: Sequence[str],
     test_cases: Sequence[str],
     *,
     locked_train_bundle: Path | None = None,
 ) -> Path:
-    view_root = study_dir / "diffact_dataset_view"
+    if fold not in FOLDS:
+        raise ValueError(f"Unsupported GTEA fold: {fold}")
+    view_root = study_dir / "diffact_dataset_views" / f"fold_{fold}"
     dataset_root = view_root / DATASET
     dataset_root.mkdir(parents=True, exist_ok=False)
     for name in ("features", "groundTruth"):
@@ -231,7 +223,7 @@ def create_dataset_view(
     ensure_symlink_or_copy(data_root / DATASET / "mapping.txt", dataset_root / "mapping.txt")
     splits = dataset_root / "splits"
     splits.mkdir()
-    train_bundle = splits / "train.split1.bundle"
+    train_bundle = splits / f"train.split{fold}.bundle"
     if locked_train_bundle is None:
         write_bundle(train_bundle, train_cases)
     else:
@@ -241,7 +233,7 @@ def create_dataset_view(
                 "Locked DiffAct train bundle order differs from requested training order"
             )
         shutil.copy2(locked_train_bundle, train_bundle)
-    write_bundle(splits / "test.split1.bundle", test_cases)
+    write_bundle(splits / f"test.split{fold}.bundle", test_cases)
     return view_root
 
 
@@ -262,9 +254,11 @@ def load_mapping(path: Path) -> Tuple[Dict[str, int], List[str]]:
 
 
 def create_alignment_dir(
-    study_dir: Path, data_root: Path, test_cases: Sequence[str]
+    study_dir: Path, data_root: Path, fold: int, test_cases: Sequence[str]
 ) -> Path:
-    align_dir = study_dir / "align" / "test"
+    if fold not in FOLDS:
+        raise ValueError(f"Unsupported GTEA fold: {fold}")
+    align_dir = study_dir / "align" / f"fold_{fold}" / "test"
     align_dir.mkdir(parents=True, exist_ok=False)
     write_lines(
         align_dir / "video_index_map.txt",
@@ -286,8 +280,11 @@ def boundary_weight_slug(weight: float) -> str:
     return str(weight).replace(".", "p")
 
 
-def variant_id(weight: float, training_seed: int) -> str:
-    return f"gtea_fold{FOLD}_trainseed{training_seed}_boundary{boundary_weight_slug(weight)}"
+def variant_id(fold: int, weight: float, training_seed: int) -> str:
+    return (
+        f"gtea_fold{fold}_trainseed{training_seed}_"
+        f"boundary{boundary_weight_slug(weight)}"
+    )
 
 
 def training_invariant_payload(config: Mapping[str, Any]) -> Dict[str, Any]:
@@ -330,15 +327,18 @@ def build_variant_config(
     view_root: Path,
     train_manifest: Path,
     test_manifest: Path,
+    fold: int,
     weight: float,
     training_seed: int,
 ) -> Dict[str, Any]:
     config = deepcopy(dict(reference))
-    task_id = variant_id(weight, training_seed)
+    if fold not in FOLDS:
+        raise ValueError(f"Unsupported GTEA fold: {fold}")
+    task_id = variant_id(fold, weight, training_seed)
     run_dir = study_dir / "runs" / task_id
     config["naming"] = task_id
     config["root_data_dir"] = str(view_root)
-    config["split_id"] = 1
+    config["split_id"] = int(fold)
     config["result_dir"] = str(run_dir / "training")
     config["random_seed"] = int(training_seed)
     config["initialization_seed"] = int(training_seed)
@@ -355,6 +355,7 @@ def build_variant_config(
     config["gtea_boundary_weight_protocol_version"] = PROTOCOL_VERSION
     config["gtea_boundary_weight_variant"] = float(weight)
     config["gtea_boundary_weight_training_seed"] = int(training_seed)
+    config["gtea_boundary_weight_official_fold"] = int(fold)
     config["loss_weights"] = deepcopy(config["loss_weights"])
     config["loss_weights"]["decoder_boundary_loss"] = float(weight)
     return config
@@ -379,6 +380,7 @@ def assert_variant_config(
         "initialization_seed": int(task["training_seed"]),
         "evaluate_during_training": False,
         "log_train_results": False,
+        "split_id": int(task["official_fold"]),
     }
     mismatches = {
         key: {"expected": expected, "actual": config.get(key)}
@@ -413,6 +415,13 @@ def assert_variant_config(
         mismatches["gtea_boundary_weight_training_seed"] = {
             "expected": int(task["training_seed"]),
             "actual": config.get("gtea_boundary_weight_training_seed"),
+        }
+    if int(config.get("gtea_boundary_weight_official_fold", -1)) != int(
+        task["official_fold"]
+    ):
+        mismatches["gtea_boundary_weight_official_fold"] = {
+            "expected": int(task["official_fold"]),
+            "actual": config.get("gtea_boundary_weight_official_fold"),
         }
     if mismatches:
         raise ValueError(f"Variant changed a frozen training field: {mismatches}")

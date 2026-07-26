@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Mapping
 from common import (
     canonical_digest,
     FINAL_EPOCH,
-    PHYSICAL_GPU,
     SCRIPT_DIR,
     atomic_write_json,
     assert_variant_config,
@@ -72,7 +71,7 @@ def stream_command(
         )
 
 
-def runtime_environment() -> Dict[str, Any]:
+def runtime_environment(physical_gpu: int) -> Dict[str, Any]:
     probe = subprocess.run(
         [
             sys.executable,
@@ -92,7 +91,7 @@ def runtime_environment() -> Dict[str, Any]:
         [
             "nvidia-smi",
             "-i",
-            str(PHYSICAL_GPU),
+            str(physical_gpu),
             "--query-gpu=index,uuid,name,driver_version,memory.total",
             "--format=csv,noheader,nounits",
         ],
@@ -106,7 +105,7 @@ def runtime_environment() -> Dict[str, Any]:
         "python_version": platform.python_version(),
         "platform": platform.platform(),
         "packages": versions,
-        "physical_gpu": PHYSICAL_GPU,
+        "physical_gpu": physical_gpu,
         "gpu_probe": gpu,
     }
 
@@ -190,10 +189,9 @@ def run_task(study_dir: Path, task_id: str) -> None:
         validated = validate_completed_task(task, metadata)
         if validated is None:
             raise RuntimeError(f"Imported task did not validate: {task_id}")
-        print(f"IMPORTED {task_id}: all v1 hashes verified", flush=True)
+        print(f"IMPORTED {task_id}: all source hashes verified", flush=True)
         return
-    if int(task["physical_gpu"]) != PHYSICAL_GPU:
-        raise ValueError(f"Task is not pinned to physical GPU {PHYSICAL_GPU}")
+    physical_gpu = int(task["physical_gpu"])
     config = load_json(Path(task["config_path"]))
     assert_variant_config(config, task, metadata)
     existing = validate_completed_task(task, metadata)
@@ -208,18 +206,18 @@ def run_task(study_dir: Path, task_id: str) -> None:
         "task_id": task_id,
         "status": "running",
         "stage": "initializing",
-        "physical_gpu": PHYSICAL_GPU,
+        "physical_gpu": physical_gpu,
         "decoder_boundary_loss": task["decoder_boundary_loss"],
         "started_utc": utc_now(),
         "pid": os.getpid(),
     }
     atomic_write_json(status_path, status)
     environment = dict(os.environ)
-    environment["CUDA_VISIBLE_DEVICES"] = str(PHYSICAL_GPU)
+    environment["CUDA_VISIBLE_DEVICES"] = str(physical_gpu)
     try:
         environment_path = run_dir / "runtime_environment.json"
         if not environment_path.is_file():
-            atomic_write_json(environment_path, runtime_environment())
+            atomic_write_json(environment_path, runtime_environment(physical_gpu))
 
         final_checkpoint = Path(task["final_checkpoint"])
         model_dir = Path(task["model_dir"])
@@ -247,7 +245,7 @@ def run_task(study_dir: Path, task_id: str) -> None:
                     "--config",
                     task["config_path"],
                     "--device",
-                    str(PHYSICAL_GPU),
+                    str(physical_gpu),
                 ],
                 cwd=diffact_root,
                 log_path=run_dir / "train.log",
@@ -316,7 +314,7 @@ def run_task(study_dir: Path, task_id: str) -> None:
                             "--inference-seed",
                             str(inference_seed),
                             "--device",
-                            str(PHYSICAL_GPU),
+                            str(physical_gpu),
                         ],
                         cwd=Path(SCRIPT_DIR.parents[1]),
                         log_path=output_dir / "export.log",
@@ -341,7 +339,7 @@ def run_task(study_dir: Path, task_id: str) -> None:
             "completed_utc": utc_now(),
             "decoder_boundary_loss": task["decoder_boundary_loss"],
             "training_seed": task["training_seed"],
-            "physical_gpu": PHYSICAL_GPU,
+            "physical_gpu": physical_gpu,
             "final_checkpoint": str(final_checkpoint),
             "checkpoint_sha256": checkpoint_hashes,
             "exports": exports,
