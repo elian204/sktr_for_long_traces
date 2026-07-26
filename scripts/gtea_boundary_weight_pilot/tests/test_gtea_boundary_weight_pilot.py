@@ -214,7 +214,13 @@ def test_generated_study_is_non_launched_multifold_and_waiters_fail_closed(
 
     configs = [json.loads(Path(task["config_path"]).read_text()) for task in tasks]
     assert len({training_invariant_digest(config) for config in configs}) == 1
-    for task in tasks:
+    for task, config in zip(tasks, configs):
+        assert Path(config["result_dir"]) / task["task_id"] == Path(
+            task["model_dir"]
+        )
+        assert Path(config["pre_specified_final_checkpoint"]) == Path(
+            task["model_dir"]
+        ) / f"epoch-{CHECKPOINT_EPOCHS[-1]}.model"
         if task["execution_mode"] == "imported":
             import_payload = json.loads(Path(task["import_manifest_path"]).read_text())
             assert len(import_payload["checkpoint_sha256"]) == len(CHECKPOINT_EPOCHS)

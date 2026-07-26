@@ -335,7 +335,7 @@ def build_variant_config(
     if fold not in FOLDS:
         raise ValueError(f"Unsupported GTEA fold: {fold}")
     task_id = variant_id(fold, weight, training_seed)
-    run_dir = study_dir / "runs" / task_id
+    run_dir = study_dir / "runs" / f"fold_{fold}" / task_id
     config["naming"] = task_id
     config["root_data_dir"] = str(view_root)
     config["split_id"] = int(fold)
