@@ -74,6 +74,30 @@ weights may determine the replication treatment only after that primary gate
 passes. No onset-head claim or ladder advancement occurs before the seed-1
 paired replication is completed and reported.
 
+## Pre-registered Gaussian-width contingency
+
+The staged screen keeps `class_specific_onset_smooth=1` exactly as reviewed.
+Its interpretation depends on the screening outcome:
+
+- If the screen is null or weak at every onset-loss weight, run a rescue probe
+  with `sigma ∈ {3, 5}` at the best screened onset weight, or at the
+  pre-registered 0.3 weight if no treatment is clearly best, before closing
+  the direction. A null result at sigma 1 alone cannot distinguish “onset
+  supervision does not help” from “the target is sharper than the annotation
+  noise.”
+- If the screen passes, `sigma ∈ {1, 3}` becomes an axis in the already
+  required seed-1 replication arm. It is not treated as a separate follow-up
+  study.
+
+Gaussian width changes the tolerance encoded by the loss. At sigma 5, the
+target tolerates approximately ±10 frames, which is close to the
+boundary-F1@10 gate tolerance. Sigma comparisons must therefore consider the
+full boundary-offset distribution—especially the p90 absolute offset—not just
+improvements in aggregate activity or boundary metrics.
+
+For a future Breakfast port, scale the onset-target sigma from Breakfast's
+dataset-specific `boundary_smooth=3`; do not copy GTEA's sigma 1 literally.
+
 ## Hard launch gate
 
 `launch_tmux.sh` cannot start training unless the Task-1 multi-fold
