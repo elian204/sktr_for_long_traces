@@ -182,6 +182,25 @@ def test_large_span_guard_raises_tau_only_for_large_spans() -> None:
     assert first.decision_reason == "large_span_below_higher_tau"
 
 
+def test_outer_test_inner_fold_zero_sentinel_normalizes_to_none() -> None:
+    segments = _segments().copy()
+    segments["scope"] = "outer_test"
+    segments["inner_fold"] = 0.0
+    selected = select_budget_rows(segments, total_frames=10, budget=0.8)
+    assert selected["inner_fold"].isna().all()
+    outer_case = CaseData(1, None, "video", _case().gt, _case().baseline)
+    predictions, _, _ = apply_configuration(
+        [outer_case],
+        segments,
+        _probabilities(),
+        selected,
+        threshold=0.5,
+        rule_name="none",
+        rule_parameter=None,
+    )
+    assert outer_case.key in predictions
+
+
 def test_logistic_and_mlp_convergence_warnings_are_hard_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

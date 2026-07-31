@@ -265,7 +265,15 @@ def select_budget_rows(
             {
                 "segment_id": int(row.segment_id),
                 "outer_fold": int(row.outer_fold),
-                "inner_fold": None if pd.isna(row.inner_fold) else int(row.inner_fold),
+                # The frozen selector CSV encodes outer-test inner_fold as 0,
+                # whereas CaseData correctly uses None. Scope is authoritative;
+                # never let this serialization sentinel become a case key.
+                "inner_fold": (
+                    None
+                    if str(row.scope) == "outer_test" or pd.isna(row.inner_fold)
+                    else int(row.inner_fold)
+                ),
+                "scope": str(row.scope),
                 "case_id": str(row.case_id),
                 "segment_index": int(row.segment_index),
                 "segment_start": start,
