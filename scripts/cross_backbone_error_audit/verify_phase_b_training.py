@@ -11,6 +11,7 @@ from phase_b_training_common import (
     OFFICIAL_SOURCE_FILES,
     atomic_write_json,
     canonical_digest,
+    compatibility_patched_model,
     file_sha256,
     load_json,
     verify_manifest,
@@ -48,7 +49,13 @@ def main() -> int:
             raise RuntimeError(f"Missing immutable data link: {runtime}")
         for name in OFFICIAL_SOURCE_FILES:
             expected = paths[f"official_source/{name}"]
-            if file_sha256(runtime / name) != file_sha256(expected):
+            if name == "model.py":
+                expected_bytes = compatibility_patched_model(expected).encode()
+                observed_bytes = (runtime / name).read_bytes()
+                matches = observed_bytes == expected_bytes
+            else:
+                matches = file_sha256(runtime / name) == file_sha256(expected)
+            if not matches:
                 raise RuntimeError(f"Runtime source drift: {task['dataset']}/fold{task['fold']}/{name}")
     result = {
         "status": "complete",

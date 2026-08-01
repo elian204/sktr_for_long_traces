@@ -97,7 +97,9 @@ configuration: 100 epochs, batch size 1, learning rate 5e-4, 64 feature maps,
 
 The study copies the clean official source at Git `f423a9e` into an isolated
 runtime per fold, hash-locks every feature/GT/split input, and exports the final
-stage probabilities without altering the training implementation. Four queues
+stage probabilities. That Git revision contains one stray `MS_TCB` token before
+`MS_TCN2.__init__`, so the runtime applies an exact one-line syntax-only repair;
+the architecture, loss, optimizer, and training loop are unchanged. Four queues
 use two consecutive free-GPU checks and never preempt another process. Phase C
 stays closed until the resulting paper reconciliation receives a separate
 review.

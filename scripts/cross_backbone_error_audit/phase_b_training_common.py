@@ -49,6 +49,8 @@ SOURCE_FILES = (
     "scripts/cross_backbone_error_audit/finalize_phase_b_training.py",
 )
 OFFICIAL_SOURCE_FILES = ("main.py", "model.py", "batch_gen.py", "eval.py", "train.sh")
+OFFICIAL_MODEL_BROKEN_LINE = "MS_TCB    def __init__(self, num_layers_PG, num_layers_R, num_R, num_f_maps, dim, num_classes):"
+OFFICIAL_MODEL_FIXED_LINE = "    def __init__(self, num_layers_PG, num_layers_R, num_R, num_f_maps, dim, num_classes):"
 
 
 def file_sha256(path: Path) -> str:
@@ -158,3 +160,11 @@ def parse_mapping(path: Path) -> tuple[dict[int, str], dict[str, int]]:
     if sorted(id_to_name) != list(range(len(id_to_name))):
         raise RuntimeError(f"Non-contiguous mapping: {path}")
     return id_to_name, {label: index for index, label in id_to_name.items()}
+
+
+def compatibility_patched_model(source: Path) -> str:
+    """Repair the authors' single syntax-corrupting token without changing the model."""
+    text = source.read_text()
+    if text.count(OFFICIAL_MODEL_BROKEN_LINE) != 1:
+        raise RuntimeError("Official MS-TCN++ syntax-repair anchor drift")
+    return text.replace(OFFICIAL_MODEL_BROKEN_LINE, OFFICIAL_MODEL_FIXED_LINE)

@@ -19,6 +19,7 @@ from phase_b_training_common import (
     QUEUE_ASSIGNMENTS,
     atomic_write_json,
     canonical_digest,
+    compatibility_patched_model,
     file_sha256,
     git_clean,
     git_head,
@@ -136,6 +137,11 @@ def main() -> int:
         "official_source_head": OFFICIAL_MSTCN2_HEAD,
         "data_root": str(data_root),
         "official_training_config": OFFICIAL_CONFIG,
+        "runtime_compatibility_patch": {
+            "file": "model.py",
+            "reason": "official Git HEAD contains a stray MS_TCB token that makes Python parsing fail",
+            "scope": "remove the stray token and restore indentation of MS_TCN2.__init__; no architecture or arithmetic change",
+        },
         "tasks": tasks,
         "queue_assignments": {str(key): [list(value) for value in values] for key, values in QUEUE_ASSIGNMENTS.items()},
         "gpu_training_allowed": bool(args.authorize_training),
@@ -172,7 +178,10 @@ def main() -> int:
         runtime.mkdir(parents=True)
         (runtime / "logs").mkdir()
         for name in OFFICIAL_SOURCE_FILES:
-            shutil.copy2(official / name, runtime / name)
+            if name == "model.py":
+                (runtime / name).write_text(compatibility_patched_model(official / name))
+            else:
+                shutil.copy2(official / name, runtime / name)
         os.symlink(data_root, runtime / "data", target_is_directory=True)
 
     script_dir = Path(__file__).resolve().parent

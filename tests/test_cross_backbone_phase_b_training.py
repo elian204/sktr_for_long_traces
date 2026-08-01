@@ -18,6 +18,7 @@ from phase_b_training_common import (
     OFFICIAL_SOURCE_FILES,
     QUEUE_ASSIGNMENTS,
     canonical_digest,
+    compatibility_patched_model,
     file_sha256,
     verify_manifest,
 )
@@ -56,6 +57,10 @@ def test_official_training_config_is_frozen() -> None:
 def test_official_source_contract_is_minimal_and_pinned() -> None:
     assert OFFICIAL_MSTCN2_HEAD == "f423a9e65f4ccb1cd7322eb9f94946a19e787993"
     assert set(OFFICIAL_SOURCE_FILES) == {"main.py", "model.py", "batch_gen.py", "eval.py", "train.sh"}
+    source = Path("/home/dsi/eli-bogdanov/MS-TCN2_official_phase_b/model.py")
+    patched = compatibility_patched_model(source)
+    assert len(source.read_text().splitlines()) == len(patched.splitlines())
+    compile(patched, str(source), "exec")
 
 
 def test_manifest_verification_is_hash_strict(tmp_path: Path) -> None:
