@@ -38,6 +38,29 @@ Every one of the 12 outer×inner OOF checkpoints must pass:
 Any failure blocks B1. The review study is fail-closed and cannot run B0 until a
 Fable approval digest is embedded in a newly generated production study.
 
+## Approved B0 → B1 execution
+
+Fable approved B0 and the pre-registered B1 candidate oracle on 2026-08-01.
+All twelve actual-checkpoint validity tasks must pass before any B1 sampling.
+After V1 has claimed its first free GPU, three V2 waiters claim distinct
+remaining devices using two consecutive free checks; they never preempt Phase B
+or V1.
+
+B1 samples each OOF video jointly over its frozen selected cores for halo widths
+0/8/16 and restart times 250/500/750/999 (999 is the pure-noise arm). Each arm
+uses sequential k≤15 sampling with the reviewed early-stop rule. Exact samples
+are deduplicated, traces are clustered at normalized segmental edit distance
+0.25, and only cluster medoids propose labels; per-frame voting is forbidden.
+For compatibility with the reviewed V0/V1 candidate schema, a medoid proposes
+its deterministic modal label within each selected core. B1 reports the OOF
+best-of-k oracle, wrong-mass candidate availability, and incremental oracle over
+the visual candidate pool under the frozen kill bars.
+
+The currently running V1 study is never mutated. If B1 passes the join bars,
+the candidates are packaged for Fable review and a separately versioned V1
+extension; they are not silently inserted into an underway verifier run. Outer
+test remains closed.
+
 ## B1, still blocked
 
 On OOF spans only, best-of-k below +1.4 Acc closes V2. Samples join V1's

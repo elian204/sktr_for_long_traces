@@ -7,6 +7,7 @@ import argparse
 import copy
 import os
 import sys
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -70,8 +71,8 @@ def execute(study_dir: Path, outer: int, inner: int, physical_device: int) -> No
     paths = verify_manifest(manifest)
     if not config["b0_sampling_allowed"] or not config.get("fable_approval_digest"):
         raise RuntimeError("V2 B0 sampling is review-blocked")
-    if config["b1_oracle_allowed"] or config["outer_test_open_allowed"]:
-        raise RuntimeError("B0 study unexpectedly authorizes B1 or outer-test access")
+    if config["outer_test_open_allowed"]:
+        raise RuntimeError("B0 study unexpectedly authorizes outer-test access")
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_device)
     import torch
@@ -233,7 +234,7 @@ def execute(study_dir: Path, outer: int, inner: int, physical_device: int) -> No
     output = study_dir / "results" / f"outer{outer}_inner{inner}_b0.json"
     atomic_write_json(output, result)
     atomic_write_json(
-        study_dir / "status" / f"outer{outer}_inner{inner}.json",
+        study_dir / "status" / f"outer{outer}_inner{inner}_b0.json",
         {"status": result["status"], "result_sha256": file_sha256(output)},
     )
     if result["status"] != "PASS":
@@ -242,7 +243,21 @@ def execute(study_dir: Path, outer: int, inner: int, physical_device: int) -> No
 
 def main() -> int:
     args = parse_args()
-    execute(args.study_dir.resolve(), args.outer_fold, args.inner_fold, args.device)
+    study = args.study_dir.resolve()
+    try:
+        execute(study, args.outer_fold, args.inner_fold, args.device)
+    except Exception as error:
+        atomic_write_json(
+            study / "status" / f"outer{args.outer_fold}_inner{args.inner_fold}_b0_failed.json",
+            {
+                "status": "failed",
+                "failed_utc": datetime.now(timezone.utc).isoformat(),
+                "error_type": type(error).__name__,
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+            },
+        )
+        raise
     return 0
 
 

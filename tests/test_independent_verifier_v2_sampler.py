@@ -20,6 +20,8 @@ from masked_diffact_sampler import (  # noqa: E402
     q_from_alpha_bar,
     sample_candidate_medoids,
 )
+from finalize_v2_b1 import classify_b1  # noqa: E402
+from run_v2_b1_oracle import modal_label  # noqa: E402
 
 
 class FakeModel:
@@ -135,3 +137,14 @@ def test_sequential_sampling_stops_after_trace_saturation() -> None:
     assert 7 <= len(batch.samples) <= 15
     assert len(batch.medoid_indices) == len(batch.clusters)
     assert all(index < len(batch.samples) for index in batch.medoid_indices)
+
+
+def test_b1_modal_label_tie_break_is_deterministic() -> None:
+    assert modal_label(np.asarray([4, 4, 3, 3])) == 3
+
+
+def test_b1_kill_bars_are_exact() -> None:
+    assert classify_b1(1.39, 100.0, 10.0) == "CLOSE_V2"
+    assert classify_b1(1.74, 100.0, 10.0) == "NO_JOIN_DIAGNOSTIC_ONLY"
+    assert classify_b1(1.75, 34.99, 0.5) == "NO_JOIN_DIAGNOSTIC_ONLY"
+    assert classify_b1(1.75, 35.0, 0.5) == "PASS_CANDIDATE_JOIN_REVIEW_REQUIRED"

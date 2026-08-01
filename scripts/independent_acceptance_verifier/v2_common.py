@@ -51,6 +51,8 @@ V2_SOURCE_FILES = (
     "scripts/independent_acceptance_verifier/v2_common.py",
     "scripts/independent_acceptance_verifier/prepare_v2_b0.py",
     "scripts/independent_acceptance_verifier/run_v2_b0_validity.py",
+    "scripts/independent_acceptance_verifier/run_v2_b1_oracle.py",
+    "scripts/independent_acceptance_verifier/finalize_v2_b1.py",
 )
 
 
@@ -66,6 +68,11 @@ def canonical_digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def stable_seed(*parts: Any) -> int:
+    payload = "|".join(str(part) for part in parts).encode()
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)
 
 
 def atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
