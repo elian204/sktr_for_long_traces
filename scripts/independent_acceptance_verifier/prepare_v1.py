@@ -157,6 +157,49 @@ def main() -> int:
         f"--study-dir {study_dir} 2>&1 | tee {study_dir / 'logs' / 'aggregate.log'}\n"
     )
     aggregate.chmod(0o755)
+    queue = study_dir / "run_all_rotations_on_device.sh"
+    commands = [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        "if [[ $# -ne 1 ]]; then echo 'usage: run_all_rotations_on_device.sh DEVICE'; exit 2; fi",
+        "device=$1",
+        "mkdir -p logs status",
+        "printf '%s\\n' \"$device\" > status/chosen_gpu.txt",
+    ]
+    for outer in OUTER_FOLDS:
+        for held in INNER_FOLDS:
+            commands.append(
+                f"/usr/bin/python {Path(__file__).resolve().parent / 'train_v1_rotation.py'} "
+                f"--study-dir {study_dir} --outer-fold {outer} --held-inner {held} "
+                f"--device \"$device\" 2>&1 | tee -a {study_dir / 'logs' / 'v1_queue.log'}"
+            )
+    commands.append(f"{study_dir / 'aggregate.sh'}")
+    queue.write_text("\n".join(commands) + "\n")
+    queue.chmod(0o755)
+    waiter = study_dir / "wait_first_gpu.sh"
+    waiter.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p logs status\n"
+        "if [[ ! -f cache/feature_cache_complete.json ]]; then ./build_features.sh; fi\n"
+        "while true; do\n"
+        "  for device in 0 1 2 3; do\n"
+        "    first=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i \"$device\" | sed '/^$/d' | wc -l)\n"
+        "    if [[ \"$first\" -eq 0 ]]; then\n"
+        "      sleep 30\n"
+        "      second=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader -i \"$device\" | sed '/^$/d' | wc -l)\n"
+        "      if [[ \"$second\" -eq 0 ]]; then exec ./run_all_rotations_on_device.sh \"$device\"; fi\n"
+        "    fi\n"
+        "  done\n"
+        "  sleep 30\n"
+        "done\n"
+    )
+    waiter.chmod(0o755)
+    launcher = study_dir / "launch_tmux.sh"
+    launcher.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\nmkdir -p logs status\n"
+        "if tmux has-session -t iav_v1_waiter 2>/dev/null; then echo 'iav_v1_waiter already exists'; exit 1; fi\n"
+        f"tmux new-session -d -s iav_v1_waiter 'cd {study_dir} && ./wait_first_gpu.sh'\n"
+    )
+    launcher.chmod(0o755)
     print(study_dir)
     print(f"spec_sha256={metadata['spec_sha256']}")
     print(f"source_digest={provenance['source_digest']}")

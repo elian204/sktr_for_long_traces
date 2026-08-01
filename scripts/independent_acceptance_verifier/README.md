@@ -46,7 +46,7 @@ The schema includes reserved nullable fields for the optional V2 inpainting
 cluster medoids. V0 is descriptive/training-corpus construction; its oracle
 candidate-availability readout is not realized repair performance.
 
-## V1 — temporal pairwise verifier (blocked pending V0 review)
+## V1 — temporal pairwise verifier (approved nested-OOF run)
 
 Each candidate will receive the span's unpooled I3D features resampled to 48
 temporal bins plus 16-bin context on each side, projected 2048→256. The frozen
@@ -64,6 +64,12 @@ V1 passes only if nested-OOF pooled ΔAcc ≥ +0.75, all three evaluations are
 positive (or two positive and none below −0.1), zero OOF videos fall below −5pp,
 helpful:harmful changed frames ≥3:1, and pooled ΔEdit/ΔF1@25 are non-negative.
 Failure closes the campaign without any outer evaluation.
+
+Fable approved this exact nested design for production on 2026-08-01. Feature
+construction is CPU-only; the twelve rotations run sequentially on the first
+GPU lane that becomes free after cross-backbone Phase B. The launcher requires
+two consecutive free checks, writes the claimed physical device into the study
+status, and never falls back to an occupied GPU.
 
 The implementation keeps the four outer folds isolated: for each outer fold it
 rotates over the three subject-disjoint inner folds, giving 12 held-inner
@@ -106,4 +112,8 @@ is the final campaign record.
   --study-dir /data1/eli-bogdanov/sktr_runs/independent_acceptance_verifier_v0_review_v1
 
 /data1/eli-bogdanov/sktr_runs/independent_acceptance_verifier_v0_review_v1/run_v0.sh
+
+/usr/bin/python scripts/independent_acceptance_verifier/prepare_v1.py \
+  --study-dir /data1/eli-bogdanov/sktr_runs/independent_acceptance_verifier_v1_nested_oof_v1 \
+  --authorize-run --fable-approval-digest APPROVAL_DIGEST
 ```
