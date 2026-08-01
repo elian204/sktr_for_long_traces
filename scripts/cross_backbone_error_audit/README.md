@@ -66,6 +66,25 @@ is a planning estimate observed on 2026-08-01, not a scientific result; Phase B
 must refresh it before launch. All new checkpoints must live under
 `/data1/eli-bogdanov/sktr_runs` because the home filesystem lacks safe headroom.
 
+### Phase B Option 0: author checkpoints first
+
+Before retraining any failed cell, Phase B inventories the original authors'
+released checkpoints. The official ASFormer README publishes one archive with
+all 13 GTEA, 50Salads, and Breakfast fold checkpoints. The archive is frozen at
+SHA-256 `7b255d8cefb90012b192aedef6f10366474acc291e3988e759a0aae3dadf5909`;
+the four Breakfast checkpoints are re-exported with the untouched author code
+at Git commit `e1bbe4f3ed083748f91467c51a63ac2a8b9277ad`.
+
+The official MS-TCN++ repository currently has no releases, tags, or checkpoint
+link in its README. Its linked Zenodo record contains the 30 GB feature archive,
+not model weights. These negative inventory claims are saved as hash-locked
+GitHub API/README snapshots; an inference study must not silently substitute a
+third-party checkpoint.
+
+Option 0 permits author-checkpoint inference only. It explicitly forbids
+training and Phase C. After reconciliation it emits the residual training bill,
+which requires separate explicit approval before any training launcher exists.
+
 ## Phase C: pre-registered audit sweep (not run in Phase A)
 
 The hypothesis and definitions below are fixed before Phase C opens any audit
