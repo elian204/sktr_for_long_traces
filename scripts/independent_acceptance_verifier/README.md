@@ -65,6 +65,22 @@ positive (or two positive and none below −0.1), zero OOF videos fall below −
 helpful:harmful changed frames ≥3:1, and pooled ΔEdit/ΔF1@25 are non-negative.
 Failure closes the campaign without any outer evaluation.
 
+The implementation keeps the four outer folds isolated: for each outer fold it
+rotates over the three subject-disjoint inner folds, giving 12 held-inner
+evaluations. Threshold selection itself is two-way cross-fit inside the two
+tuning folds; the final rotation model is then refit on both and evaluated once
+on the untouched third. The four outer-fold results are combined within each
+held-inner index before applying the pre-registered three-evaluation consistency
+rule. This avoids training a verifier on a duplicated video from another outer
+fold.
+
+The frozen TCN projects each 2048-D frame feature to 256 dimensions, consumes 48
+resampled core bins plus 16 span-length-matched context bins on either side, and
+uses dilations 1/2/4/8. Candidate and incumbent class embeddings are concatenated
+only after temporal pooling. Proposal probabilities are never model inputs or
+acceptance features; they are used solely to upweight high-confidence harmful
+training negatives. This preserves the campaign's independent-acceptance claim.
+
 ## V2 — corrected masked sampling as candidate generation only (blocked)
 
 V2 may run in parallel with V1 after V0 review. It uses the pre-registered
