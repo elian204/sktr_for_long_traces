@@ -85,6 +85,23 @@ Option 0 permits author-checkpoint inference only. It explicitly forbids
 training and Phase C. After reconciliation it emits the residual training bill,
 which requires separate explicit approval before any training launcher exists.
 
+### Phase B residual MS-TCN++ retraining
+
+Fable approved the residual 13 official-config trainings on 2026-08-01 after
+Option 0 reproduced author-ASFormer Breakfast to a maximum absolute paper-row
+delta of 0.036 percentage points and verified that no official MS-TCN++ weights
+are available. The production matrix is MS-TCN++ × GTEA folds 1–4, 50Salads
+folds 1–5, and Breakfast folds 1–4. Every fold uses the untouched authors'
+configuration: 100 epochs, batch size 1, learning rate 5e-4, 64 feature maps,
+11 prediction-generation layers, 10 refinement layers, and 3 refinements.
+
+The study copies the clean official source at Git `f423a9e` into an isolated
+runtime per fold, hash-locks every feature/GT/split input, and exports the final
+stage probabilities without altering the training implementation. Four queues
+use two consecutive free-GPU checks and never preempt another process. Phase C
+stays closed until the resulting paper reconciliation receives a separate
+review.
+
 ## Phase C: pre-registered audit sweep (not run in Phase A)
 
 The hypothesis and definitions below are fixed before Phase C opens any audit
@@ -137,4 +154,8 @@ script suite only after Phase-A review.
   --study-dir /data1/eli-bogdanov/sktr_runs/cross_backbone_error_audit_phase_a_review_v1
 
 /data1/eli-bogdanov/sktr_runs/cross_backbone_error_audit_phase_a_review_v1/run_phase_a.sh
+
+/usr/bin/python scripts/cross_backbone_error_audit/prepare_phase_b_training.py \
+  --study-dir /data1/eli-bogdanov/sktr_runs/cross_backbone_phase_b_mstcn2_v1 \
+  --authorize-training --fable-approval-digest APPROVAL_DIGEST
 ```
