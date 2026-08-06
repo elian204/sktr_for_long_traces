@@ -104,6 +104,52 @@ use two consecutive free-GPU checks and never preempt another process. Phase C
 stays closed until the resulting paper reconciliation receives a separate
 review.
 
+### Phase B Step 0: validation-only checkpoint selection
+
+The epoch-100 reconciliation failure is treated as a scientific protocol issue,
+not a cosmetic discrepancy. All 100 checkpoints exist for each of the 13
+MS-TCN++ cells. Breakfast degrades sharply late in training while GTEA and
+50Salads are comparatively stable; the authors have also confirmed that their
+published MS-TCN++ rows selected the best epoch on the test set. We do not
+repeat that test-selected protocol.
+
+Before any probe runs, this package fixes a deterministic validation-only rule.
+Within each official training fold, cases are ranked by
+`sha256(cross-backbone-step0-carve-v1|dataset|fold|case_id)` and the first
+`ceil(0.15*N)` form the carve. Original bundle order is retained inside both
+partitions. Existing checkpoints are evaluated on the carve at epochs 5, 10,
+..., 95, 100 plus 96–99. The checkpoint composite is the arithmetic mean of
+Edit, F1@10, and F1@25, with earlier epoch winning an exact tie.
+
+A Breakfast fold is informative only if its composite peaks no later than epoch
+85 and drops by at least 5 percentage points by epoch 100. If all four
+Breakfast folds are informative, Branch A selects each of all 13 cells by that
+carved-validation composite using the existing checkpoints. This branch is
+explicitly labeled as a seen-video diagnostic because carve videos participated
+in those trainings. Otherwise Branch B retrains all 13 cells on train-minus-
+carve and performs genuine held-out validation selection with the official
+configuration otherwise unchanged. No test prediction or metric can enter
+either branch decision or checkpoint selection.
+
+Separately, the same checkpoint grid is evaluated on the official test folds as
+a descriptive trajectory exhibit. It lives in a separate namespace, carries
+checkpoint hashes, and is firewalled from the selection finalizer. Published
+numbers remain the reconciliation reference; the trajectory only explains the
+observed deviation.
+
+The future Phase-C loader must hard-error on any input under
+`~/cross_backbone_pred_cache/`. It accepts only digest-recorded Phase-B selected
+exports and author-release exports. Phase C additionally pre-registers absolute
+error rates per GT segment and per minute, Breakfast checkpoint sensitivity at
+selected/epoch-100/epoch-30 for MS-TCN++ and ASFormer, and the disclosure that
+ASFormer/DiffAct use author-released checkpoints while MS-TCN++ is selected by
+our validation protocol. ASFormer's selected sensitivity reference is its
+author-release epoch-120 checkpoint.
+
+The staged Step-0 study is review-only: all inference, conditional training,
+selected-export, and Phase-C permissions default to false. V1/V2 repair studies
+remain closed and immutable.
+
 ## Phase C: pre-registered audit sweep (not run in Phase A)
 
 The hypothesis and definitions below are fixed before Phase C opens any audit
