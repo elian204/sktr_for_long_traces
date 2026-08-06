@@ -46,6 +46,31 @@ def source_disclosure(backbone: str, arm: str, analysis_role: str) -> str:
     return str(disclosure[backbone])
 
 
+def align_analysis_timeline(
+    probability: np.ndarray,
+    prediction: np.ndarray,
+    *,
+    target_frames: int,
+    sample_rate: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Normalize native-rate exports to the common full 15-fps GT timeline."""
+    if probability.shape[1] != len(prediction):
+        raise RuntimeError("Probability/prediction timeline drift")
+    if len(prediction) == target_frames:
+        return probability, prediction, 1
+    expected_native_frames = len(range(0, target_frames, sample_rate))
+    if sample_rate <= 1 or len(prediction) != expected_native_frames:
+        raise RuntimeError(
+            f"Unsupported native timeline: export={len(prediction)} "
+            f"target={target_frames} sample_rate={sample_rate}"
+        )
+    expanded_probability = np.repeat(probability, sample_rate, axis=1)[:, :target_frames]
+    expanded_prediction = np.repeat(prediction, sample_rate)[:target_frames]
+    if expanded_probability.shape[1] != target_frames or len(expanded_prediction) != target_frames:
+        raise AssertionError("Full-timeline expansion failed")
+    return expanded_probability, expanded_prediction, sample_rate
+
+
 def materialized_exports(study: Path, config: Mapping[str, Any]) -> dict[tuple[str, str, int, str], Path]:
     result: dict[tuple[str, str, int, str], Path] = {}
     required = []
@@ -284,11 +309,19 @@ def execute(study: Path) -> None:
             fold, case_id, sample_rate = int(case.fold), str(case.case_id), int(case.sample_rate)
             dfg_cache.setdefault((dataset, fold), dfg_for(study, config, dataset, fold))
             gt_names = read_nonempty_lines(paths[f"data/{dataset}/ground_truth/{case_id}"])
-            gt = np.asarray([name_to_id[label] for label in gt_names], dtype=np.int64)[::sample_rate]
+            gt = np.asarray([name_to_id[label] for label in gt_names], dtype=np.int64)
             probability, prediction, disagreement = load_probability_and_prediction(
                 study=study, paths=paths, materialized=materialized, backbone=backbone,
                 dataset=dataset, fold=fold, case_id=case_id, arm=arm,
             )
+            source_frames = len(prediction)
+            probability, prediction, expansion_factor = align_analysis_timeline(
+                probability,
+                prediction,
+                target_frames=len(gt_names),
+                sample_rate=sample_rate,
+            )
+            disagreement = int(np.sum(prediction != probability.argmax(axis=0)))
             if probability.shape != (len(id_to_name), len(gt)) or prediction.shape != gt.shape:
                 raise RuntimeError(f"Phase-C frame/class alignment drift: {backbone}/{dataset}/{case_id}")
             row = analyze_case(gt=gt, prediction=prediction, probability=probability, dfg=dfg_cache[(dataset, fold)], background=background)
@@ -298,6 +331,9 @@ def execute(study: Path) -> None:
                     "dataset": dataset, "fold": fold, "case_id": case_id, "arm": arm,
                     "analysis_role": arm_record["analysis_role"],
                     "source_asymmetry": source_disclosure(backbone, arm, arm_record["analysis_role"]),
+                    "native_export_frames": source_frames,
+                    "analysis_timeline_frames": len(prediction),
+                    "timeline_expansion_factor": expansion_factor,
                     "official_prediction_vs_probability_argmax_disagreement_frames": disagreement,
                     **row,
                 }

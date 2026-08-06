@@ -21,7 +21,7 @@ from phase_c_common import (  # noqa: E402
     exact_one_sided_sign_p,
     holm_adjust,
 )
-from run_phase_c_audit import source_disclosure  # noqa: E402
+from run_phase_c_audit import align_analysis_timeline, source_disclosure  # noqa: E402
 from materialize_phase_c_asformer import load_model_class  # noqa: E402
 from phase_c_taxonomy import (  # noqa: E402
     DFG,
@@ -194,3 +194,33 @@ def test_asformer_loader_resolves_hash_locked_sibling_import(tmp_path: Path) -> 
     )
     loaded = load_model_class(tmp_path / "model.py")
     assert loaded.sibling_value == 7
+
+
+def test_native_sample_rate_export_expands_to_common_full_timeline() -> None:
+    probability = np.asarray([[0.8, 0.2, 0.7], [0.2, 0.8, 0.3]])
+    prediction = np.asarray([0, 1, 0])
+    expanded_probability, expanded_prediction, factor = align_analysis_timeline(
+        probability, prediction, target_frames=5, sample_rate=2
+    )
+    assert factor == 2
+    assert expanded_probability.shape == (2, 5)
+    assert expanded_prediction.tolist() == [0, 0, 1, 1, 0]
+    assert np.allclose(expanded_probability[:, 0], expanded_probability[:, 1])
+
+
+def test_full_resolution_export_is_not_resampled() -> None:
+    probability = np.asarray([[0.8, 0.2], [0.2, 0.8]])
+    prediction = np.asarray([0, 1])
+    output_probability, output_prediction, factor = align_analysis_timeline(
+        probability, prediction, target_frames=2, sample_rate=2
+    )
+    assert factor == 1
+    assert output_probability is probability
+    assert output_prediction is prediction
+
+
+def test_unrecognized_export_timeline_fails_closed() -> None:
+    with pytest.raises(RuntimeError, match="Unsupported native timeline"):
+        align_analysis_timeline(
+            np.ones((2, 4)) / 2, np.zeros(4, dtype=int), target_frames=10, sample_rate=2
+        )

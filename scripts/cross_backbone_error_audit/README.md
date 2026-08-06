@@ -217,6 +217,12 @@ and the GT class's best rank under probability ties (top-2/3/5, median, p90).
 
 Every fold and dataset table places two conventions side by side:
 
+Before aggregation, any native sample-rate export is deterministically repeated
+and trimmed onto the full 15-fps GT timeline. Full-resolution exports are left
+unchanged. This makes boundary widths, frame counts, and per-minute rates
+physically comparable across backbones; the native length and expansion factor
+remain in the per-case table and any unsupported length hard-fails.
+
 - `frame_weighted`: frame or segment numerators and denominators are pooled
   before division; accuracy and segmental F1 use their conventional pooled
   definitions, while Edit retains the conventional unweighted video mean.
