@@ -150,40 +150,109 @@ The staged Step-0 study is review-only: all inference, conditional training,
 selected-export, and Phase-C permissions default to false. V1/V2 repair studies
 remain closed and immutable.
 
-## Phase C: pre-registered audit sweep (not run in Phase A)
+## Phase C: pre-registered cross-backbone audit sweep
 
-The hypothesis and definitions below are fixed before Phase C opens any audit
-result.
+R6 accepted the selected-checkpoint reconciliation and authorized **staging**, not
+execution. The review package therefore keeps `phase_c_allowed=false`,
+`asformer_materialization_allowed=false`, and `audit_execution_allowed=false`.
+It contains no approval digest, launches no process, and is not committed before
+the digest review. All definitions below are frozen before the audit sees a
+Phase-C result.
 
-- `boundary_timing`: a wrong frame within ±25 frames of a GT transition whose
-  prediction equals either adjacent GT label.
-- `present_nonadjacent`: not boundary timing, and the wrong predicted label
-  occurs elsewhere in that video's GT.
-- `absent_label_confusion`: not boundary timing, and the predicted label is
-  absent from that video's GT. These three buckets are mutually exclusive and
-  partition all wrong frames.
-- `wrong_label_span_mass`: error frames inside predicted segments whose strict
-  GT-majority label differs from the predicted label.
-- `long_substitution_share`: error frames in a contiguous wrong span of at least
-  100 frames whose modal predicted label occupies at least 90% of the span.
-- `illegal_transition_rate`: unseen edges in the collapsed predicted trace,
-  relative to the fold-pure train-GT directly-follows graph. Start/end edges are
-  reported separately from internal edges.
-- `over_segmentation_ratio`: predicted non-background segment count divided by
-  GT non-background segment count.
-- `candidate_rank`: the GT class rank in the probability matrix at each wrong
-  frame; report top-2/3/5 coverage, median, and p90.
+### Headline matrix and source asymmetry
 
-For every headline metric and taxonomy share, Phase C reports:
+The headline matrix is MS-TCN++ → ASFormer → DiffAct on all official folds of
+GTEA, 50Salads, and Breakfast:
 
-1. the conventional paper aggregation;
-2. a frame-weighted or segment-count-weighted aggregation as applicable; and
-3. an unweighted per-video macro aggregation with fold spread.
+- MS-TCN++ uses the Phase-B checkpoints selected only on the genuine carved
+  training validation set. These are our official-config retrainings on
+  train-minus-carve.
+- ASFormer uses the authors' released epoch-120 checkpoints. The already
+  accepted Option-0 Breakfast exports are consumed directly; the missing GTEA
+  and 50Salads exports are inference-only materializations from the same
+  hash-locked official archive.
+- DiffAct uses the existing official-release probability matrices and official
+  postprocessed predictions. The audit records their disagreement with
+  probability argmax rather than silently replacing the official prediction.
 
-DiffAct uses the already hash-locked official release exports from the completed
-GTEA, Breakfast, and 50Salads studies; it is not regenerated. Phase C produces
-the model-generation table, per-dataset findings, and a releasable manifest and
-script suite only after Phase-A review.
+This asymmetry is disclosed in every report. Local ASFormer Breakfast epoch-30
+and epoch-100 checkpoints are descriptive sensitivity arms only and are loaded
+with the separately hash-locked local source that produced their registered
+attention-mask buffers. They never enter the headline generation test. The
+original full-train epoch-100 MS-TCN++
+exports for GTEA and 50Salads are likewise a pre-registered robustness
+comparator, not a replacement for the selected primary.
+
+### Exclusive error taxonomy
+
+The four buckets use this fixed precedence and partition every wrong frame:
+
+1. `boundary_offset`: a wrong frame within ±25 analysis frames of a GT
+   transition whose predicted label is one of the two labels adjacent to that
+   transition. Widths 10 and 50 are reported as orthogonal sensitivity
+   readouts.
+2. `fragmentation`: a remaining wrong frame in an internal predicted island of
+   at most 25 frames, fully contained within one GT segment and bounded on both
+   sides by that GT label.
+3. `illegal_order`: a remaining wrong frame in the destination predicted
+   segment of an illegal start or internal transition in the fold-pure training
+   DFG, or in an illegal final segment.
+4. `legal_substitution`: every remaining wrong frame. This bucket is split
+   descriptively into predicted labels that occur elsewhere in the video's GT
+   (`present_nonadjacent`) and labels absent from that video's GT.
+
+The DFG is discovered separately for each official fold from full **training GT
+only**, after applying that dataset's evaluation sample rate and collapsing
+runs. Its legal starts, internal directly-follows edges, and legal ends are all
+checked. The per-case invariant
+`boundary_offset + fragmentation + illegal_order + legal_substitution = all
+wrong frames` is a hard failure, not a report warning.
+
+Orthogonal readouts reproduce the original taxonomy harness: wrong-label span
+mass, long homogeneous substitutions (error span length ≥100 and modal
+prediction ≥90%), illegal internal/start/end counts, over-segmentation ratio,
+and the GT class's best rank under probability ties (top-2/3/5, median, p90).
+
+### Aggregation and hypothesis test
+
+Every fold and dataset table places two conventions side by side:
+
+- `frame_weighted`: frame or segment numerators and denominators are pooled
+  before division; accuracy and segmental F1 use their conventional pooled
+  definitions, while Edit retains the conventional unweighted video mean.
+- `per_video_macro`: the unweighted mean of each per-video readout. Error-share
+  means exclude zero-error videos and explicitly report that denominator.
+
+For each exclusive bucket, both tables include counts and shares plus absolute
+rates in frames and contiguous bucket spans per GT segment and per minute. Time
+uses the fixed 15-fps analysis convention. Per-video, per-fold, and pooled
+tables remain available so fold spread is visible.
+
+The primary model-generation hypothesis has three endpoints across the 13
+official dataset-fold pairs: fragmentation frames/min decreases, illegal-order
+frames/min decreases, and legal-substitution share increases from MS-TCN++ to
+DiffAct. Each endpoint uses a paired, one-sided exact sign test on DiffAct minus
+MS-TCN++; Holm correction covers the three endpoints. Support requires all
+three adjusted p-values ≤0.05 and all three pooled directions to agree. The
+three-backbone monotonic rows and per-dataset directions are descriptive and
+remain visible whether or not the primary rule passes.
+
+Breakfast checkpoint sensitivity recomputes the complete taxonomy for
+selected/epoch-100/epoch-30 MS-TCN++ and ASFormer (where ASFormer's selected arm
+is the author epoch-120 model). GTEA and 50Salads separately repeat the taxonomy
+share comparison with the original full-train epoch-100 MS-TCN++ exports.
+
+### Provenance and releasable package
+
+The input manifest admits only digest-recorded Phase-B selected exports,
+Option-0 ASFormer artifacts, the official ASFormer archive/source, official
+DiffAct exports, and official data assets. Any path resolving under
+`~/cross_backbone_pred_cache/` hard-fails, including through a symlink. The
+staged `release/audit_suite/` contains one copy of each source/test file plus the
+frozen config, manifest, case index, analysis-arm table, and a release digest.
+After approval and execution, the results package will add per-case/fold/dataset
+tables, the centerpiece generation table and hypothesis test, checkpoint
+sensitivity and robustness tables, per-dataset findings, and an output digest.
 
 ## Governance
 
