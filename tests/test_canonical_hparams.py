@@ -66,6 +66,50 @@ def main():
             failures.append(f'CANONICAL_DECODE[{k!r}] changed: {CANONICAL_DECODE[k]!r} != {v!r}. '
                             'If deliberate, update this test AND SKTR_HYPERPARAMETERS.md.')
 
+    # Keys in the decoder-kwargs dicts are passed as **cfg to
+    # incremental_softmax_recovery(). An artifact-only key there raises TypeError
+    # at run time -- exactly what shipped in edaf85b when 'source_state' landed in
+    # the wrong dict and killed both arms of a 53 CPU-h run five minutes in.
+    # AST-based: the dict is built as base_config -> cfg.copy() -> cfg.update(),
+    # so a text scan from the call site misses it.
+    try:
+        import ast as _ast
+        import inspect
+        from src.incremental_softmax_recovery import incremental_softmax_recovery
+        accepted = set(inspect.signature(incremental_softmax_recovery).parameters)
+        tree = _ast.parse((ROOT / 'kfold_learning_curve_experiment.py').read_text())
+        keys = set()
+        for node in _ast.walk(tree):
+            dicts = []
+            # base_config = {...} / cfg = {...}
+            if isinstance(node, _ast.Assign) and isinstance(node.value, _ast.Dict):
+                names = [t.id for t in node.targets if isinstance(t, _ast.Name)]
+                if any(n in ('base_config', 'cfg') for n in names):
+                    dicts.append(node.value)
+            # def build_base_config(...): return {...}   <- the actual shape here
+            if isinstance(node, _ast.FunctionDef) and 'base_config' in node.name:
+                for sub in _ast.walk(node):
+                    if isinstance(sub, _ast.Return) and isinstance(sub.value, _ast.Dict):
+                        dicts.append(sub.value)
+            # cfg.update({...})
+            if (isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute)
+                    and node.func.attr == 'update' and node.args
+                    and isinstance(node.args[0], _ast.Dict)):
+                dicts.append(node.args[0])
+            for d in dicts:
+                for k in d.keys:
+                    if isinstance(k, _ast.Constant) and isinstance(k.value, str):
+                        keys.add(k.value)
+        unknown = sorted(k for k in keys if k not in accepted)
+        if not keys:
+            failures.append('decoder-kwargs check found no dict keys -- the check itself is broken')
+        elif unknown:
+            failures.append(
+                'decoder-kwargs dict contains key(s) incremental_softmax_recovery() does not '
+                f'accept: {unknown}. Artifact-only fields belong in the experiment_config dict.')
+    except Exception as exc:
+        failures.append(f'could not verify decoder kwargs against signature: {exc}')
+
     # Sanity: the detector must catch the historical mis-launch.
     if deviations_from_canonical({'candidate_top_k': 15, 'top_m': 3}) != {
             'candidate_top_k': (15, 3), 'conditioning_top_m': (3, 1)}:

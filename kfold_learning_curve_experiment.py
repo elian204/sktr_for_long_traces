@@ -162,6 +162,13 @@ def parse_args():
     )
     # Conformance checking parameters
     parser.add_argument(
+        '--test-cases',
+        type=str,
+        default=None,
+        help='Comma-separated test case IDs to decode (overrides --max-test-traces). '
+             'Use for designed samples where WHICH videos matter, not just how many.'
+    )
+    parser.add_argument(
         '--state-mode',
         type=str,
         choices=['exact', 'topm'],
@@ -314,8 +321,6 @@ def build_base_config(args, dataset_parallelization: bool, dataset_parallelizati
         # Search space restrictions
         'restrict_log_moves': args.restrict_log_moves,
         'restrict_model_moves_to_tau': args.restrict_model_moves_to_tau,
-        # Provenance: makes the run reconstructable from the artifact alone.
-        'source_state': source_state(),
     }
 
 
@@ -711,6 +716,7 @@ def main():
         'inner_parallel': dataset_parallelization,
         'unique_only': args.unique_only,
         'max_test_traces': args.max_test_traces,
+        'test_cases': args.test_cases,
         'chunk_size': args.chunk_size,
         'prob_threshold': args.prob_threshold,
         'candidate_top_k': args.candidate_top_k,
@@ -722,6 +728,11 @@ def main():
         'max_hist_len': 3,
         'restrict_log_moves': args.restrict_log_moves,
         'restrict_model_moves_to_tau': args.restrict_model_moves_to_tau,
+        # Provenance: makes the run reconstructable from the artifact alone.
+        # NOTE: this dict is written to JSON only. The decoder kwargs dict is a
+        # DIFFERENT dict earlier in this file -- adding keys there passes them
+        # straight into incremental_softmax_recovery() and raises TypeError.
+        'source_state': source_state(),
     }
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
@@ -796,8 +807,22 @@ def main():
             print(
                 f"  Fold {fold}: unique filter applied: train {orig_train}->{len(train_pool)}, test {orig_test}->{len(test_case_ids)}")
 
-        # Apply test trace limit if specified (for quick testing)
-        if args.max_test_traces is not None and len(test_case_ids) > args.max_test_traces:
+        # Explicit case selection takes precedence: a designed sample cares WHICH
+        # videos are decoded, not just how many. Fails loudly on unknown ids
+        # rather than silently decoding a smaller set than the design specifies.
+        if args.test_cases:
+            want = [c.strip() for c in args.test_cases.split(',') if c.strip()]
+            available = {str(c) for c in test_case_ids}
+            missing = [c for c in want if c not in available]
+            if missing:
+                raise SystemExit(
+                    f"--test-cases: {len(missing)} id(s) not in fold {fold} test set: {missing[:10]}"
+                    f" (fold test set has {len(available)} cases)")
+            by_id = {str(c): c for c in test_case_ids}
+            test_case_ids = [by_id[c] for c in want]
+            print(f"  Fold {fold}: train_pool={len(train_pool)}, "
+                  f"test={len(test_case_ids)} (EXPLICIT SELECTION)")
+        elif args.max_test_traces is not None and len(test_case_ids) > args.max_test_traces:
             test_case_ids = test_case_ids[:args.max_test_traces]
             print(
                 f"  Fold {fold}: train_pool={len(train_pool)}, test={len(test_case_ids)} (LIMITED)")
