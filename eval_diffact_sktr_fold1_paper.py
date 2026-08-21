@@ -37,6 +37,8 @@ import re
 
 import numpy as np
 import pandas as pd
+from sktr_hparams import CANONICAL_DECODE, format_banner  # single source of truth
+
 
 workspace_root = Path(__file__).resolve().parent
 if str(workspace_root) not in sys.path:
@@ -518,16 +520,16 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--data-root", type=str,
                         default=os.environ.get("DATA_ROOT", DEFAULT_DATA_ROOT))
-    parser.add_argument("--chunk-size", type=int, default=11,
-                        help="Conformance chunk size (kfold default: 11)")
-    parser.add_argument("--prob-threshold", type=float, default=1e-6)
+    parser.add_argument("--chunk-size", type=int, default=CANONICAL_DECODE['chunk_size'],
+                        help="Conformance chunk size (canonical: 11)")
+    parser.add_argument("--prob-threshold", type=float, default=CANONICAL_DECODE['prob_threshold'])
     parser.add_argument("--model-move-cost", type=float, default=1.0)
     parser.add_argument("--state-mode", type=str,
-                        default="topm", choices=["exact", "topm"])
-    parser.add_argument("--top-m", type=int, default=1)
-    parser.add_argument("--candidate-top-k", type=int, default=3)
-    parser.add_argument("--candidate-top-p", type=float, default=1.0)
-    parser.add_argument("--candidate-min-k", type=int, default=1)
+                        default=CANONICAL_DECODE['conditioning_state_mode'], choices=["exact", "topm"])
+    parser.add_argument("--top-m", type=int, default=CANONICAL_DECODE['conditioning_top_m'])
+    parser.add_argument("--candidate-top-k", type=int, default=CANONICAL_DECODE['candidate_top_k'])
+    parser.add_argument("--candidate-top-p", type=float, default=CANONICAL_DECODE['candidate_top_p'])
+    parser.add_argument("--candidate-min-k", type=int, default=CANONICAL_DECODE['candidate_min_k'])
     parser.add_argument(
         "--conformance-switch-penalty-weight",
         type=parse_nonnegative_float,

@@ -72,41 +72,16 @@ for mod in ['graphviz', 'matplotlib', 'PIL']:
 # HYPERPARAMETER CONFIGURATIONS
 # =============================================================================
 
-HP_STRATEGIES = {
-    'trigram_heavy': [0.1, 0.15, 0.75],
-    'unigram_super_heavy': [0.75, 0.15, 0.1],
-    'bigram_heavy': [0.15, 0.75, 0.1],
-    'balanced': [0.33, 0.34, 0.33],
-}
-
-# Dataset and model-specific default hyperparameters
-# Based on hyperparameter search results (lowest avg_rank = best)
-DATASET_HP_DEFAULTS = {
-    # 50 Salads ASFormer: alpha=0.3, unigram_super_heavy (avg_rank 7.33)
-    ('50salads', 'asformer'): {'alpha': 0.3, 'strategy': 'unigram_super_heavy'},
-    # 50 Salads MS-TCN2: alpha=0.3, trigram_heavy (avg_rank 3.33)
-    ('50salads', 'mstcn2'): {'alpha': 0.3, 'strategy': 'trigram_heavy'},
-    # GTEA ASFormer: alpha=0.95, trigram_heavy (avg_rank 6.0)
-    ('gtea', 'asformer'): {'alpha': 0.95, 'strategy': 'trigram_heavy'},
-    # GTEA MS-TCN2: alpha=0.95, trigram_heavy (avg_rank 2.0)
-    ('gtea', 'mstcn2'): {'alpha': 0.95, 'strategy': 'trigram_heavy'},
-    # Breakfast (HP search): alpha=0.7, trigram_heavy
-    ('breakfast', 'asformer'): {'alpha': 0.7, 'strategy': 'trigram_heavy'},
-    ('breakfast', 'mstcn2'): {'alpha': 0.7, 'strategy': 'trigram_heavy'},
-    # DiffAct: reuse ASFormer defaults until a dedicated HP sweep is run
-    ('50salads', 'diffact'): {'alpha': 0.3, 'strategy': 'unigram_super_heavy'},
-    ('gtea', 'diffact'): {'alpha': 0.95, 'strategy': 'trigram_heavy'},
-    ('breakfast', 'diffact'): {'alpha': 0.7, 'strategy': 'trigram_heavy'},
-}
-
-
-def get_dataset_hp_defaults(dataset: str, model: str) -> dict:
-    """Get default hyperparameters for a dataset/model combination."""
-    key = (dataset.lower(), model.lower())
-    if key in DATASET_HP_DEFAULTS:
-        return DATASET_HP_DEFAULTS[key]
-    # Fallback defaults
-    return {'alpha': 0.9, 'strategy': 'trigram_heavy'}
+# Hyperparameters are defined ONCE in sktr_hparams.py (single source of truth).
+# Do not redefine them here. See SKTR_HYPERPARAMETERS.md for what to use and why.
+from sktr_hparams import (
+    CANONICAL_DECODE,
+    HP_STRATEGIES,
+    DATASET_HP_DEFAULTS,
+    get_dataset_hp_defaults,
+    format_banner,
+    source_state,
+)
 
 # =============================================================================
 # COMMAND-LINE ARGUMENTS
@@ -190,25 +165,25 @@ def parse_args():
         '--state-mode',
         type=str,
         choices=['exact', 'topm'],
-        default='topm',
-        help='Conditioning state mode: exact (full history match) or topm (top-m states)'
+        default=CANONICAL_DECODE['conditioning_state_mode'],
+        help='Conditioning state mode: exact (full history match) or topm (top-m states). Canonical: topm.'
     )
     parser.add_argument(
         '--top-m',
         type=int,
-        default=3,
-        help='Number of top states to consider when state-mode=topm'
+        default=CANONICAL_DECODE['conditioning_top_m'],
+        help='Number of top conditioning states (canonical: 1). Inert unless --state-mode=topm.'
     )
     parser.add_argument(
         '--chunk-size',
         type=int,
-        default=11,
+        default=CANONICAL_DECODE['chunk_size'],
         help='Chunk size for conformance checking'
     )
     parser.add_argument(
         '--prob-threshold',
         type=float,
-        default=1e-6,
+        default=CANONICAL_DECODE['prob_threshold'],
         help='Minimum probability threshold for pruning'
     )
     parser.add_argument(
@@ -225,19 +200,19 @@ def parse_args():
     parser.add_argument(
         '--candidate-top-k',
         type=int,
-        default=15,
-        help='Max candidate labels per timestamp (top-K)'
+        default=CANONICAL_DECODE['candidate_top_k'],
+        help='Max candidate labels per timestamp (canonical: 3). COST-CRITICAL: runtime and memory scale steeply with this.'
     )
     parser.add_argument(
         '--candidate-top-p',
         type=float,
-        default=1.0,
+        default=CANONICAL_DECODE['candidate_top_p'],
         help='Cumulative probability cutoff for candidate labels (top-p)'
     )
     parser.add_argument(
         '--candidate-min-k',
         type=int,
-        default=1,
+        default=CANONICAL_DECODE['candidate_min_k'],
         help='Minimum candidate labels per timestamp'
     )
     parser.add_argument(
@@ -339,6 +314,8 @@ def build_base_config(args, dataset_parallelization: bool, dataset_parallelizati
         # Search space restrictions
         'restrict_log_moves': args.restrict_log_moves,
         'restrict_model_moves_to_tau': args.restrict_model_moves_to_tau,
+        # Provenance: makes the run reconstructable from the artifact alone.
+        'source_state': source_state(),
     }
 
 
@@ -703,6 +680,20 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
     print(f"  Results directory: {results_dir}")
 
+    # Effective-config banner: makes a non-canonical run announce itself
+    # instead of silently costing an order of magnitude more compute.
+    print(format_banner({
+        'candidate_top_k': args.candidate_top_k,
+        'candidate_top_p': args.candidate_top_p,
+        'candidate_min_k': args.candidate_min_k,
+        'candidate_source': 'conditioned',
+        'state_mode': args.state_mode,
+        'top_m': args.top_m,
+        'max_hist_len': 3,
+        'chunk_size': args.chunk_size,
+        'prob_threshold': args.prob_threshold,
+    }), flush=True)
+
     # Save experiment config
     config_path = results_dir / 'experiment_config.json'
     config = {
@@ -723,6 +714,12 @@ def main():
         'chunk_size': args.chunk_size,
         'prob_threshold': args.prob_threshold,
         'candidate_top_k': args.candidate_top_k,
+        'candidate_top_p': args.candidate_top_p,
+        'candidate_min_k': args.candidate_min_k,
+        'candidate_source': 'conditioned',
+        'state_mode': args.state_mode,
+        'top_m': args.top_m,
+        'max_hist_len': 3,
         'restrict_log_moves': args.restrict_log_moves,
         'restrict_model_moves_to_tau': args.restrict_model_moves_to_tau,
     }

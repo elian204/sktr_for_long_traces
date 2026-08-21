@@ -1,5 +1,9 @@
 # Incremental Softmax Recovery for Long Traces
 
+> **Hyperparameters:** don't pass decode flags — the defaults are canonical.
+> See [SKTR_HYPERPARAMETERS.md](SKTR_HYPERPARAMETERS.md) for what to use and why.
+
+
 A Python system for incrementally recovering activity sequences from softmax probability matrices using conformance checking with Petri nets.
 
 ## 🎯 Overview
