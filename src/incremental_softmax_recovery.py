@@ -848,7 +848,12 @@ def incremental_softmax_recovery(
 
     # 7. Model discovery
     logger.info("Discovering Petri net model from training data.")
-    model = discover_petri_net(train_df)
+    # Export the net as PNML alongside the visualisation. Without it the pm4py
+    # net is discarded and conformance of predictions cannot be tested post hoc.
+    model = discover_petri_net(
+        train_df,
+        pnml_path=(f"{save_model_path}.pnml" if save_model else None),
+    )
     model.enable_caching(True, max_size=enabled_cache_size)
     
     if save_model:

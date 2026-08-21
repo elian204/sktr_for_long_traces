@@ -7,6 +7,7 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import logging
 import pm4py
 
 from .classes import Arc, Marking, PetriNet, Place, Transition
@@ -14,7 +15,8 @@ from .classes import Arc, Marking, PetriNet, Place, Transition
 
 def discover_petri_net(
     train_df: pd.DataFrame,
-    non_sync_penalty: float = 1.0
+    non_sync_penalty: float = 1.0,
+    pnml_path: Optional[str] = None
 ) -> PetriNet:
     """
     Discover an inductive Petri net from training traces.
@@ -25,7 +27,14 @@ def discover_petri_net(
         Training DataFrame with columns 'case:concept:name' and 'concept:name'
     non_sync_penalty : float
         Penalty weight for non-synchronous transitions
-        
+    pnml_path : str, optional
+        If given, write the discovered net to this path as PNML before the
+        internal conversion. The pm4py net is otherwise discarded, which makes
+        post-hoc conformance testing of predictions impossible — see
+        evidence_lock_v1/SWD_PILOT_FINDINGS.md, where a run's net survived only
+        as PNG/PDF and the "was argmax already conformant?" question could not
+        be answered. Failure to write is logged, never raised.
+
     Returns
     -------
     PetriNet
@@ -34,7 +43,16 @@ def discover_petri_net(
     prep_df = prepare_df_for_discovery(train_df)
     
     net, init_marking, final_marking = pm4py.discover_petri_net_inductive(prep_df)
-    
+
+    if pnml_path:
+        try:
+            import os
+            os.makedirs(os.path.dirname(os.path.abspath(pnml_path)), exist_ok=True)
+            pm4py.write_pnml(net, init_marking, final_marking, pnml_path)
+            logging.getLogger(__name__).info("Petri net exported as PNML to %s", pnml_path)
+        except Exception as exc:  # provenance capture must never kill a run
+            logging.getLogger(__name__).warning("Failed to write PNML to %s: %s", pnml_path, exc)
+
     model = convert_pm4py_to_petrinet(
         discovered_model=net,
         non_sync_penalty=non_sync_penalty,
