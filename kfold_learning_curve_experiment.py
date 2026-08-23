@@ -35,6 +35,7 @@ import sys
 import logging
 import time
 import argparse
+import hashlib
 import json
 import traceback
 from pathlib import Path
@@ -161,6 +162,12 @@ def parse_args():
         help='Comma-separated k values (e.g., "1,5,10"). Default: dataset-specific values.'
     )
     # Conformance checking parameters
+    parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Write per-video checkpoints and reuse completed ones on restart. '
+             'STRONGLY RECOMMENDED for long runs: without it a crash loses the whole run.'
+    )
     parser.add_argument(
         '--test-cases',
         type=str,
@@ -337,6 +344,7 @@ def run_single_fold_k_experiment(
     dataset_name: str,
     results_dir: Path,
     save_models: bool = False,
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a single experiment for one fold and one k value.
@@ -352,7 +360,50 @@ def run_single_fold_k_experiment(
         save_model_path = str(results_dir / f'petri_net_fold{fold}_k{k}')
 
     cfg = base_config.copy()
+    # Per-video checkpoint directory is CONTENT-ADDRESSED on the effective decode
+    # config. The library's checkpoint loader validates only column presence and
+    # row count -- NOT the configuration that produced the rows. Without this, a
+    # rerun at a different alpha/top_k/train-set would silently reuse the previous
+    # config's per-video outputs and yield a wrong-but-plausible table.
+    ckpt_dir = None
+    if resume:
+        sig = {k_: cfg.get(k_) for k_ in (
+            'conditioning_alpha', 'conditioning_interpolation_weights',
+            'candidate_top_k', 'candidate_top_p', 'candidate_min_k',
+            'conditioning_state_mode', 'conditioning_top_m', 'chunk_size',
+            'prob_threshold', 'max_hist_len', 'model_move_cost',
+            'restrict_log_moves', 'restrict_model_moves_to_tau',
+            # added after external review: all of these change decode output
+            'random_seed', 'n_indices', 'n_per_run', 'sequential_sampling',
+            'independent_sampling', 'cost_function', 'log_move_cost', 'tau_move_cost',
+            'round_precision', 'conformance_switch_penalty_weight',
+            'conditioning_n_prev_labels', 'candidate_source', 'candidate_apply_to_sync',
+            'max_consecutive_tau_moves', 'merge_mismatched_boundaries',
+            'use_calibration', 'temperature', 'non_sync_penalty',
+            'compute_marking_transition_map', 'adaptive_chunk_sizing', 'max_chunk_size')}
+        sig['alpha'] = alpha
+        sig['weights'] = list(weights)
+        # ORDER matters: _extract_cases orders data by this list, so do NOT sort.
+        sig['train_cases'] = [str(c) for c in train_case_ids]   # determines the discovered net
+        digest = hashlib.sha256(
+            json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:32]
+        ckpt_dir = str(results_dir / f'case_outputs_fold{fold}_k{k}_{digest}')
+        # Manifest sidecar: the hash isolates, this makes the isolation auditable
+        # and catches a digest collision instead of silently reusing another config.
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        mf = Path(ckpt_dir) / 'checkpoint_manifest.json'
+        if mf.exists():
+            prev = json.loads(mf.read_text())
+            if prev.get('signature') != sig:
+                raise SystemExit(
+                    f'Checkpoint digest collision at {ckpt_dir}: manifest config differs from '
+                    'the current run. Refusing to reuse. Delete the directory to recompute.')
+        else:
+            mf.write_text(json.dumps({'digest': digest, 'signature': sig,
+                                      'fold': fold, 'k': k}, indent=2, default=str))
     cfg.update({
+        'case_output_dir': ckpt_dir,
+        'resume_case_outputs': bool(resume),
         'conditioning_alpha': alpha,
         'conditioning_interpolation_weights': weights,
         'train_cases': train_case_ids,
@@ -576,7 +627,7 @@ def check_existing_fold_k(results_dir: Path, fold: int, k: int, config: dict) ->
                 'restrict_log_moves', 'restrict_model_moves_to_tau',
                 'candidate_top_k', 'candidate_top_p', 'candidate_min_k',
                 'prob_threshold', 'model_move_cost', 'state_mode', 'top_m',
-                'unique_only', 'max_test_traces',
+                'unique_only', 'max_test_traces', 'test_cases',
             ]
             for key in keys_to_check:
                 if saved_config.get(key) != config.get(key):
@@ -717,6 +768,7 @@ def main():
         'unique_only': args.unique_only,
         'max_test_traces': args.max_test_traces,
         'test_cases': args.test_cases,
+        'resume': args.resume,
         'chunk_size': args.chunk_size,
         'prob_threshold': args.prob_threshold,
         'candidate_top_k': args.candidate_top_k,
@@ -769,6 +821,7 @@ def main():
 
     # Build config dict for skip-existing validation (all params that affect results)
     run_config = {
+        'test_cases': args.test_cases,
         'alpha': alpha,
         'strategy': strategy,
         'seed': args.seed,
@@ -903,6 +956,7 @@ def main():
                 dataset_name=args.dataset,
                 results_dir=results_dir,
                 save_models=not args.no_save_models,
+                resume=args.resume,
             )
             for job in jobs_to_run
         )
