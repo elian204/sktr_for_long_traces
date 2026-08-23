@@ -169,6 +169,12 @@ def parse_args():
              'STRONGLY RECOMMENDED for long runs: without it a crash loses the whole run.'
     )
     parser.add_argument(
+        '--allow-source-drift',
+        action='store_true',
+        help='Reuse checkpoints whose manifest records a different git state. Only when the '
+             'code change is provably irrelevant to decode output.'
+    )
+    parser.add_argument(
         '--test-cases',
         type=str,
         default=None,
@@ -331,6 +337,32 @@ def build_base_config(args, dataset_parallelization: bool, dataset_parallelizati
     }
 
 
+def export_identity(dataset_name: str, model_source: str) -> dict:
+    """Identity of the softmax export feeding a run.
+
+    R2: expected_len and case-id cannot detect CHANGED logits at the same length,
+    so export identity must be compared, not merely recorded. Digest is over the
+    sorted (relative path, size, mtime_ns) of every file under the export root --
+    cheap, and sensitive to replacement or in-place modification.
+    """
+    home = Path.home()
+    src = model_source.lower()
+    if src == 'asformer':
+        root = home / 'ASFormer' / 'results' / dataset_name
+    elif src == 'mstcn2':
+        root = home / 'MS-TCN2' / 'results' / dataset_name
+    else:
+        root = Path(__file__).resolve().parent / 'baselines' / 'DiffAct' / 'results' / dataset_name
+    if not root.exists():
+        return {'export_root': str(root), 'exists': False, 'digest': None}
+    entries = []
+    for f in sorted(root.rglob('*')):
+        if f.is_file():
+            st = f.stat()
+            entries.append((str(f.relative_to(root)), st.st_size, st.st_mtime_ns))
+    h = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
+    return {'export_root': str(root), 'exists': True, 'n_files': len(entries), 'digest': h}
+
 def run_single_fold_k_experiment(
     df: pd.DataFrame,
     softmax_lst: List[np.ndarray],
@@ -345,6 +377,7 @@ def run_single_fold_k_experiment(
     results_dir: Path,
     save_models: bool = False,
     resume: bool = False,
+    allow_source_drift: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a single experiment for one fold and one k value.
@@ -385,6 +418,7 @@ def run_single_fold_k_experiment(
         sig['weights'] = list(weights)
         # ORDER matters: _extract_cases orders data by this list, so do NOT sort.
         sig['train_cases'] = [str(c) for c in train_case_ids]   # determines the discovered net
+        sig['export_identity'] = export_identity(dataset_name, model_source)   # R2
         digest = hashlib.sha256(
             json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:32]
         ckpt_dir = str(results_dir / f'case_outputs_fold{fold}_k{k}_{digest}')
@@ -392,15 +426,34 @@ def run_single_fold_k_experiment(
         # and catches a digest collision instead of silently reusing another config.
         Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
         mf = Path(ckpt_dir) / 'checkpoint_manifest.json'
+        cur_src = source_state()
         if mf.exists():
             prev = json.loads(mf.read_text())
             if prev.get('signature') != sig:
                 raise SystemExit(
                     f'Checkpoint digest collision at {ckpt_dir}: manifest config differs from '
                     'the current run. Refusing to reuse. Delete the directory to recompute.')
+            # R3: recording provenance without comparing it is not invalidation.
+            prev_src = prev.get('source_state') or {}
+            if (prev_src.get('git_head') != cur_src.get('git_head')
+                    or prev_src.get('dirty_files') != cur_src.get('dirty_files')):
+                if not allow_source_drift:
+                    raise SystemExit(
+                        f'Checkpoint source-state mismatch at {ckpt_dir}: checkpoints were produced '
+                        f"at git {prev_src.get('git_head','?')[:12]} with a different working tree "
+                        f"than the current {cur_src.get('git_head','?')[:12]}. Delete the directory "
+                        'to recompute, or pass --allow-source-drift if the change is provably '
+                        'irrelevant to decode output.')
         else:
-            mf.write_text(json.dumps({'digest': digest, 'signature': sig,
-                                      'fold': fold, 'k': k}, indent=2, default=str))
+            # R4: a manifest-less but non-empty directory would let stale checkpoints
+            # be adopted by a freshly written manifest.
+            existing = [q for q in Path(ckpt_dir).iterdir() if q.name != 'checkpoint_manifest.json']
+            if existing:
+                raise SystemExit(
+                    f'Checkpoint directory {ckpt_dir} holds {len(existing)} file(s) but no manifest. '
+                    'Refusing to adopt unattributed checkpoints. Delete the directory to recompute.')
+            mf.write_text(json.dumps({'digest': digest, 'signature': sig, 'fold': fold, 'k': k,
+                                      'source_state': cur_src}, indent=2, default=str))
     cfg.update({
         'case_output_dir': ckpt_dir,
         'resume_case_outputs': bool(resume),
@@ -957,6 +1010,7 @@ def main():
                 results_dir=results_dir,
                 save_models=not args.no_save_models,
                 resume=args.resume,
+                allow_source_drift=args.allow_source_drift,
             )
             for job in jobs_to_run
         )
