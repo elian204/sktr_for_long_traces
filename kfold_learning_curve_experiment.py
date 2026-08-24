@@ -337,13 +337,46 @@ def build_base_config(args, dataset_parallelization: bool, dataset_parallelizati
     }
 
 
-def export_identity(dataset_name: str, model_source: str) -> dict:
-    """Identity of the softmax export feeding a run.
+SIGNATURE_SCHEMA_VERSION = 2
+_ABSENT = "<absent>"
 
-    R2: expected_len and case-id cannot detect CHANGED logits at the same length,
-    so export identity must be compared, not merely recorded. Digest is over the
-    sorted (relative path, size, mtime_ns) of every file under the export root --
-    cheap, and sensitive to replacement or in-place modification.
+
+def _canonical(value, path="sig"):
+    """Strict JSON-native normalisation for the checkpoint signature.
+
+    A generic default=str erases types: Path('x') and 'x' hash identically, tuples
+    become lists, and a callable stringifies with its memory address, which differs
+    between runs. Anything not JSON-native is rejected here rather than silently
+    coerced, so the signature cannot compare equal across genuinely different runs.
+    """
+    import math
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            raise SystemExit(f"checkpoint signature: non-finite float at {path}: {value!r}")
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_canonical(v, f"{path}[{i}]") for i, v in enumerate(value)]
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if not isinstance(k, str):
+                raise SystemExit(f"checkpoint signature: non-string key at {path}: {k!r}")
+            out[k] = _canonical(v, f"{path}.{k}")
+        return out
+    raise SystemExit(
+        f"checkpoint signature: value at {path} is {type(value).__name__}, which is not "
+        "JSON-native and cannot be compared reliably. Add explicit handling for it.")
+
+
+def export_identity(dataset_name: str, model_source: str) -> dict:
+    """Identity of the softmax export feeding a run, by CONTENT.
+
+    size+mtime was both over-invalidating (touch/copy/restore forces needless
+    recompute) and under-invalidating (changed bytes at identical size and
+    timestamp pass). Full content hashing of this export takes ~3.6s for 1.2 GB,
+    which is nothing against a multi-thousand-CPU-hour decode.
     """
     home = Path.home()
     src = model_source.lower()
@@ -354,14 +387,19 @@ def export_identity(dataset_name: str, model_source: str) -> dict:
     else:
         root = Path(__file__).resolve().parent / 'baselines' / 'DiffAct' / 'results' / dataset_name
     if not root.exists():
-        return {'export_root': str(root), 'exists': False, 'digest': None}
-    entries = []
+        return {'export_root': str(root), 'exists': False, 'content_digest': None, 'n_files': 0}
+    h = hashlib.sha256()
+    n = 0
     for f in sorted(root.rglob('*')):
         if f.is_file():
-            st = f.stat()
-            entries.append((str(f.relative_to(root)), st.st_size, st.st_mtime_ns))
-    h = hashlib.sha256(json.dumps(entries, sort_keys=True).encode()).hexdigest()
-    return {'export_root': str(root), 'exists': True, 'n_files': len(entries), 'digest': h}
+            h.update(str(f.relative_to(root)).encode())
+            with open(f, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b''):
+                    h.update(chunk)
+            n += 1
+    return {'export_root': str(root), 'exists': True, 'n_files': n,
+            'content_digest': h.hexdigest()}
+
 
 def run_single_fold_k_experiment(
     df: pd.DataFrame,
@@ -401,7 +439,7 @@ def run_single_fold_k_experiment(
     # config's per-video outputs and yield a wrong-but-plausible table.
     ckpt_dir = None
     if resume:
-        sig = {k_: cfg.get(k_) for k_ in (
+        sig = {k_: (cfg[k_] if k_ in cfg else _ABSENT) for k_ in (
             'conditioning_alpha', 'conditioning_interpolation_weights',
             'candidate_top_k', 'candidate_top_p', 'candidate_min_k',
             'conditioning_state_mode', 'conditioning_top_m', 'chunk_size',
@@ -420,8 +458,10 @@ def run_single_fold_k_experiment(
         # ORDER matters: _extract_cases orders data by this list, so do NOT sort.
         sig['train_cases'] = [str(c) for c in train_case_ids]   # determines the discovered net
         sig['export_identity'] = export_identity(dataset_name, model_source)   # R2
+        sig['_schema_version'] = SIGNATURE_SCHEMA_VERSION
+        sig = _canonical(sig)
         digest = hashlib.sha256(
-            json.dumps(sig, sort_keys=True, default=str).encode()).hexdigest()[:32]
+            json.dumps(sig, sort_keys=True, allow_nan=False).encode()).hexdigest()[:32]
         ckpt_dir = str(results_dir / f'case_outputs_fold{fold}_k{k}_{digest}')
         # Manifest sidecar: the hash isolates, this makes the isolation auditable
         # and catches a digest collision instead of silently reusing another config.
@@ -435,7 +475,18 @@ def run_single_fold_k_experiment(
                     f'Checkpoint digest collision at {ckpt_dir}: manifest config differs from '
                     'the current run. Refusing to reuse. Delete the directory to recompute.')
             # R3: recording provenance without comparing it is not invalidation.
+            for fld, cur in (('digest', digest), ('fold', fold), ('k', k)):
+                if prev.get(fld) != cur:
+                    raise SystemExit(
+                        f'Checkpoint manifest {fld} mismatch at {ckpt_dir}: '
+                        f'{prev.get(fld)!r} != {cur!r}. Refusing to reuse.')
             prev_src = prev.get('source_state') or {}
+            if str(prev_src.get('git_head','')).startswith('<no-repo') or \
+               str(cur_src.get('git_head','')).startswith('<no-repo'):
+                raise SystemExit(
+                    f'Checkpoint at {ckpt_dir} cannot be validated: source state is unknown '
+                    '(<no-repo-found>). Comparing unknown to unknown proves nothing. '
+                    'Delete the directory to recompute.')
             if (prev_src.get('git_head') != cur_src.get('git_head')
                     or prev_src.get('dirty_files') != cur_src.get('dirty_files')):
                 if not allow_source_drift:
@@ -454,7 +505,7 @@ def run_single_fold_k_experiment(
                     f'Checkpoint directory {ckpt_dir} holds {len(existing)} file(s) but no manifest. '
                     'Refusing to adopt unattributed checkpoints. Delete the directory to recompute.')
             mf.write_text(json.dumps({'digest': digest, 'signature': sig, 'fold': fold, 'k': k,
-                                      'source_state': cur_src}, indent=2, default=str))
+                                      'source_state': _canonical(cur_src)}, indent=2))
     cfg.update({
         'case_output_dir': ckpt_dir,
         'resume_case_outputs': bool(resume),
