@@ -150,7 +150,35 @@ def source_state(repo_root=None) -> dict:
     import hashlib
     import os
     import subprocess
-    root = repo_root or os.path.dirname(os.path.abspath(__file__))
+
+    def _find_repo(start):
+        """Walk up for a .git dir. Runs often execute from an isolated directory
+        holding a COPY of the entry point, where the copy's own path is not a repo
+        -- in that case git returns empty and any comparison against it is inert."""
+        d = os.path.abspath(start)
+        while True:
+            if os.path.exists(os.path.join(d, '.git')):
+                return d
+            parent = os.path.dirname(d)
+            if parent == d:
+                return None
+            d = parent
+
+    root = repo_root
+    if root is None:
+        # try this file, then the resolved location of the src package (usually a
+        # symlink into the real repo in isolated run dirs)
+        root = _find_repo(os.path.dirname(os.path.abspath(__file__)))
+        if root is None:
+            try:
+                import src as _src
+                root = _find_repo(os.path.dirname(os.path.realpath(_src.__file__)))
+            except Exception:
+                root = None
+        if root is None:
+            return {'git_head': '<no-repo-found>', 'git_branch': '<no-repo-found>',
+                    'git_remote': '<no-repo-found>', 'dirty_files': {}, 'clean_tree': False,
+                    'note': 'no git repository located; provenance comparison cannot be trusted'}
 
     def sh(cmd):
         try:
